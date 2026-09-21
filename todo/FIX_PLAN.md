@@ -1,21 +1,23 @@
 # executor.hpp — fix plan
 
-**Status (2026-09-21) — two steps landed, one blocker closed.** The pool was imported from
+**Status (2026-09-21) — four steps landed, two blockers closed.** The pool was imported from
 `async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before it
 can be called production ready. 19 items, in seven groups — item 19 was added after the audit
-closed and is a decision rather than a finding; see group 7. **Four are blockers**: each one is a way
+closed and is a decision rather than a finding; see group 7. **Four were blockers**: each one is a way
 the pool can hang or read freed memory, and three of the four are reachable without any misuse.
-**Tests:** 19 of 19 green in Debug, 2026-09-21; clang-format clean;
+**Two are left** — 3 and 4, both in the destructor.
+**Tests:** 20 of 20 green in Debug, 2026-09-21; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 23 pages (was 19 at the import), rebuilt with
-`tools/make_doc.sh`. **Both sanitizers have now been run, and TSan has
-named step 2.** Locally (macOS, libc++) both came back clean; on CI (Linux, GCC 14, libstdc++) TSan
-reported a data race in `concurrent_submission` between `~executor()` and a worker in
-`take_next_task()`. Step 2 moves from read-only to CONFIRMED, and the blocker count stands. See step
-19 for both runs and why the local clean sheet was platform luck rather than evidence. (An earlier
-draft of this line called the sanitizers step 17; they are step 19.)
-**Sites** are line numbers in `executor.hpp` as of `ba4eb82`, and they move with every fix that
-lands — they were remapped once already, after steps 14 and 1. Re-read them before trusting them.
-**Source:** read of `executor.hpp` against `async.hpp` at `4acb06d`, 2026-09-21. Five findings are
+`tools/make_doc.sh`. **Step 2 is closed** (`b68cc97`). The destructor now waits on an
+`async::execution_poll` until every worker has left its thread and clears them only then, and the
+race TSan named on CI no longer reproduces: 20 of 20 under TSan and under ASan on macOS/libc++,
+where the case that provokes it aborted before the fix. **That is one platform, not both** — the
+Linux/libstdc++ run this plan insists on has not been made since the fix, which is why step 19
+stays open.
+**Sites** are line numbers in `executor.hpp` as of `2814742`, and they move with every fix that
+lands — they were remapped after steps 14 and 1, and step 2 moved them again. Re-read them before
+trusting them.
+**Source:** read of `executor.hpp` against `async.hpp` at `22c5892`, 2026-09-21. Five findings are
 confirmed by a probe or by a test that failed before it was corrected; the rest are read-only and
 say so.
 
@@ -35,15 +37,19 @@ it pulls items 5, 16 and 18 along with it.
 
 ## Progress
 
-Done — steps 14 and 1. Step 14 was a refactor: nothing it touched was defective. **Step 1 is the
-first blocker closed**, and it is the cheapest of the four — a guard in the constructor, no change
-to how a working pool behaves. **Three blockers remain**, all of them in the destructor: 2, 3
-and 4.
+Done — steps 14, 1, 2 and 20. Step 14 was a refactor: nothing it touched was defective. **Step 1
+was the first blocker closed**, and the cheapest of the four — a guard in the constructor, no change
+to how a working pool behaves. **Step 2 is the second, and the one that mattered**: it is the only
+use-after-free in the audit, and the only finding a sanitizer had named. Step 20's stress case is
+what made it reproducible on a second platform, and it landed in step 2's own commit because the
+case is that fix's evidence. **Two blockers remain**, both in the destructor: 3 and 4.
 
-Step 19 is under way rather than done: its first sanitizer pass ran on 2026-09-21, locally and then
-on CI, and produced no code change to commit — the "before" half is done, the "after" half waits on
-step 2. It paid for itself immediately: CI's TSan named step 2, which had been the one blocker
-resting on a reading rather than on a report.
+Step 19 is still under way. The "before" half ran on 2026-09-21, locally and then on CI, and paid
+for itself immediately: CI's TSan named step 2, which had been the one blocker resting on a reading
+rather than on a report. The "after" half has now run on macOS/libc++ and is clean, through the
+presets `cfd5aea` added. What it still owes is Linux/libstdc++ — the platform that produced the
+report in the first place. Until that run, step 2 is fixed on the evidence of the toolchain that
+was never the one complaining.
 
 **Working method, from 2026-09-21.** Each step is a test first: a case that shows the defect, put up
 for review on its own, and the fix written only once that case is agreed. The test is the unit of
@@ -60,12 +66,13 @@ own hash, so the table below is filled by the `chore: update fix plan` that foll
 also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` under an amend and left
 three dangling references behind it.
 
-**NEXT: the rest of group 1 — steps 2, 3, 4.** Steps 14 (`4c1cba6`) and 1 are done. What is left
-of the group is one pass over the destructor, and step 2 is the one to read first: it is the only
-finding here that is a use-after-free, and the shape of its fix — the destructor taking `mutex_`
-for the parts that touch `workers_`, with the workers moved out under the lock — decides how 3 and
-4 are written. Step 3 then reuses that teardown minus the drain, and step 4 changes only how the
-wait reports itself.
+**NEXT: the rest of group 1 — steps 3 and 4.** Steps 14 (`4c1cba6`), 1 (`ba4eb82`) and 2
+(`b68cc97`) are done. What is left of the group is the same destructor, and step 2 has already
+settled the teardown both remaining steps build on: drain, `stop()` every worker outside the lock,
+wait on `poll_` until none is in its thread, then clear. Step 3 reuses that teardown minus the
+drain — a constructor that throws has nothing to drain, but it has started workers holding `this`,
+so it needs the same wait before it unwinds. Step 4 changes only how the wait reports itself, and
+the wait it changes is now the poll loop rather than the condition variable.
 
 Step 22 (any task type) comes after all four, not before: a hang and a use-after-free outrank a
 surface change, and templating the class is a whole-file diff that is far easier to review against
@@ -87,6 +94,9 @@ returns something give back — so read those two before deciding what it means 
 |---|---|
 | `4c1cba6` | 14 — `struct worker` replaced by `std::vector<std::shared_ptr<worker_execution>>` |
 | `ba4eb82` | 1 — `executor(0)` refused with `std::invalid_argument` |
+| `cfd5aea` | 19 (part) — `debug`/`release`/`asan`/`tsan` presets, so a sanitizer run is one command |
+| `b68cc97` | 2 — `~executor()` waits on an `execution_poll` before clearing; 20 — its stress case |
+| `2814742` | — `async` submodule to `22c5892`, which removed `execution_poll::get()` |
 
 ## Step index
 
@@ -94,7 +104,7 @@ returns something give back — so read those two before deciding what it means 
 |---|---|---|---|---|
 | **Group 1 — lifetime (blockers)** |
 | 1 ✅ | 1 | a pool with no workers takes work nothing can run, and never dies | `:57-74`, `:79-94` | CONFIRMED (hangs; probe) |
-| 2 | 2 | `~executor()` mutates `workers_` outside the mutex every reader takes | `:86-93`, `:150-163`, `:171-179` | **CONFIRMED (TSan, CI)** |
+| 2 ✅ | 2 | `~executor()` mutates `workers_` outside the mutex every reader takes | `:95-116` | CONFIRMED (TSan, CI) — fixed `b68cc97` |
 | 3 | 3 | a constructor that throws leaves started workers holding `this` | `:57-74` | read-only |
 | 4 | 4 | the destructor waits forever on a task that never returns | `:79-84` | read-only |
 | **Group 2 — what the caller is told** |
@@ -119,7 +129,7 @@ returns something give back — so read those two before deciding what it means 
 | 22 | 19 | `task_t` is fixed at `std::function<void(void)>` | `:41`, `:132` | CONFIRMED (compile probe) |
 | **Group 6 — the suite** |
 | 19 | — | the sanitizers have never been run against the suite | `.github/workflows/ci.yml` | — |
-| 20 | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp` | — |
+| 20 ✅ | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp:457` | — |
 | 21 | — | README and the reference state behaviour the fixes will change | `README.md` | — |
 
 ---
@@ -166,9 +176,41 @@ straight through is the likely way in.
 > the hang as a failure; it was dropped once the answer was settled as the throw, because it left a
 > thread parked in `~executor` that cannot be joined and that a leak checker would report.
 
-### Step 2 · item 2 — `~executor()` mutates `workers_` outside the mutex — OPEN, CONFIRMED
-`executor.hpp:73-78`, `:150-163`, `:171-179` · **CONFIRMED by TSan on CI, 2026-09-21**: data race in
+### Step 2 ✅ · item 2 — `~executor()` mutates `workers_` outside the mutex — DONE (`b68cc97`)
+`executor.hpp:95-116` · **CONFIRMED by TSan on CI, 2026-09-21**: data race in
 `executor_smoke_test.concurrent_submission`, GCC 14 / libstdc++ / Linux
+
+**What landed, and why it is not the fix this step prescribed.** The blockquote at the end of this
+section asked for the destructor to hold `mutex_` across the parts that touch `workers_`, with the
+workers moved out under the lock and a companion early-return in `take_next_task()`. That is not
+what was written. `~executor()` drains as before, calls `stop()` on each worker outside the lock,
+and then waits on an `async::execution_poll` — a member, declared before `workers_` — until no
+worker is inside its thread at all, clearing the vector only after that:
+
+```c++
+while (poll_.is_running()) {  // time of check
+  std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
+}
+
+// time of use: no worker thread is left to reach workers_, so clearing it races nothing.
+workers_.clear();
+```
+
+The poll is the better answer because it closes **both** mechanisms this section names with one
+wait, rather than the buffer race alone. A worker is detached and cannot be joined, so asking
+whether it is still running is the only way to wait for one, and the poll answers that for any
+number at once — which is exactly the gap `~execution()` cannot close, since each one waits only
+for itself. Once the poll reports idle there is no thread left to read any element, so the
+element-0-freed-while-element-2-runs case below disappears too. The lock dance and the
+`take_next_task()` guard are both unnecessary against a vector nobody can still reach, and neither
+was written.
+
+**Verified after the fix:** 20 of 20 on `debug`, `asan` and `tsan`, Apple clang 21.0.0 /
+arm64-apple-darwin25.6.0. `destroying_a_pool_under_load_does_not_race_its_workers` aborted under
+TSan before this change and passes after. **Not yet re-run on Linux/libstdc++**, which is the
+toolchain that reported the race — see step 19.
+
+The finding as it was diagnosed follows, unchanged.
 
 `mutex_` guards `workers_` for every reader: `submit()` scans it, `nothing_running()` iterates it,
 `take_next_task()` indexes into it. The destructor is the one writer, and it takes no lock at all:
@@ -252,6 +294,10 @@ are still alive and still calling `nothing_running()`, which iterates *every* wo
 *every* `action_mutex_`. The destructor does not have to be racing the buffer; element 0 being gone
 while element 2's thread still runs is enough, and no amount of waiting inside `~execution()` closes
 it, because each one waits only for itself.
+
+**Superseded — the shape below is not what landed; see the top of this step.** Kept because it
+records what the fix had to beat, and because its last paragraph is a live question step 7 inherits:
+if a running task may still submit, `pending_` is not empty at teardown.
 
 > The destructor holds `mutex_` across the parts that touch `workers_`, and the parts that must not
 > hold it — `stop()`, which wakes a worker that will want the mutex, and `clear()`, which waits for
@@ -565,8 +611,8 @@ rather than difficulty.
 
 ## Group 6 — the suite
 
-### Step 19 — run the suite under both sanitizers — OPEN (the "before" pass has run)
-`.github/workflows/ci.yml` · both run locally 2026-09-21, both clean
+### Step 19 — run the suite under both sanitizers — OPEN (both passes run, one platform)
+`.github/workflows/ci.yml` · before and after run locally 2026-09-21
 
 The CI job still has never run. Both sanitizers have now been run **locally**, against the
 unmodified header, before any fix — which is the half of this step that had to happen first:
@@ -594,16 +640,27 @@ What differs is the platform. Two sanitizer runs of the same source disagreed, s
 toolchain says nothing about the other, and "clean under TSan" is only ever a statement about the
 configuration that produced it.
 
-> Three things still open. **The "after" pass**, once step 2 lands — and it now has a named report to
-> be measured against rather than a clean sheet, which is the whole reason this step said to run the
-> sanitizers before the fix. **Both platforms, every time**: this repo has now seen the same code
-> come back clean on one and racy on the other, so a fix is not demonstrated until Linux/libstdc++
-> says so. **Step 20 is still worth having**, but its justification has changed: not to make step 2
-> observable — it already is — but to shorten the odds of catching what a three-worker case with one
-> destructor at the end can still miss.
+**The "after" pass has now run, on macOS only.** Step 2 landed, and the suite — 20 cases, step 20's
+stress case among them — comes back clean on both sanitizers through the presets `cfd5aea` added:
 
-### Step 20 — the suite has no case that runs the pool hard — OPEN
-`test/executor_tests.cpp` · —
+| Preset | Result, after step 2 |
+|---|---|
+| `asan` | 20/20 passed, 5.34s, no report |
+| `tsan` | 20/20 passed, 8.61s, no report |
+
+Measured against a named report rather than a clean sheet, which is the whole reason this step said
+to run the sanitizers before the fix: `destroying_a_pool_under_load_does_not_race_its_workers`
+aborted under `tsan` on this same toolchain before the change.
+
+> **What is left is the platform that complained.** CI — Linux, GCC 14, libstdc++ — has not run
+> since step 2, and that is the run that decides it. This repo has already seen the same source come
+> back clean on macOS and racy on Linux, so a macOS clean sheet is not the fix being demonstrated;
+> it is the weaker of the two runs repeating itself. Until CI is green on the thread job, step 2 is
+> closed on evidence from the toolchain that never reported the race. **Then the job itself**: the
+> CI workflow still has no sanitizer build, so both passes so far have been run by hand.
+
+### Step 20 ✅ — the suite has no case that runs the pool hard — DONE (`b68cc97`)
+`test/executor_tests.cpp:457` · —
 
 Every case is deterministic and short, which is what makes them reportable. None of them puts the
 pool under the sustained churn that steps 2 and 3 live in — construction and destruction under
@@ -614,9 +671,17 @@ Linux under TSan, with three workers and one destruction. What the suite lacks i
 construction and destruction under load — which is where step 3 lives, and step 3 is still the
 finding with no observation behind it.
 
-> A stress case, off by default or bounded to a few seconds: construct and destroy repeatedly while
-> submitting, at a worker count above the core count. It is the case most likely to make step 2
-> reproducible under TSan.
+**Landed as `destroying_a_pool_under_load_does_not_race_its_workers`**, in step 2's commit rather
+than its own, because the case is that fix's evidence: 50 rounds of build a 4-worker pool, submit 64
+tasks, leave the scope without waiting. Not waiting is the mechanism — the queue is still backed up
+when the destructor starts, so workers are inside `take_next_task()` when it reaches `clear()`. It
+aborted under TSan before step 2 and passes after, and it did what this step was for: it made step 2
+reproducible on macOS, where the suite had been clean while CI was not.
+
+It is bounded rather than off by default — ~2.8s under TSan, the slowest case in the suite — and it
+runs at 4 workers, not above the core count. A probe at 16 workers and 200 rounds was used while
+diagnosing step 2 and is not what was committed; reach for those numbers again when step 3 needs
+observing, since a pool that never finishes constructing is what that one is about.
 
 ### Step 21 — README and the reference state behaviour the fixes will change — OPEN
 `README.md` · —
