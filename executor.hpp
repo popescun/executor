@@ -13,6 +13,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <async.hpp>
 #include <chrono>
 #include <condition_variable>
@@ -21,6 +22,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <print>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -47,14 +49,12 @@ class executor {
    *
    * @param worker_count - How many workers to run. Must not be zero.
    *
-   * @throws std::invalid_argument - \p worker_count is zero. Such a pool would accept work and
-   * then have nobody to run it: submit() would queue the task and answer true, and the destructor
-   * would wait for a queue only a worker can empty. It is refused before any worker is started, so
-   * a pool that cannot run anything never exists rather than existing and hanging.
+   * @throws std::invalid_argument - \p worker_count is zero. Such a pool would take work and never
+   * run it, so it is refused before any worker starts rather than left to hang in the destructor.
    *
    * @remark std::thread::hardware_concurrency() returns 0 when it cannot tell how many cores there
-   * are, so a caller passing it straight through is the way this is most likely to be reached.
-   * Choosing a default in that case is the caller's to make, not the pool's.
+   * are, and a caller passing that straight through is the likely way in. Choosing a default then
+   * is the caller's call, not the pool's.
    */
   explicit executor(std::size_t worker_count) {
     if (worker_count == 0) {
@@ -84,19 +84,41 @@ class executor {
   }
 
   /**
-   * @brief Drains what has been submitted, then stops every worker.
+   * @brief Finishes what has been submitted, then stops every worker.
    *
-   * @remark Every worker has left its thread before the first execution is destroyed. That is what
-   * the poll is for: ~execution() waits only for its *own* worker, so destroying the executions one
-   * at a time would free the first while another's thread is still reading it through
-   * nothing_running(). The wait is on this pool's own poll, so a second pool running alongside
-   * this one is not something this destructor waits for.
+   * Both waits are unbounded - a pool that abandoned a running task would be worse than one that
+   * waits for it - and both report on stderr rather than stalling in silence, naming the workers
+   * they are still waiting on.
+   *
+   * @remark Every worker has left its thread before the first execution is destroyed. ~execution()
+   * waits only for its *own* worker, so destroying them one at a time would free the first while
+   * another's thread was still reading it through nothing_running(); the poll waits for all of
+   * them. It is this pool's own poll, so a second pool running alongside it is not waited for.
    */
   ~executor() {
     {
       std::unique_lock<std::mutex> lock(mutex_);
       accepting_ = false;
-      drained_cv_.wait(lock, [this] { return pending_.empty() && nothing_running(); });
+
+      // Unbounded, and reported rather than bounded. Both waits below keep waiting for as long as
+      // it takes; what they stop doing is keeping it to themselves.
+      auto interval = std::chrono::milliseconds(report_first_ms);
+      auto waited = std::chrono::milliseconds(0);
+
+      while (!finished_cv_.wait_for(lock, interval,
+                                    [this] { return pending_.empty() && nothing_running(); })) {
+        waited += interval;
+
+        // The lock is held here, which is what makes both reads consistent with the predicate that
+        // just failed. is_busy() takes each execution's action_mutex_ under this one, which is the
+        // same order give_to_worker() uses - no new lock order is introduced by reporting.
+        std::println(
+            stderr, "executor: still waiting to finish after {}s - {} queued, {} in a task{}",
+            waited.count() / 1000, pending_.size(), count_workers(&worker_execution::is_busy),
+            name_workers(&worker_execution::is_busy));
+
+        interval = std::min(interval * 2, std::chrono::milliseconds(report_max_ms));
+      }
     }
 
     // Outside the lock: stop() wakes each worker, and a worker waking up runs on_finished, which
@@ -108,8 +130,25 @@ class executor {
     // The poll stands in for a join. Until it reports idle, a worker can still be inside
     // take_next_task(), reading every execution through nothing_running() and is_busy() - which is
     // what makes destroying them here a use-after-free rather than a teardown.
+    //
+    // A different question from the finish above, and reported as one: that wait is about workers
+    // still inside a task, this is about workers whose thread has not left. A worker can be idle
+    // and still be here.
+    auto interval = std::chrono::milliseconds(report_first_ms);
+    auto waited = std::chrono::milliseconds(0);
+
     while (poll_.is_running()) {  // time of check
-      std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
+      const auto tick = std::chrono::milliseconds(poll_interval_ms);
+      std::this_thread::sleep_for(tick);
+      waited += tick;
+
+      if (waited >= interval) {
+        std::println(stderr, "executor: still waiting to stop after {}s - {} not left its thread{}",
+                     waited.count() / 1000, count_workers(&worker_execution::is_running),
+                     name_workers(&worker_execution::is_running));
+
+        interval = std::min(interval * 2, std::chrono::milliseconds(report_max_ms));
+      }
     }
 
     // time of use: no worker thread is left to reach workers_, so clearing it races nothing.
@@ -168,7 +207,7 @@ class executor {
   }
 
   /**
-   * @brief Called on the worker's own thread once its queue has drained.
+   * @brief Called on the worker's own thread once it has finished its queue.
    */
   void take_next_task(std::size_t index) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -181,7 +220,7 @@ class executor {
     }
 
     if (nothing_running()) {
-      drained_cv_.notify_all();
+      finished_cv_.notify_all();
     }
   }
 
@@ -201,12 +240,57 @@ class executor {
     return true;
   }
 
+  /**
+   * @brief Counts the workers a predicate holds for. Call the is_busy() form with the mutex held.
+   *
+   * @param state - \ref worker_execution::is_busy or \ref worker_execution::is_running.
+   */
+  std::size_t count_workers(bool (worker_execution::*state)() const) const {
+    std::size_t count = 0;
+
+    for (const auto& one : workers_) {
+      if ((one.get()->*state)()) {
+        ++count;
+      }
+    }
+
+    return count;
+  }
+
+  /**
+   * @brief Names those same workers, for a report that has to say which one.
+   *
+   * The execution's own name rather than the index, so one worker reads the same here and in
+   * async's own warnings. The task cannot be named: task_t is std::function<void(void)> and carries
+   * nothing to report.
+   *
+   * @return The matching names behind a ": " separator, empty when none match, so it appends to a
+   * message cleanly either way.
+   */
+  std::string name_workers(bool (worker_execution::*state)() const) const {
+    std::string names;
+
+    for (const auto& one : workers_) {
+      if ((one.get()->*state)()) {
+        names += names.empty() ? ": " : ", ";
+        names += one->name;
+      }
+    }
+
+    return names;
+  }
+
   //! How often the destructor asks the poll whether the workers have left. Matches the interval
   //! async's own smoke test waits at.
   static constexpr int poll_interval_ms = 50;
 
+  //! How long a shutdown may be silent before it reports, and the ceiling the interval doubles to.
+  //! A stuck teardown says something almost at once; a long one does not turn into a log flood.
+  static constexpr int report_first_ms = 1000;
+  static constexpr int report_max_ms = 30000;
+
   mutable std::mutex mutex_;
-  std::condition_variable drained_cv_;
+  std::condition_variable finished_cv_;
 
   /**
    * @brief Stands in for joining this pool's workers, which are detached and cannot be joined.

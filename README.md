@@ -38,7 +38,7 @@ int main() {
     pool.submit([i] { work(i); });
   }
 
-  return 0;  // ~executor drains what was submitted, then stops the workers
+  return 0;  // ~executor finishes what was submitted, then stops the workers
 }
 ```
 
@@ -50,7 +50,7 @@ N executions run in continuous mode behind a shared `std::deque` of tasks.
 otherwise it joins the back of the queue. Finding a free worker does not let a task jump a queue
 that already has work in it.
 
-**Workers pull rather than being pushed to.** When one reports its queue drained — `on_finished`,
+**Workers pull rather than being pushed to.** When one reports its queue finished — `on_finished`,
 raised by `execution` the moment its list empties — it takes the front of the shared queue. That is
 what spreads the work, with no scheduling logic of its own: 400 tasks over 4 workers come out
 100/100/100/100.
@@ -61,7 +61,7 @@ pool's belief about its workers; this is the workers' own answer, and it cannot 
 
 ## lifetime and failure
 
-**The destructor drains.** It refuses further work, waits for the queue to empty and for every
+**The destructor finishes what was submitted.** It refuses further work, waits for the queue to empty and for every
 worker to go idle, and only then stops them. A task submitted before the pool goes out of scope has
 run by the time it does.
 

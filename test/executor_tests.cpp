@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -98,8 +99,8 @@ class gate {
 /**
  * @brief Every submitted task is invoked, once each.
  *
- * The mock outlives the pool, so the expectation is verified after the destructor has drained -
- * which is also what makes this a test of the drain.
+ * The mock outlives the pool, so the expectation is verified after the destructor has finished -
+ * which is also what makes this a test of the finish.
  */
 TEST(executor_tests, every_submitted_task_runs_exactly_once) {
   constexpr int task_count = 200;
@@ -120,7 +121,7 @@ TEST(executor_tests, every_submitted_task_runs_exactly_once) {
  * Long enough that a destructor which only stopped the workers would be caught leaving a task
  * unrun, rather than winning the race by chance.
  */
-TEST(executor_tests, the_destructor_drains_work_in_flight) {
+TEST(executor_tests, the_destructor_finishes_work_in_flight) {
   std::atomic_bool finished = {false};
 
   {
@@ -405,54 +406,73 @@ TEST(executor_tests, an_idle_pool_shuts_down) {
 }
 
 /**
- * @brief A pool that can run nothing is refused before it exists - fix plan step 1.
+ * @brief A pool that can run nothing is refused before it exists.
  *
- * executor(0) is accepted today. workers_ is empty, so submit() finds no free worker, queues the
- * task and answers true; the destructor then waits for pending_ to empty, which no worker will ever
- * make true, and nothing_running() is vacuously true over no workers, so the predicate never comes
- * up with it. std::thread::hardware_concurrency() returns 0 when it cannot tell, and a caller
- * passing it straight through is the likely way in.
- *
- * @remark The hang needs a submit(), and this case does not perform one: an empty pool that is
- * never given work destructs cleanly. What is stated here is the guard rather than the hang it
- * prevents, so the case reports a missing throw instead of wedging the suite for three seconds.
+ * A pool with no workers would take work and never run it: submit() queues the task and answers
+ * true, and the destructor then waits for a queue only a worker can empty.
+ * std::thread::hardware_concurrency() returns 0 when it cannot tell how many cores there are, and a
+ * caller passing that straight through is the likely way in.
  */
 TEST(executor_tests, a_pool_with_no_workers_is_refused) {
   EXPECT_THROW(executor(0), std::invalid_argument);
 }
 
 /**
- * @brief Destroying a pool while its workers are still turning over - fix plan step 2.
+ * @brief A destructor waiting on a task that has not returned reports why, and keeps waiting.
  *
- * ~executor() takes no lock for the parts that touch workers_. It stop()s each worker and then
- * clear()s the vector, while a worker thread can be inside take_next_task() - holding mutex_,
- * which the destructor is not holding - and reading every worker through nothing_running() and
- * is_busy(). clear() destroys the executions in order, and ~execution() waits only on its own
- * worker, so freeing worker 0 while worker 2's thread is still locking worker 0's action_mutex_ is
- * enough on its own; the vector does not have to be racing anything.
+ * Abandoning a running task would be worse than waiting for it, so the wait stays unbounded; what
+ * it stops doing is keeping quiet about itself. The task holds the pool's only worker, so
+ * nothing_running() cannot come true and the closing brace is where this case spends its time.
  *
- * The window is opened by not waiting. The drain predicate is satisfied by whichever worker calls
- * take_next_task() last, and it reads the other workers through is_busy(); one that has just
- * cleared executing_action_ and has not yet reached its own on_finished reads as idle there. So
- * the destructor can be released by one worker while another is an instruction away from entering
- * take_next_task() and touching a vector whose elements are being freed.
+ * @remark The task times its own stall instead of waiting to be released, which is what lets a
+ * plain scope destroy the pool: ~executor() has already begun by the time the scope is left, so
+ * anything that released it would have to live outside. `started` is declared before the pool for
+ * the same reason - reversed, it would be destroyed while the task was still reading it.
+ */
+TEST(executor_tests, a_destructor_stuck_on_a_task_reports_why) {
+  //! How long the task holds its worker - longer than a first report is due, so the destructor is
+  //! stuck across at least one of them.
+  constexpr auto stall = 2s;
+
+  testing::internal::CaptureStderr();
+
+  {
+    std::atomic_bool started = {false};
+    executor pool(1);
+
+    pool.submit([&started, stall] {
+      started.store(true);
+      std::this_thread::sleep_for(stall);
+    });
+
+    EXPECT_TRUE(wait_for([&started] { return started.load(); }, 2s))
+        << "the worker never reached the task, so the destructor is not stuck on it";
+  }  // ~executor() waits out the rest of the task here, and has to say so while it does
+
+  const std::string reported = testing::internal::GetCapturedStderr();
+
+  EXPECT_THAT(reported, ::testing::HasSubstr("executor"))
+      << "the stall went unreported; stderr held: " << reported;
+  EXPECT_THAT(reported, ::testing::HasSubstr("waiting"))
+      << "the stall went unreported; stderr held: " << reported;
+}
+
+/**
+ * @brief Destroying a pool while its workers are still turning over does not race them.
  *
- * @attention This case cannot fail on an ordinary build, and passing it proves nothing there. The
- * accesses are unsynchronised rather than wrong in any order a plain build can observe, so all it
- * does is open the window repeatedly and leave the verdict to a sanitizer standing in it.
- * Configure with -DEXECUTOR_SANITIZE=thread, where it aborts. Measured 2026-09-21 on macOS/libc++
- * as well as on CI's Linux/libstdc++ - which is the reason the case exists. The suite's other
- * eighteen cases were TSan-clean on macOS while CI reported the race from
- * executor_smoke_test.concurrent_submission, so the difference was never the platform; it was that
- * nothing here destroyed a pool often enough. This is the churn case step 20 asks for.
+ * ~executor() waits on the poll until no worker is left in its thread, and destroys them only then.
+ * Without that wait a worker could still be inside take_next_task(), reading every execution
+ * through nothing_running() and is_busy() while the vector holding them was being cleared. Not
+ * waiting here is what opens the window: the queue is still backed up when the destructor starts.
  *
- * @attention AddressSanitizer does not report it, and its silence is not an acquittal. The race is
- * a free on one thread against a read on another with nothing ordering them; ASan sees a fault only
- * when the read actually lands after the free, which it has not in any run measured here. TSan
- * reports the missing order itself, which is the defect.
+ * @attention Sanitizer-sensitive. On an ordinary build the accesses are unsynchronised rather than
+ * wrong in any order it can observe, so passing there proves nothing; configure with
+ * -DEXECUTOR_SANITIZE=thread, where this aborted before the wait existed. ASan stays silent even
+ * so - the race is a free against a read with nothing ordering them, so it faults only when the
+ * read lands after the free.
  *
- * @remark The expectation it does state is the drain: every task submitted before the scope closed
- * has run by the time the destructor returns. That much is meaningful on any build.
+ * @remark What it states on any build is the finish: every task submitted before the scope closed
+ * has run by the time the destructor returns.
  */
 TEST(executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
   constexpr int rounds = 50;

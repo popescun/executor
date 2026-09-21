@@ -45,7 +45,7 @@ TEST(executor_smoke_test, tasks_run_and_spread_across_workers) {
         seen.push_back(std::this_thread::get_id());
       });
     }
-  }  // the destructor drains, then stops
+  }  // the destructor finishes, then stops
 
   std::vector<std::thread::id> distinct;
   for (const auto& id : seen) {

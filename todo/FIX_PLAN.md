@@ -107,7 +107,7 @@ returns something give back — so read those two before deciding what it means 
 | 1 ✅ | 1 | a pool with no workers takes work nothing can run, and never dies | `:57-74`, `:79-94` | CONFIRMED (hangs; probe) |
 | 2 ✅ | 2 | `~executor()` mutates `workers_` outside the mutex every reader takes | `:95-116` | CONFIRMED (TSan, CI) — fixed `b68cc97` |
 | 3 ✅ | 3 | a constructor that throws leaves started workers holding `this` | `:59-84` | DISPROVEN (probe) — not a defect |
-| 4 | 4 | the destructor waits forever on a task that never returns | `:79-84` | read-only |
+| 4 | 4 | the destructor waits forever on a task that never returns | `:99`, `:111-113` | read-only |
 | **Group 2 — what the caller is told** |
 | 5 | 5 | a task that throws is reported to stderr and to nobody else | `:140-145` | CONFIRMED (test) |
 | 6 | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:140-145` | read-only |
@@ -367,7 +367,9 @@ unwinds identically to the injected throw.
 > loop: on the way out, stop and release whatever was started, then rethrow.*
 
 ### Step 4 · item 4 — the destructor waits forever on a task that never returns — OPEN
-`executor.hpp:64-70` · read-only
+`executor.hpp:99`, `:111-113` · read-only · **sites remapped after step 2**, which split the wait in
+two: the drain on `drained_cv_` at `:99`, and the poll loop at `:111-113`. Both are unbounded, so
+the step now has two waits to answer for rather than one.
 
 ```c++
 drained_cv_.wait(lock, [this] { return pending_.empty() && nothing_running(); });
@@ -694,9 +696,8 @@ pool under the sustained churn that steps 2 and 3 live in — construction and d
 load, many workers, tasks finishing while the destructor runs.
 
 **Amended 2026-09-21.** "None of them" was too strong: `concurrent_submission` reaches step 2 on
-Linux under TSan, with three workers and one destruction. What the suite lacks is *repeated*
-construction and destruction under load — which is where step 3 lives, and step 3 is still the
-finding with no observation behind it.
+Linux under TSan, with three workers and one destruction. What the suite lacked is *repeated*
+construction and destruction under load.
 
 **Landed as `destroying_a_pool_under_load_does_not_race_its_workers`**, in step 2's commit rather
 than its own, because the case is that fix's evidence: 50 rounds of build a 4-worker pool, submit 64
@@ -707,8 +708,13 @@ reproducible on macOS, where the suite had been clean while CI was not.
 
 It is bounded rather than off by default — ~2.8s under TSan, the slowest case in the suite — and it
 runs at 4 workers, not above the core count. A probe at 16 workers and 200 rounds was used while
-diagnosing step 2 and is not what was committed; reach for those numbers again when step 3 needs
-observing, since a pool that never finishes constructing is what that one is about.
+diagnosing step 2 and is not what was committed; those numbers are where to start if a later step
+needs a wider window than this case opens.
+
+**The construction half of this step is no longer owed.** It was kept partly for step 3, a pool that
+throws while constructing, and step 3 has since been closed as not a defect — member destruction
+already stops and waits for every worker started before the throw, and a probe shows it. There is no
+remaining finding that repeated *construction* failure would observe.
 
 ### Step 21 — README and the reference state behaviour the fixes will change — OPEN
 `README.md` · —
