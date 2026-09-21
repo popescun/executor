@@ -1,0 +1,186 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Formatting is platform independent: the same clang-format version produces
+  # the same result everywhere, so this runs once rather than per platform.
+  format:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A pinned Python keeps pip usable on every runner; the macOS system
+      # Python refuses plain `pip install` as an externally managed environment.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Pinned to the same major version used locally. Formatting output differs
+      # between clang-format majors, so an unpinned tool fails CI on code that is
+      # correctly formatted on a developer's machine.
+      - name: Install clang-format
+        run: pip install "clang-format>=21,<22"
+
+      - name: Show version
+        run: clang-format --version
+
+      # --Werror turns "needs reformatting" into a non-zero exit.
+      # git ls-files keeps this to tracked sources, so neither build trees nor
+      # the async submodule's sources are ever scanned.
+      # -z/-0 pairs NUL-separated names, so word splitting never mangles a path.
+      - name: Check formatting
+        run: |
+          echo "checking:"
+          git ls-files '*.hpp' '*.cpp' | sed 's/^/  /'
+          git ls-files -z '*.hpp' '*.cpp' | xargs -0 clang-format --dry-run --Werror --style=file
+
+  build:
+    needs: format
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # executor.hpp includes <async.hpp> from the async submodule, which carries
+      # its own actuator submodule - hence recursive. Both are public repositories,
+      # so the default GITHUB_TOKEN reaches them and no PAT is needed. The format
+      # job does not need them: submodule content is a gitlink here, so
+      # git ls-files never lists it and clang-format is never pointed at another
+      # project's sources.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # test/CMakeLists.txt requires CMake 4.1, which is newer than some runner
+      # images ship. Installing it via pip pins the same version on all three.
+      - name: Install CMake
+        run: pip install "cmake>=4.1"
+
+      - name: Show versions
+        shell: bash
+        run: |
+          cmake --version | head -1
+          git ls-files '*.hpp' '*.cpp' | wc -l | sed 's/^/tracked sources: /'
+
+      # ubuntu-latest still defaults to GCC 13. Its libstdc++ has <format> but not <print> -
+      # std::println only arrived in GCC 14 - so -std=c++23 is accepted and the include then
+      # fails. Select the newer compiler rather than rewriting the headers: macOS (libc++ 18+)
+      # and Windows (MSVC 17.9+) already provide <print>, so this is a Linux-only gap.
+      - name: Use GCC 14 on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: cmake -S test -B test/build -DCMAKE_BUILD_TYPE=Release
+
+      # --config matters on multi-config generators (Visual Studio); it is
+      # ignored elsewhere, so one command covers all three platforms.
+      - name: Build
+        run: cmake --build test/build --config Release
+
+      # --no-tests=error: every TEST() is registered by gtest_discover_tests, so
+      # an empty suite here means discovery failed rather than that there is
+      # nothing to run.
+      - name: Test
+        run: ctest --test-dir test/build --build-config Release --output-on-failure --no-tests=error
+
+  # The pool is what makes the header's threading assumptions observable, so the
+  # suite is run again under the two sanitizers that name a defect rather than
+  # leave it to be inferred. Linux only: one runner covers both, and TSan does
+  # not ship for every image in the matrix above.
+  sanitizers:
+    needs: format
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install CMake
+        run: pip install "cmake>=4.1"
+
+      - name: Use GCC 14
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+      # A separate build directory per sanitizer: address and thread instrument
+      # the same accesses in incompatible ways and cannot be combined.
+      - name: Configure
+        run: >
+          cmake -S test -B test/build-${{ matrix.sanitizer }}
+          -DCMAKE_BUILD_TYPE=Debug
+          -DEXECUTOR_SANITIZE=${{ matrix.sanitizer }}
+
+      - name: Build
+        run: cmake --build test/build-${{ matrix.sanitizer }}
+
+      # halt_on_error makes a report a failed test rather than a line in a log
+      # that a passing exit code buries.
+      - name: Test
+        env:
+          ASAN_OPTIONS: halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: >
+          ctest --test-dir test/build-${{ matrix.sanitizer }}
+          --output-on-failure --no-tests=error
+
+  # tools/make_doc.sh fails on any doxygen warning that is not an obsolete-tag
+  # notice, so this job is what keeps an undocumented member or a broken \ref
+  # out of the reference. It runs once rather than per platform: the PDF is a
+  # single artifact, not something built per target.
+  docs:
+    needs: format
+    runs-on: macos-latest
+    steps:
+      # No submodules: the Doxyfile's INPUT is this repo's own header and
+      # README, and doxygen does not follow #include <async.hpp> - the docs
+      # build is clean without it.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # tectonic replaces a full TeX distribution; make_index.py stands in for
+      # the makeindex it does not ship.
+      - name: Install doxygen and tectonic
+        run: brew install doxygen tectonic
+
+      - name: Show versions
+        run: |
+          doxygen --version | sed 's/^/doxygen /'
+          tectonic --version
+
+      - name: Build the reference
+        run: tools/make_doc.sh
+
+      # The PDF in doc/ is regenerated by hand and committed; this is the copy
+      # built from the commit under test, for comparing against it.
+      - name: Upload refman.pdf
+        uses: actions/upload-artifact@v4
+        with:
+          name: refman
+          path: doc/refman.pdf

@@ -67,3 +67,12 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# doxygen scratch tree - tools/make_doc.sh removes it, but not if it is killed mid-run
+doc/tmp/
+
+.idea
+
+
+
+.DS_Store
