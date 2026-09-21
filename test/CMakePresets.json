@@ -1,0 +1,79 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "description": "The suite as it is normally run. Every case is expected green here; a sanitizer-sensitive case passes without proving anything.",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "EXECUTOR_SANITIZE": ""
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "description": "What the CI build job compiles on macOS, Windows and Linux.",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "EXECUTOR_SANITIZE": ""
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug + AddressSanitizer",
+      "description": "Names a dangling read rather than leaving it to be inferred. Its silence is not an acquittal for a data race: ASan faults only when a read actually lands after the free.",
+      "binaryDir": "${sourceDir}/build-address",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "EXECUTOR_SANITIZE": "address"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Debug + ThreadSanitizer",
+      "description": "Where the pool's threading defects are visible. Fix plan step 2's race aborts here and cannot be seen on any other preset.",
+      "binaryDir": "${sourceDir}/build-thread",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "EXECUTOR_SANITIZE": "thread"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "tsan", "configurePreset": "tsan" }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "environment": { "ASAN_OPTIONS": "halt_on_error=1" },
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "environment": { "TSAN_OPTIONS": "halt_on_error=1" },
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    }
+  ]
+}
