@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,8 +42,23 @@ class executor {
 
   /**
    * @brief Starts \p worker_count executions in continuous mode.
+   *
+   * @param worker_count - How many workers to run. Must not be zero.
+   *
+   * @throws std::invalid_argument - \p worker_count is zero. Such a pool would accept work and
+   * then have nobody to run it: submit() would queue the task and answer true, and the destructor
+   * would wait for a queue only a worker can empty. It is refused before any worker is started, so
+   * a pool that cannot run anything never exists rather than existing and hanging.
+   *
+   * @remark std::thread::hardware_concurrency() returns 0 when it cannot tell how many cores there
+   * are, so a caller passing it straight through is the way this is most likely to be reached.
+   * Choosing a default in that case is the caller's to make, not the pool's.
    */
   explicit executor(std::size_t worker_count) {
+    if (worker_count == 0) {
+      throw std::invalid_argument("executor: worker_count must not be zero");
+    }
+
     workers_.reserve(worker_count);
 
     for (std::size_t index = 0; index < worker_count; ++index) {
