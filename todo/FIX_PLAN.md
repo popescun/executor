@@ -1,11 +1,12 @@
 # executor.hpp — fix plan
 
-**Status (2026-09-21) — opened, nothing landed.** The pool was imported from
+**Status (2026-09-21) — one step landed, no blocker yet.** The pool was imported from
 `async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before it
 can be called production ready. 19 items, in seven groups — item 19 was added after the audit
 closed and is a decision rather than a finding; see group 7. **Four are blockers**: each one is a way
 the pool can hang or read freed memory, and three of the four are reachable without any misuse.
-**Tests:** 18 of 18 green in Debug, 20 runs in a row, measured on 2026-09-21; clang-format clean;
+**Tests:** 19 cases, 18 green and 1 deliberately red — step 1's guard, written before its fix;
+clang-format clean;
 doxygen clean, `doc/refman.pdf` at 19 pages. **Both sanitizers have now been run, and TSan has
 named step 2.** Locally (macOS, libc++) both came back clean; on CI (Linux, GCC 14, libstdc++) TSan
 reported a data race in `concurrent_submission` between `~executor()` and a worker in
@@ -32,35 +33,45 @@ it pulls items 5, 16 and 18 along with it.
 
 ## Progress
 
-**Nothing landed in the header.** No step has changed `executor.hpp` and no commit is listed
-below. One step has been *started*: step 19's first sanitizer pass ran on 2026-09-21, locally and
-then on CI, and produced no code change to commit — its "before" half is done, its "after" half
-waits on step 2. It paid for itself immediately: CI's TSan named step 2, which had been the one
-blocker resting on a reading rather than on a report.
+Done — step 14, and nothing else. It is the only change to `executor.hpp` so far and it is a
+refactor: nothing it touched was defective. **No blocker has landed.**
 
-**NEXT: step 14, then group 1 in order — steps 1, 2, 3, 4.** Step 22 (any task type) comes after
-those, not before: a hang and a use-after-free outrank a surface change, and templating the class
-is a whole-file diff that is far easier to review against a baseline already known correct. 14 is three lines and it rewrites the
-lines step 2 would otherwise touch twice, which is the only reason it goes first. The four blockers
-then come together, because they are all in the constructor and the destructor and that is one pass
-over those lines rather than four. Step 2 is the one to read first of them: it is the only finding
-here that is a use-after-free, and the shape of its fix — the destructor taking `mutex_` for the
-parts that touch `workers_` — decides how steps 1 and 4 are written.
+Step 19 is under way rather than done: its first sanitizer pass ran on 2026-09-21, locally and then
+on CI, and produced no code change to commit — the "before" half is done, the "after" half waits on
+step 2. It paid for itself immediately: CI's TSan named step 2, which had been the one blocker
+resting on a reading rather than on a report.
+
+**Working method, from 2026-09-21.** Each step is a test first: a case that shows the defect, put up
+for review on its own, and the fix written only once that case is agreed. The test is the unit of
+review, not the fix.
+
+**NEXT: group 1 in order — steps 1, 2, 3, 4.** Step 14 is done (`bf7739b`), which is what these
+were waiting on: it rewrote the lines step 2 would otherwise have touched twice. The four blockers
+come together, because they are all in the constructor and the destructor and that is one pass over
+those lines rather than four. Step 2 is the one to read first of them: it is the only finding here
+that is a use-after-free, and the shape of its fix — the destructor taking `mutex_` for the parts
+that touch `workers_` — decides how steps 1 and 4 are written. Step 1's case is already written and
+red; its fix is the next thing to write.
+
+Step 22 (any task type) comes after all four, not before: a hang and a use-after-free outrank a
+surface change, and templating the class is a whole-file diff that is far easier to review against
+a baseline already known correct.
 
 **Read the couplings before picking an order.** Steps 1 and 4 are both about a destructor that
 waits for something that will never come, and the guard for one is the place to put the other.
 Steps 5 and 6 ask the same question — what happened to the task I gave you — and the async plan's
 experience with its own steps 21 and 28 was that answering it in two passes answers it twice and
-badly; settle them together. Step 14 changes what a worker *is* here, and steps 2 and 8 both
-rewrite the lines that name one, so 14 goes before both or gets written three times. Step 13 gives
+badly; settle them together. Step 14 changed what a worker *is* here, and steps 2 and 8 both
+rewrite the lines that name one — that coupling is discharged, and both now start from
+`workers_[i]->` rather than `workers_[i].exec->`. Step 13 gives
 the pool a name and step 5 needs something to put in a report, so 13 comes first of those two.
-Step 22 lands on the same lines as 14 and touches every use of `worker_execution`, so it goes after
-14 as well; and it asks step 5's and step 18's question in a third form — what does a task that
+Step 22 touches every use of `worker_execution`, which step 14 has now settled the spelling of; and
+it asks step 5's and step 18's question in a third form — what does a task that
 returns something give back — so read those two before deciding what it means for a non-void task.
 
 | Commit | Step |
 |---|---|
-| *(none yet)* | — |
+| `bf7739b` | 14 — `struct worker` replaced by `std::vector<std::shared_ptr<worker_execution>>` |
 
 ## Step index
 
@@ -84,7 +95,7 @@ returns something give back — so read those two before deciding what it means 
 | 12 | 12 | the 10ms tick, once per worker | `async.hpp:744-747` | measured, not a defect |
 | **Group 5 — surface and hygiene** |
 | 13 | 13 | worker names collide between pools | `:50` | read-only |
-| 14 | 14 | `struct worker` is a one-field wrapper the prototype outgrew | `:119-121` | read-only |
+| 14 ✅ | 14 | `struct worker` is a one-field wrapper the prototype outgrew | `:119-121` | read-only |
 | 15 | 15 | copy and move are suppressed by accident, not by statement | `:170` | read-only |
 | 16 | 16 | a move-only task does not compile | `:40` | CONFIRMED (compile probe) |
 | 17 | 17 | `pending()` is advisory and does not say so | `:111-114` | read-only |
@@ -128,6 +139,15 @@ straight through is the likely way in.
 > Reject it in the constructor — `std::invalid_argument`, thrown before any worker is started, so a
 > pool that cannot run anything never exists rather than existing and hanging. `<stdexcept>` joins
 > the includes. A default worker count is a separate question and is not this step's.
+
+**The case is written and red** (2026-09-21): `executor_tests.a_pool_with_no_workers_is_refused`,
+one line — `EXPECT_THROW(executor(0), std::invalid_argument)` — reporting *"it throws nothing"*. It
+states the guard rather than the hang: an empty pool that is never given work destructs cleanly, so
+the case never reaches the wait, and it fails in milliseconds instead of wedging the suite for
+three. The hang's standing evidence is the probe above. A first draft built the pool on its own
+thread behind a three-second watchdog, which did reproduce the hang as a failure; it was dropped
+once the answer was settled as the throw, because it left a thread parked in `~executor` that could
+not be joined and that a leak checker would report. Fix not written: awaiting review of the case.
 
 ### Step 2 · item 2 — `~executor()` mutates `workers_` outside the mutex — OPEN, CONFIRMED
 `executor.hpp:73-78`, `:139-157`, `:160-167` · **CONFIRMED by TSan on CI, 2026-09-21**: data race in
@@ -343,7 +363,8 @@ cache holds, for what a profile of the pool looks like, and for anything per-wor
 
 > Start the scan where the last one stopped. One `std::size_t` member, incremented past the worker
 > that took the task; the placement rule does not change, only which free worker is found first.
-> Land it after step 14, which changes what is being scanned.
+> Land it after step 14, which changed what is being scanned — done at `bf7739b`, so the scan now
+> reads `workers_[index]->is_busy()` and this step is unblocked.
 
 ### Step 9 · item 9 — the queue is unbounded and nothing pushes back — OPEN, API decision
 `executor.hpp:104` · read-only
@@ -424,7 +445,7 @@ either.
 > per instance. It costs one constructor parameter and makes step 5's reporting legible; land them
 > in that order.
 
-### Step 14 · item 14 — `struct worker` is a one-field wrapper — OPEN
+### Step 14 ✅ · item 14 — `struct worker` is a one-field wrapper
 `executor.hpp:119-121` · read-only
 
 ```c++
@@ -436,8 +457,13 @@ struct worker {
 It held the `busy` flag the pool kept before `is_busy()` existed. The flag is gone and the struct
 stayed, so every use reads `workers_[index].exec->` for no benefit.
 
-> `std::vector<std::shared_ptr<worker_execution>>`. Land it before steps 2 and 8, both of which
-> rewrite the lines that would otherwise be touched twice.
+> `std::vector<std::shared_ptr<worker_execution>>`. The struct is gone and the six
+> `workers_[index].exec->` sites read `workers_[index]->`. No behaviour change; the gate was the
+> existing suite, 18 of 18 still green. Landed before steps 2 and 8, which rewrite the same lines.
+>
+> One consequence for step 2: the TSan report recorded there names
+> `untangle::executor::worker::~worker()` at frame #9, and that symbol no longer exists — the same
+> race comes back pointing at `~shared_ptr` / `_M_destroy`.
 
 ### Step 15 · item 15 — copy and move are suppressed by accident — OPEN
 `executor.hpp:170` · read-only
@@ -503,7 +529,7 @@ rather than difficulty.
 
 ## Group 6 — the suite
 
-### Step 19 — run the suite under both sanitizers — HALF DONE (the "before" pass)
+### Step 19 — run the suite under both sanitizers — OPEN (the "before" pass has run)
 `.github/workflows/ci.yml` · both run locally 2026-09-21, both clean
 
 The CI job still has never run. Both sanitizers have now been run **locally**, against the
@@ -662,6 +688,7 @@ contract above is the escape hatch if that ever changes — a caller supplying a
 against it.
 
 > Template the class on `task_t`, default `std::function<void(void)>`, and write `worker_execution`
-> in terms of it so the signature appears once. Sequence it **after group 1** and after step 14.
+> in terms of it so the signature appears once. Sequence it **after group 1**; step 14 is already
+> done, so that half of the sequencing is discharged.
 > Step 16 does not dissolve into this: the move-only gap lives in `queued_action_t` upstream, and a
 > template parameter on the pool does not reach it.

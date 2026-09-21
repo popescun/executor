@@ -46,15 +46,14 @@ class executor {
     workers_.reserve(worker_count);
 
     for (std::size_t index = 0; index < worker_count; ++index) {
-      worker next;
-      next.exec = worker_execution::create_instance("pool_worker_" + std::to_string(index));
+      auto next = worker_execution::create_instance("pool_worker_" + std::to_string(index));
 
       // How a worker learns there is more waiting for it. is_busy() answers whether a worker has
       // room; this is what tells the pool the moment one frees up, without anybody polling.
-      next.exec->on_finished = [this, index] { take_next_task(index); };
+      next->on_finished = [this, index] { take_next_task(index); };
 
       workers_.push_back(std::move(next));
-      workers_.back().exec->start();
+      workers_.back()->start();
     }
   }
 
@@ -71,7 +70,7 @@ class executor {
     // Outside the lock: stop() wakes each worker, and a worker waking up runs on_finished, which
     // wants this mutex.
     for (auto& one : workers_) {
-      one.exec->stop();
+      one->stop();
     }
 
     // Releasing the last shared_ptr runs ~execution(), which waits for the detached worker.
@@ -94,7 +93,7 @@ class executor {
     // waiting does not get to overtake them just because a worker happens to be free.
     if (pending_.empty()) {
       for (std::size_t index = 0; index < workers_.size(); ++index) {
-        if (!workers_[index].exec->is_busy()) {
+        if (!workers_[index]->is_busy()) {
           give_to_worker(index, std::move(task));
           return true;
         }
@@ -116,10 +115,6 @@ class executor {
  private:
   using worker_execution = untangle::async::execution<std::function<void(void)>>;
 
-  struct worker {
-    std::shared_ptr<worker_execution> exec;
-  };
-
   /**
    * @brief Hands one task to a worker. Call with the mutex held.
    *
@@ -130,7 +125,7 @@ class executor {
     // add_action() takes the execution's own action_mutex while this holds mutex_. That is only
     // safe in one direction, and it holds: a worker calls on_finished with action_mutex released,
     // so it never takes mutex_ while holding action_mutex, and the two never form a cycle.
-    workers_[index].exec->add_action(std::move(task));
+    workers_[index]->add_action(std::move(task));
   }
 
   /**
@@ -159,7 +154,7 @@ class executor {
    */
   bool nothing_running() const {
     for (const auto& one : workers_) {
-      if (one.exec->is_busy()) {
+      if (one->is_busy()) {
         return false;
       }
     }
@@ -171,7 +166,7 @@ class executor {
   std::condition_variable drained_cv_;
 
   std::deque<task_t> pending_;  //!< Tasks waiting for a worker, in the order submitted.
-  std::vector<worker> workers_;
+  std::vector<std::shared_ptr<worker_execution>> workers_;
   bool accepting_ = true;
 };
 

@@ -403,3 +403,20 @@ TEST(executor_tests, an_idle_pool_shuts_down) {
   executor pool(4);
   EXPECT_EQ(pool.pending(), 0u);
 }
+
+/**
+ * @brief A pool that can run nothing is refused before it exists - fix plan step 1.
+ *
+ * executor(0) is accepted today. workers_ is empty, so submit() finds no free worker, queues the
+ * task and answers true; the destructor then waits for pending_ to empty, which no worker will ever
+ * make true, and nothing_running() is vacuously true over no workers, so the predicate never comes
+ * up with it. std::thread::hardware_concurrency() returns 0 when it cannot tell, and a caller
+ * passing it straight through is the likely way in.
+ *
+ * @remark The hang needs a submit(), and this case does not perform one: an empty pool that is
+ * never given work destructs cleanly. What is stated here is the guard rather than the hang it
+ * prevents, so the case reports a missing throw instead of wedging the suite for three seconds.
+ */
+TEST(executor_tests, a_pool_with_no_workers_is_refused) {
+  EXPECT_THROW(executor(0), std::invalid_argument);
+}
