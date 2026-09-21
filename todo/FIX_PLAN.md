@@ -1,11 +1,11 @@
 # executor.hpp — fix plan
 
-**Status (2026-09-21) — four steps landed, two blockers closed.** The pool was imported from
+**Status (2026-09-21) — four steps landed, two blockers closed and one disproven.** The pool was imported from
 `async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before it
 can be called production ready. 19 items, in seven groups — item 19 was added after the audit
-closed and is a decision rather than a finding; see group 7. **Four were blockers**: each one is a way
-the pool can hang or read freed memory, and three of the four are reachable without any misuse.
-**Two are left** — 3 and 4, both in the destructor.
+closed and is a decision rather than a finding; see group 7. **Four were called blockers**: each was read as a way
+the pool can hang or read freed memory. **One is left** — step 4. Steps 1 and 2 were fixed; step 3
+was probed and does not reproduce, so it is closed as not a defect rather than fixed.
 **Tests:** 20 of 20 green in Debug, 2026-09-21; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 23 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Step 2 is closed** (`b68cc97`). The destructor now waits on an
@@ -42,7 +42,9 @@ was the first blocker closed**, and the cheapest of the four — a guard in the 
 to how a working pool behaves. **Step 2 is the second, and the one that mattered**: it is the only
 use-after-free in the audit, and the only finding a sanitizer had named. Step 20's stress case is
 what made it reproducible on a second platform, and it landed in step 2's own commit because the
-case is that fix's evidence. **Two blockers remain**, both in the destructor: 3 and 4.
+case is that fix's evidence. **Step 3 is closed without a code change**: a probe disproved its
+premise — a constructor that throws already stops and waits for every worker it started, because
+member destruction unwinds `workers_` and `~execution()` does both. **One blocker remains**, step 4.
 
 Step 19 is still under way. The "before" half ran on 2026-09-21, locally and then on CI, and paid
 for itself immediately: CI's TSan named step 2, which had been the one blocker resting on a reading
@@ -66,13 +68,12 @@ own hash, so the table below is filled by the `chore: update fix plan` that foll
 also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` under an amend and left
 three dangling references behind it.
 
-**NEXT: the rest of group 1 — steps 3 and 4.** Steps 14 (`4c1cba6`), 1 (`ba4eb82`) and 2
-(`b68cc97`) are done. What is left of the group is the same destructor, and step 2 has already
-settled the teardown both remaining steps build on: drain, `stop()` every worker outside the lock,
-wait on `poll_` until none is in its thread, then clear. Step 3 reuses that teardown minus the
-drain — a constructor that throws has nothing to drain, but it has started workers holding `this`,
-so it needs the same wait before it unwinds. Step 4 changes only how the wait reports itself, and
-the wait it changes is now the poll loop rather than the condition variable.
+**NEXT: step 4, and it is what is left of group 1.** Steps 14 (`4c1cba6`), 1 (`ba4eb82`) and 2
+(`b68cc97`) are done, and step 3 is closed on a probe rather than a fix. Step 2 settled the teardown
+step 4 builds on: drain, `stop()` every worker outside the lock, wait on `poll_` until none is in
+its thread, then clear. Step 4 changes only how that wait reports itself, and the wait it changes is
+now the poll loop rather than the condition variable — so it is a smaller step than it was when
+written, and the last one standing between the pool and a group 1 that is done.
 
 Step 22 (any task type) comes after all four, not before: a hang and a use-after-free outrank a
 surface change, and templating the class is a whole-file diff that is far easier to review against
@@ -105,7 +106,7 @@ returns something give back — so read those two before deciding what it means 
 | **Group 1 — lifetime (blockers)** |
 | 1 ✅ | 1 | a pool with no workers takes work nothing can run, and never dies | `:57-74`, `:79-94` | CONFIRMED (hangs; probe) |
 | 2 ✅ | 2 | `~executor()` mutates `workers_` outside the mutex every reader takes | `:95-116` | CONFIRMED (TSan, CI) — fixed `b68cc97` |
-| 3 | 3 | a constructor that throws leaves started workers holding `this` | `:57-74` | read-only |
+| 3 ✅ | 3 | a constructor that throws leaves started workers holding `this` | `:59-84` | DISPROVEN (probe) — not a defect |
 | 4 | 4 | the destructor waits forever on a task that never returns | `:79-84` | read-only |
 | **Group 2 — what the caller is told** |
 | 5 | 5 | a task that throws is reported to stderr and to nobody else | `:140-145` | CONFIRMED (test) |
@@ -136,8 +137,9 @@ returns something give back — so read those two before deciding what it means 
 
 ## Group 1 — lifetime (blockers)
 
-Four ways the pool outlives or under-lives itself. Every one of them is in the constructor or the
-destructor, and none of them needs a caller to do anything unusual.
+Four ways the pool was read as outliving or under-living itself. Every one is in the constructor or
+the destructor, and none needs a caller to do anything unusual. Three are settled: 1 and 2 by a fix,
+3 by a probe that disproved it.
 
 ### Step 1 ✅ · item 1 — a pool with no workers takes work nothing can run
 `executor.hpp:45-59`, `:79-94` · CONFIRMED by probe: the destructor does not return
@@ -315,29 +317,54 @@ if a running task may still submit, `pending_` is not empty at teardown.
 > but step 7 is the open question of whether a running task may still submit, and if that answer is
 > "yes" it is no longer empty. Write the guard now; the two steps meet here.
 
-### Step 3 · item 3 — a throwing constructor leaves started workers holding `this` — OPEN
-`executor.hpp:45-59` · read-only
+### Step 3 ✅ · item 3 — a throwing constructor leaves started workers holding `this` — CLOSED, NOT A DEFECT
+`executor.hpp:59-84` · **DISPROVEN by probe, 2026-09-21** · no code change
 
-The constructor starts each worker as it builds it:
+**The premise was wrong, and a probe is what showed it.** The finding reasoned that because
+`~executor()` is never called for an object that never finished constructing, nothing cleans up.
+Member destructors still run. `workers_` is a `std::vector<std::shared_ptr<worker_execution>>`, so
+unwinding destroys it, dropping the last reference to each execution, and `~execution()`
+(`async.hpp:266`) sets `stopped_`, notifies `action_cv_`, and spins on `running_` until that worker
+has left `loop()`. Stopping and waiting for every started worker is exactly what the scope guard
+below was to be written for, and it already happens.
 
-```c++
-workers_.push_back(std::move(next));
-workers_.back().exec->start();
+**The probe.** A scratch copy of the header with `throw std::runtime_error(...)` injected straight
+after `workers_.back()->start()` at `index == 2`, constructing `executor(4)` so two workers are
+started and running when the body throws:
+
+```
+== constructing executor(4), throw injected at worker 2 ==
+execution 'pool_worker_2' thread finished
+execution 'pool_worker_1' thread finished
+execution 'pool_worker_0' thread finished
+caught: injected: thread creation failed
+== 500ms after the unwind ==
+== clean exit ==
 ```
 
-Worker 0 is running, with `on_finished` capturing `this`, before worker 1 is created. If creating
-worker 1 throws — `create_instance` allocates, `push_back` reallocates, `std::thread` construction
-can throw `std::system_error` when a thread cannot be started, which is the plausible one at a
-large worker count — then the object never finishes construction, **so `~executor()` is never
-called**. Every worker already started keeps running, keeps a callback into a pool whose storage is
-about to be reused, and is detached, so nothing joins it.
+Clean under ASan and under TSan, exit 0, Apple clang 21.0.0. The ordering is the result: every
+worker reports `thread finished` **before** the catch, so all three are stopped and waited for
+during the unwind rather than left running.
 
-`std::system_error` from `std::thread` is the realistic trigger, and it arrives exactly when a
-caller asks for more workers than the system will give.
+**The dangling callback cannot fire either.** `on_finished` does capture `this`, but
+`notify_finished()` (`async.hpp:781`) returns early on `actions_run_ == 0 || !on_finished`. A worker
+that has never run an action never calls back, and during construction no task can exist — nothing
+can reach `submit()` on a pool that has not finished constructing. That is also what keeps step 2's
+race off this path: no worker is ever inside `take_next_task()` iterating a `workers_` being
+destroyed.
 
-> A function-try-block, or a scope guard around the loop: on the way out, stop and release whatever
-> was started, then rethrow. What it has to do is the destructor's job minus the drain, so write it
-> where step 2 leaves the destructor rather than before.
+**The other two triggers do not survive either.** `push_back` cannot reallocate, because
+`workers_.reserve(worker_count)` runs before the loop. A `bad_alloc` out of `create_instance`
+unwinds identically to the injected throw.
+
+> **Nothing to do.** The function-try-block the step asked for would re-implement what member
+> destruction already does. What remains is not this step's: the unwind is correct because
+> `~execution()` stops *and* waits, which is async.hpp's behaviour rather than a stated contract of
+> it — the same exposure step 10 records about the lock order. If that is ever to be pinned down,
+> pin it there, once, for both.
+>
+> The original prescription, kept for the record: *a function-try-block, or a scope guard around the
+> loop: on the way out, stop and release whatever was started, then rethrow.*
 
 ### Step 4 · item 4 — the destructor waits forever on a task that never returns — OPEN
 `executor.hpp:64-70` · read-only
