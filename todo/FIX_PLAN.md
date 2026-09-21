@@ -1,22 +1,24 @@
 # executor.hpp — fix plan
 
-**Status (2026-09-21) — four steps landed, two blockers closed and one disproven.** The pool was imported from
+**Status (2026-09-21) — group 1 is done: every blocker closed or disproven.** The pool was imported from
 `async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before it
 can be called production ready. 19 items, in seven groups — item 19 was added after the audit
 closed and is a decision rather than a finding; see group 7. **Four were called blockers**: each was read as a way
-the pool can hang or read freed memory. **One is left** — step 4. Steps 1 and 2 were fixed; step 3
-was probed and does not reproduce, so it is closed as not a defect rather than fixed.
+the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed; step 3 was
+probed and does not reproduce, so it is closed as not a defect rather than fixed. What is left in
+the plan is group 2 onwards — what the caller is told, placement, and the surface.
 **Tests:** 20 of 20 green in Debug, 2026-09-21; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 23 pages (was 19 at the import), rebuilt with
-`tools/make_doc.sh`. **Step 2 is closed** (`b68cc97`). The destructor now waits on an
+`tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `d10d400`). The destructor now waits on an
 `async::execution_poll` until every worker has left its thread and clears them only then, and the
 race TSan named on CI no longer reproduces: 20 of 20 under TSan and under ASan on macOS/libc++,
 where the case that provokes it aborted before the fix. **That is one platform, not both** — the
 Linux/libstdc++ run this plan insists on has not been made since the fix, which is why step 19
 stays open.
-**Sites** are line numbers in `executor.hpp` as of `2814742`, and they move with every fix that
-lands — they were remapped after steps 14 and 1, and step 2 moved them again. Re-read them before
-trusting them.
+**Sites** are line numbers in `executor.hpp` as of `d10d400`, and they move with every fix that
+lands — they were remapped after steps 14 and 1, and steps 2 and 4 moved them again. Re-read them
+before trusting them. **Names move too:** `d10d400` replaced "drain" with "finish" throughout, so
+`drained_cv_` is `finished_cv_` and entries written before it may still say drain.
 **Source:** read of `executor.hpp` against `async.hpp` at `22c5892`, 2026-09-21. Five findings are
 confirmed by a probe or by a test that failed before it was corrected; the rest are read-only and
 say so.
@@ -44,7 +46,9 @@ use-after-free in the audit, and the only finding a sanitizer had named. Step 20
 what made it reproducible on a second platform, and it landed in step 2's own commit because the
 case is that fix's evidence. **Step 3 is closed without a code change**: a probe disproved its
 premise — a constructor that throws already stops and waits for every worker it started, because
-member destruction unwinds `workers_` and `~execution()` does both. **One blocker remains**, step 4.
+member destruction unwinds `workers_` and `~execution()` does both. **Step 4 keeps its unbounded
+wait and reports instead**: bounding it was never available, since giving up early is step 2's
+use-after-free and a bounded wait only moves the hang into `~execution()`. **No blocker remains.**
 
 Step 19 is still under way. The "before" half ran on 2026-09-21, locally and then on CI, and paid
 for itself immediately: CI's TSan named step 2, which had been the one blocker resting on a reading
@@ -68,12 +72,15 @@ own hash, so the table below is filled by the `chore: update fix plan` that foll
 also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` under an amend and left
 three dangling references behind it.
 
-**NEXT: step 4, and it is what is left of group 1.** Steps 14 (`4c1cba6`), 1 (`ba4eb82`) and 2
-(`b68cc97`) are done, and step 3 is closed on a probe rather than a fix. Step 2 settled the teardown
-step 4 builds on: drain, `stop()` every worker outside the lock, wait on `poll_` until none is in
-its thread, then clear. Step 4 changes only how that wait reports itself, and the wait it changes is
-now the poll loop rather than the condition variable — so it is a smaller step than it was when
-written, and the last one standing between the pool and a group 1 that is done.
+**NEXT: group 2 — steps 5, 6 and 7, what the caller is told.** Group 1 is done, and the couplings
+below say to settle 5 and 6 together rather than in two passes: both ask what happened to the task I
+gave you, and the async plan's own steps 21 and 28 answered that question twice and badly by
+splitting it. Step 13 comes before step 5, because a report needs a pool name to put in it.
+
+Step 4 left two things behind that are not group 2's and not this repo's. The report names the
+worker but cannot name the task, which needs item 19 (step 22) before a task can carry a label; and
+ending a hang rather than explaining it needs cancellation in `async::execution`. Both are recorded
+at the foot of step 4.
 
 Step 22 (any task type) comes after all four, not before: a hang and a use-after-free outrank a
 surface change, and templating the class is a whole-file diff that is far easier to review against
@@ -98,6 +105,7 @@ returns something give back — so read those two before deciding what it means 
 | `cfd5aea` | 19 (part) — `debug`/`release`/`asan`/`tsan` presets, so a sanitizer run is one command |
 | `b68cc97` | 2 — `~executor()` waits on an `execution_poll` before clearing; 20 — its stress case |
 | `2814742` | — `async` submodule to `22c5892`, which removed `execution_poll::get()` |
+| `d10d400` | 4 — both destructor waits report the workers they are still waiting on |
 
 ## Step index
 
@@ -107,7 +115,7 @@ returns something give back — so read those two before deciding what it means 
 | 1 ✅ | 1 | a pool with no workers takes work nothing can run, and never dies | `:57-74`, `:79-94` | CONFIRMED (hangs; probe) |
 | 2 ✅ | 2 | `~executor()` mutates `workers_` outside the mutex every reader takes | `:95-116` | CONFIRMED (TSan, CI) — fixed `b68cc97` |
 | 3 ✅ | 3 | a constructor that throws leaves started workers holding `this` | `:59-84` | DISPROVEN (probe) — not a defect |
-| 4 | 4 | the destructor waits forever on a task that never returns | `:99`, `:111-113` | read-only |
+| 4 ✅ | 4 | the destructor waits forever on a task that never returns | `:104-121`, `:136-152` | CONFIRMED (test) — fixed `d10d400` |
 | **Group 2 — what the caller is told** |
 | 5 | 5 | a task that throws is reported to stderr and to nobody else | `:140-145` | CONFIRMED (test) |
 | 6 | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:140-145` | read-only |
@@ -138,8 +146,8 @@ returns something give back — so read those two before deciding what it means 
 ## Group 1 — lifetime (blockers)
 
 Four ways the pool was read as outliving or under-living itself. Every one is in the constructor or
-the destructor, and none needs a caller to do anything unusual. Three are settled: 1 and 2 by a fix,
-3 by a probe that disproved it.
+the destructor, and none needs a caller to do anything unusual. All four are settled: 1, 2 and 4 by
+a fix, 3 by a probe that disproved it.
 
 ### Step 1 ✅ · item 1 — a pool with no workers takes work nothing can run
 `executor.hpp:45-59`, `:79-94` · CONFIRMED by probe: the destructor does not return
@@ -147,7 +155,7 @@ the destructor, and none needs a caller to do anything unusual. Three are settle
 `executor(0)` is accepted. `workers_` is empty, so `submit()` finds no free worker, queues the task
 and answers true; `pending()` says 1. The destructor then waits for `pending_.empty()`, which no
 worker will ever make true, and `nothing_running()` — which is vacuously true over no workers —
-never brings the predicate up with it. Nothing notifies `drained_cv_` either, because only
+never brings the predicate up with it. Nothing notifies `finished_cv_` either, because only
 `take_next_task()` does and it runs on a worker thread. The probe hung at its 3-second watchdog:
 
 ```
@@ -366,27 +374,52 @@ unwinds identically to the injected throw.
 > The original prescription, kept for the record: *a function-try-block, or a scope guard around the
 > loop: on the way out, stop and release whatever was started, then rethrow.*
 
-### Step 4 · item 4 — the destructor waits forever on a task that never returns — OPEN
-`executor.hpp:99`, `:111-113` · read-only · **sites remapped after step 2**, which split the wait in
-two: the drain on `drained_cv_` at `:99`, and the poll loop at `:111-113`. Both are unbounded, so
-the step now has two waits to answer for rather than one.
+### Step 4 ✅ · item 4 — the destructor waits forever on a task that never returns — DONE (`d10d400`)
+`executor.hpp:104-121`, `:136-152` · **CONFIRMED (test)** · the wait is unchanged; the silence is what was fixed
 
-```c++
-drained_cv_.wait(lock, [this] { return pending_.empty() && nothing_running(); });
+**The wait is still unbounded, and that is the answer rather than a compromise.** Abandoning a
+running task would be worse, and it is not even available: returning early from `~executor()` while
+a worker is still in a task is exactly the use-after-free step 2 closed, and bounding the wait would
+only move the hang three lines down into `~execution()`, which spins on `running_`
+(`async.hpp:282`) with no timeout of its own. Workers are detached and `async::execution` has no
+cancellation, so a pool cannot outlive a task it cannot interrupt. What was fixed is the silence.
+
+**Both waits report, and they are kept apart because they answer different questions.** Step 2 split
+one wait into two, and they are not interchangeable:
+
+| Wait | Asks | Reports |
+|---|---|---|
+| `finished_cv_`, `:104-121` | who is still inside a task | queue depth, and `is_busy()` workers by name |
+| the poll loop, `:136-152` | whose thread has not left | `is_running()` workers by name |
+
+The second is "which worker does not stop", and it can be true of a worker that is idle — which is
+why a single combined report would have been the wrong shape.
+
+**It names workers rather than counting them.** `count_workers()` and `name_workers()` take a
+member-function pointer, so one pair of helpers serves both waits through `is_busy()` and
+`is_running()`. The name is `execution::name`, so one worker reads the same here and in async's own
+warnings:
+
+```
+executor: still waiting to finish after 1s - 1 queued, 4 in a task: pool_worker_0, pool_worker_1, pool_worker_2, pool_worker_3
+executor: still waiting to finish after 3s - 1 queued, 4 in a task: pool_worker_0, pool_worker_1, pool_worker_2, pool_worker_3
+executor: still waiting to finish after 7s - 0 queued, 1 in a task: pool_worker_1
 ```
 
-An unbounded wait. A task that blocks on something that never arrives takes the destructor with it,
-and the process shows a thread parked in `~executor` with nothing said about which task or which
-worker. That is the correct default — the alternative, abandoning a running task, is worse — but it
-is a hang, and a hang that says nothing is a support call.
+**The interval starts at 1s and doubles to a 30s ceiling** (`report_first_ms`, `report_max_ms`). A
+fixed interval was what this step originally asked for; backoff was taken instead because the two
+things wanted pull opposite ways — a stuck teardown should say something almost at once, and a long
+one should not become a log flood. It also keeps the case that tests it near two seconds rather than
+past the interval.
 
-Distinct from step 1: there the wait is unsatisfiable by construction, here it is a task's fault
-and the pool is behaving as designed.
+**Verified by `executor_tests.a_destructor_stuck_on_a_task_reports_why`**, which failed before this
+with an empty capture after two seconds. 21 of 21 on `debug`, `asan` and `tsan`.
 
-> Keep the wait unbounded, and say something: `wait_for` on a long interval, and a
-> `std::println(stderr, ...)` naming the pool, the queue depth and how many workers are still busy,
-> repeated while it waits. The destructor still does not give up; it stops being silent about why.
-> Whether the interval is 5s or 30s is worth one measurement, not a debate.
+> **What is left is not this step's, and not this repo's.** The report cannot name the task, only
+> the worker: `task_t` is `std::function<void(void)>` and carries nothing to identify. Naming the
+> blocking action needs item 19 (step 22) first, and after that a label a task can carry. Ending the
+> hang at all — rather than explaining it — needs cancellation in `async::execution`, a stop token an
+> action can poll. Neither belongs in `executor.hpp`; the second is async's, in the way step 11 is.
 
 ## Group 2 — what the caller is told
 
