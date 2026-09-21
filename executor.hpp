@@ -72,10 +72,10 @@ class executor {
 
       // A worker runs in a detached thread and cannot be joined, so asking whether it is still
       // running is the only way to wait for one, and the poll answers that for any number of them
-      // at once. This pool's own poll rather than the process-wide one: what the destructor asks
-      // is about these workers, and execution_poll::get() would answer it for every execution in
-      // the process. Nothing here has to unregister - the record runs both ways, so whichever of
-      // the two dies first takes itself out of the other.
+      // at once. A poll answers for the executions added to it, and this one is added the pool's
+      // own workers and nothing else, so what the destructor waits for is exactly these. Nothing
+      // here has to unregister - the record runs both ways, so whichever of the two dies first
+      // takes itself out of the other.
       poll_.add(*next);
 
       workers_.push_back(std::move(next));
@@ -211,10 +211,9 @@ class executor {
   /**
    * @brief Stands in for joining this pool's workers, which are detached and cannot be joined.
    *
-   * The pool's own rather than async::execution_poll::get(): that one answers for every execution
-   * registered with it anywhere in the process, so a destructor waiting on it would wait for
-   * another pool's workers too - and a continuous worker runs for the life of its execution, so
-   * that wait would not end.
+   * Holds this pool's workers and nothing else. A poll answers for the executions added to it, so
+   * one shared with a second pool would make this destructor wait for that pool's workers too -
+   * and a continuous worker runs for the life of its execution, so that wait would not end.
    *
    * Declared before the workers so it outlives them, though it does not depend on that: an
    * execution withdraws from every poll holding it, and a poll releases every execution it holds.
