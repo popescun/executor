@@ -14,6 +14,7 @@
 #pragma once
 
 #include <async.hpp>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -22,6 +23,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -68,6 +70,14 @@ class executor {
       // room; this is what tells the pool the moment one frees up, without anybody polling.
       next->on_finished = [this, index] { take_next_task(index); };
 
+      // A worker runs in a detached thread and cannot be joined, so asking whether it is still
+      // running is the only way to wait for one, and the poll answers that for any number of them
+      // at once. This pool's own poll rather than the process-wide one: what the destructor asks
+      // is about these workers, and execution_poll::get() would answer it for every execution in
+      // the process. Nothing here has to unregister - the record runs both ways, so whichever of
+      // the two dies first takes itself out of the other.
+      poll_.add(*next);
+
       workers_.push_back(std::move(next));
       workers_.back()->start();
     }
@@ -75,6 +85,12 @@ class executor {
 
   /**
    * @brief Drains what has been submitted, then stops every worker.
+   *
+   * @remark Every worker has left its thread before the first execution is destroyed. That is what
+   * the poll is for: ~execution() waits only for its *own* worker, so destroying the executions one
+   * at a time would free the first while another's thread is still reading it through
+   * nothing_running(). The wait is on this pool's own poll, so a second pool running alongside
+   * this one is not something this destructor waits for.
    */
   ~executor() {
     {
@@ -89,7 +105,14 @@ class executor {
       one->stop();
     }
 
-    // Releasing the last shared_ptr runs ~execution(), which waits for the detached worker.
+    // The poll stands in for a join. Until it reports idle, a worker can still be inside
+    // take_next_task(), reading every execution through nothing_running() and is_busy() - which is
+    // what makes destroying them here a use-after-free rather than a teardown.
+    while (poll_.is_running()) {  // time of check
+      std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
+    }
+
+    // time of use: no worker thread is left to reach workers_, so clearing it races nothing.
     workers_.clear();
   }
 
@@ -178,8 +201,25 @@ class executor {
     return true;
   }
 
+  //! How often the destructor asks the poll whether the workers have left. Matches the interval
+  //! async's own smoke test waits at.
+  static constexpr int poll_interval_ms = 50;
+
   mutable std::mutex mutex_;
   std::condition_variable drained_cv_;
+
+  /**
+   * @brief Stands in for joining this pool's workers, which are detached and cannot be joined.
+   *
+   * The pool's own rather than async::execution_poll::get(): that one answers for every execution
+   * registered with it anywhere in the process, so a destructor waiting on it would wait for
+   * another pool's workers too - and a continuous worker runs for the life of its execution, so
+   * that wait would not end.
+   *
+   * Declared before the workers so it outlives them, though it does not depend on that: an
+   * execution withdraws from every poll holding it, and a poll releases every execution it holds.
+   */
+  async::execution_poll poll_;
 
   std::deque<task_t> pending_;  //!< Tasks waiting for a worker, in the order submitted.
   std::vector<std::shared_ptr<worker_execution>> workers_;

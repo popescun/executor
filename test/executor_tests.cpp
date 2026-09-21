@@ -420,3 +420,55 @@ TEST(executor_tests, an_idle_pool_shuts_down) {
 TEST(executor_tests, a_pool_with_no_workers_is_refused) {
   EXPECT_THROW(executor(0), std::invalid_argument);
 }
+
+/**
+ * @brief Destroying a pool while its workers are still turning over - fix plan step 2.
+ *
+ * ~executor() takes no lock for the parts that touch workers_. It stop()s each worker and then
+ * clear()s the vector, while a worker thread can be inside take_next_task() - holding mutex_,
+ * which the destructor is not holding - and reading every worker through nothing_running() and
+ * is_busy(). clear() destroys the executions in order, and ~execution() waits only on its own
+ * worker, so freeing worker 0 while worker 2's thread is still locking worker 0's action_mutex_ is
+ * enough on its own; the vector does not have to be racing anything.
+ *
+ * The window is opened by not waiting. The drain predicate is satisfied by whichever worker calls
+ * take_next_task() last, and it reads the other workers through is_busy(); one that has just
+ * cleared executing_action_ and has not yet reached its own on_finished reads as idle there. So
+ * the destructor can be released by one worker while another is an instruction away from entering
+ * take_next_task() and touching a vector whose elements are being freed.
+ *
+ * @attention This case cannot fail on an ordinary build, and passing it proves nothing there. The
+ * accesses are unsynchronised rather than wrong in any order a plain build can observe, so all it
+ * does is open the window repeatedly and leave the verdict to a sanitizer standing in it.
+ * Configure with -DEXECUTOR_SANITIZE=thread, where it aborts. Measured 2026-09-21 on macOS/libc++
+ * as well as on CI's Linux/libstdc++ - which is the reason the case exists. The suite's other
+ * eighteen cases were TSan-clean on macOS while CI reported the race from
+ * executor_smoke_test.concurrent_submission, so the difference was never the platform; it was that
+ * nothing here destroyed a pool often enough. This is the churn case step 20 asks for.
+ *
+ * @attention AddressSanitizer does not report it, and its silence is not an acquittal. The race is
+ * a free on one thread against a read on another with nothing ordering them; ASan sees a fault only
+ * when the read actually lands after the free, which it has not in any run measured here. TSan
+ * reports the missing order itself, which is the defect.
+ *
+ * @remark The expectation it does state is the drain: every task submitted before the scope closed
+ * has run by the time the destructor returns. That much is meaningful on any build.
+ */
+TEST(executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
+  constexpr int rounds = 50;
+  constexpr int tasks_per_round = 64;
+  std::atomic_int ran = {0};
+
+  for (int round = 0; round < rounds; ++round) {
+    executor pool(4);
+
+    for (int i = 0; i < tasks_per_round; ++i) {
+      pool.submit([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+    }
+
+    // Deliberately no wait: leaving the scope with the queue still backed up is what puts workers
+    // inside take_next_task() at the moment the destructor reaches clear().
+  }
+
+  EXPECT_EQ(ran.load(), rounds * tasks_per_round);
+}

@@ -1,18 +1,20 @@
 # executor.hpp — fix plan
 
-**Status (2026-09-21) — one step landed, no blocker yet.** The pool was imported from
+**Status (2026-09-21) — two steps landed, one blocker closed.** The pool was imported from
 `async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before it
 can be called production ready. 19 items, in seven groups — item 19 was added after the audit
 closed and is a decision rather than a finding; see group 7. **Four are blockers**: each one is a way
 the pool can hang or read freed memory, and three of the four are reachable without any misuse.
-**Tests:** 19 cases, 18 green and 1 deliberately red — step 1's guard, written before its fix;
-clang-format clean;
-doxygen clean, `doc/refman.pdf` at 19 pages. **Both sanitizers have now been run, and TSan has
+**Tests:** 19 of 19 green in Debug, 2026-09-21; clang-format clean;
+doxygen clean, `doc/refman.pdf` at 23 pages (was 19 at the import), rebuilt with
+`tools/make_doc.sh`. **Both sanitizers have now been run, and TSan has
 named step 2.** Locally (macOS, libc++) both came back clean; on CI (Linux, GCC 14, libstdc++) TSan
 reported a data race in `concurrent_submission` between `~executor()` and a worker in
 `take_next_task()`. Step 2 moves from read-only to CONFIRMED, and the blocker count stands. See step
 19 for both runs and why the local clean sheet was platform luck rather than evidence. (An earlier
 draft of this line called the sanitizers step 17; they are step 19.)
+**Sites** are line numbers in `executor.hpp` as of `ba4eb82`, and they move with every fix that
+lands — they were remapped once already, after steps 14 and 1. Re-read them before trusting them.
 **Source:** read of `executor.hpp` against `async.hpp` at `4acb06d`, 2026-09-21. Five findings are
 confirmed by a probe or by a test that failed before it was corrected; the rest are read-only and
 say so.
@@ -28,13 +30,15 @@ which is upstream's to fix.
 keeps the prototype's surface: `submit()` and `pending()`. No futures, no priorities, no results.
 Items 9, 16 and 18 are recorded against that decision rather than argued with; if the decision
 changes, they are where to start. **The task type is no longer part of it:** the pool is to run any
-task type rather than the `std::function<void(void)>` fixed at `:40`. That is item 19, group 7, and
+task type rather than the `std::function<void(void)>` fixed at `:41`. That is item 19, group 7, and
 it pulls items 5, 16 and 18 along with it.
 
 ## Progress
 
-Done — step 14, and nothing else. It is the only change to `executor.hpp` so far and it is a
-refactor: nothing it touched was defective. **No blocker has landed.**
+Done — steps 14 and 1. Step 14 was a refactor: nothing it touched was defective. **Step 1 is the
+first blocker closed**, and it is the cheapest of the four — a guard in the constructor, no change
+to how a working pool behaves. **Three blockers remain**, all of them in the destructor: 2, 3
+and 4.
 
 Step 19 is under way rather than done: its first sanitizer pass ran on 2026-09-21, locally and then
 on CI, and produced no code change to commit — the "before" half is done, the "after" half waits on
@@ -45,13 +49,23 @@ resting on a reading rather than on a report.
 for review on its own, and the fix written only once that case is agreed. The test is the unit of
 review, not the fix.
 
-**NEXT: group 1 in order — steps 1, 2, 3, 4.** Step 14 is done (`bf7739b`), which is what these
-were waiting on: it rewrote the lines step 2 would otherwise have touched twice. The four blockers
-come together, because they are all in the constructor and the destructor and that is one pass over
-those lines rather than four. Step 2 is the one to read first of them: it is the only finding here
-that is a use-after-free, and the shape of its fix — the destructor taking `mutex_` for the parts
-that touch `workers_` — decides how steps 1 and 4 are written. Step 1's case is already written and
-red; its fix is the next thing to write.
+**One step per commit**, and a step's case travels with its own fix. `4c1cba6` is the counter-example
+to avoid: it is step 14's refactor, and step 1's case rode along in it because the case had been
+written while the refactor was still unstaged. Nothing was wrong with either change, but the commit
+says one thing in its subject and does two, and a reader chasing step 1 finds half of it under step
+14. `ba4eb82` is the shape to keep — `executor.hpp` alone, 16 lines, one step.
+
+The plan's own updates are their own commit too, and always a later one: a commit cannot record its
+own hash, so the table below is filled by the `chore: update fix plan` that follows the fix. That is
+also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` under an amend and left
+three dangling references behind it.
+
+**NEXT: the rest of group 1 — steps 2, 3, 4.** Steps 14 (`4c1cba6`) and 1 are done. What is left
+of the group is one pass over the destructor, and step 2 is the one to read first: it is the only
+finding here that is a use-after-free, and the shape of its fix — the destructor taking `mutex_`
+for the parts that touch `workers_`, with the workers moved out under the lock — decides how 3 and
+4 are written. Step 3 then reuses that teardown minus the drain, and step 4 changes only how the
+wait reports itself.
 
 Step 22 (any task type) comes after all four, not before: a hang and a use-after-free outrank a
 surface change, and templating the class is a whole-file diff that is far easier to review against
@@ -71,37 +85,38 @@ returns something give back — so read those two before deciding what it means 
 
 | Commit | Step |
 |---|---|
-| `bf7739b` | 14 — `struct worker` replaced by `std::vector<std::shared_ptr<worker_execution>>` |
+| `4c1cba6` | 14 — `struct worker` replaced by `std::vector<std::shared_ptr<worker_execution>>` |
+| `ba4eb82` | 1 — `executor(0)` refused with `std::invalid_argument` |
 
 ## Step index
 
 | # | Item | Concern | Sites | Verified |
 |---|---|---|---|---|
 | **Group 1 — lifetime (blockers)** |
-| 1 | 1 | a pool with no workers takes work nothing can run, and never dies | `:45-59`, `:64-79` | CONFIRMED (hangs; probe) |
-| 2 | 2 | `~executor()` mutates `workers_` outside the mutex every reader takes | `:73-78`, `:139-157`, `:160-167` | **CONFIRMED (TSan, CI)** |
-| 3 | 3 | a constructor that throws leaves started workers holding `this` | `:45-59` | read-only |
-| 4 | 4 | the destructor waits forever on a task that never returns | `:64-70` | read-only |
+| 1 ✅ | 1 | a pool with no workers takes work nothing can run, and never dies | `:57-74`, `:79-94` | CONFIRMED (hangs; probe) |
+| 2 | 2 | `~executor()` mutates `workers_` outside the mutex every reader takes | `:86-93`, `:150-163`, `:171-179` | **CONFIRMED (TSan, CI)** |
+| 3 | 3 | a constructor that throws leaves started workers holding `this` | `:57-74` | read-only |
+| 4 | 4 | the destructor waits forever on a task that never returns | `:79-84` | read-only |
 | **Group 2 — what the caller is told** |
-| 5 | 5 | a task that throws is reported to stderr and to nobody else | `:129-134` | CONFIRMED (test) |
-| 6 | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:129-134` | read-only |
-| 7 | 7 | work spawned by an in-flight task is refused once shutdown starts | `:67`, `:86-106` | CONFIRMED (test) |
+| 5 | 5 | a task that throws is reported to stderr and to nobody else | `:140-145` | CONFIRMED (test) |
+| 6 | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:140-145` | read-only |
+| 7 | 7 | work spawned by an in-flight task is refused once shutdown starts | `:82`, `:101-121` | CONFIRMED (test) |
 | **Group 3 — placement** |
-| 8 | 8 | the free-worker scan always starts at worker 0 | `:95-101` | CONFIRMED (20 tasks, 1 of 4; probe) |
-| 9 | 9 | the queue is unbounded and nothing pushes back | `:104` | read-only, API decision |
+| 8 | 8 | the free-worker scan always starts at worker 0 | `:110-117` | CONFIRMED (20 tasks, 1 of 4; probe) |
+| 9 | 9 | the queue is unbounded and nothing pushes back | `:119` | read-only, API decision |
 | **Group 4 — what async.hpp imposes** |
-| 10 | 10 | the lock order rests on an async.hpp detail that is not its contract | `:129-134`, `:160-167` | read-only |
+| 10 | 10 | the lock order rests on an async.hpp detail that is not its contract | `:140-145`, `:171-179` | read-only |
 | 11 | 11 | every worker prints to stdout on shutdown | `async.hpp:757` | CONFIRMED (14 lines of 38) |
 | 12 | 12 | the 10ms tick, once per worker | `async.hpp:744-747` | measured, not a defect |
 | **Group 5 — surface and hygiene** |
-| 13 | 13 | worker names collide between pools | `:50` | read-only |
+| 13 | 13 | worker names collide between pools | `:65` | read-only |
 | 14 ✅ | 14 | `struct worker` is a one-field wrapper the prototype outgrew | `:119-121` | read-only |
-| 15 | 15 | copy and move are suppressed by accident, not by statement | `:170` | read-only |
-| 16 | 16 | a move-only task does not compile | `:40` | CONFIRMED (compile probe) |
-| 17 | 17 | `pending()` is advisory and does not say so | `:111-114` | read-only |
-| 18 | 18 | no way to wait for the pool to drain short of destroying it | `:64-79` | read-only, API decision |
+| 15 | 15 | copy and move are suppressed by accident, not by statement | `:181` | read-only |
+| 16 | 16 | a move-only task does not compile | `:41` | CONFIRMED (compile probe) |
+| 17 | 17 | `pending()` is advisory and does not say so | `:126-129` | read-only |
+| 18 | 18 | no way to wait for the pool to drain short of destroying it | `:79-94` | read-only, API decision |
 | **Group 7 — the task type** |
-| 22 | 19 | `task_t` is fixed at `std::function<void(void)>` | `:40`, `:117` | CONFIRMED (compile probe) |
+| 22 | 19 | `task_t` is fixed at `std::function<void(void)>` | `:41`, `:132` | CONFIRMED (compile probe) |
 | **Group 6 — the suite** |
 | 19 | — | the sanitizers have never been run against the suite | `.github/workflows/ci.yml` | — |
 | 20 | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp` | — |
@@ -114,8 +129,8 @@ returns something give back — so read those two before deciding what it means 
 Four ways the pool outlives or under-lives itself. Every one of them is in the constructor or the
 destructor, and none of them needs a caller to do anything unusual.
 
-### Step 1 · item 1 — a pool with no workers takes work nothing can run — OPEN
-`executor.hpp:45-59`, `:64-79` · CONFIRMED by probe: the destructor does not return
+### Step 1 ✅ · item 1 — a pool with no workers takes work nothing can run
+`executor.hpp:45-59`, `:79-94` · CONFIRMED by probe: the destructor does not return
 
 `executor(0)` is accepted. `workers_` is empty, so `submit()` finds no free worker, queues the task
 and answers true; `pending()` says 1. The destructor then waits for `pending_.empty()`, which no
@@ -136,21 +151,23 @@ needs a `submit()`, and `submit()` is the one thing every caller does.
 `std::thread::hardware_concurrency()` returns 0 when it cannot tell, and a caller passing it
 straight through is the likely way in.
 
-> Reject it in the constructor — `std::invalid_argument`, thrown before any worker is started, so a
-> pool that cannot run anything never exists rather than existing and hanging. `<stdexcept>` joins
-> the includes. A default worker count is a separate question and is not this step's.
-
-**The case is written and red** (2026-09-21): `executor_tests.a_pool_with_no_workers_is_refused`,
-one line — `EXPECT_THROW(executor(0), std::invalid_argument)` — reporting *"it throws nothing"*. It
-states the guard rather than the hang: an empty pool that is never given work destructs cleanly, so
-the case never reaches the wait, and it fails in milliseconds instead of wedging the suite for
-three. The hang's standing evidence is the probe above. A first draft built the pool on its own
-thread behind a three-second watchdog, which did reproduce the hang as a failure; it was dropped
-once the answer was settled as the throw, because it left a thread parked in `~executor` that could
-not be joined and that a leak checker would report. Fix not written: awaiting review of the case.
+> Rejected in the constructor — `std::invalid_argument`, thrown before any worker is started, so a
+> pool that cannot run anything never exists rather than existing and hanging. `<stdexcept>` joined
+> the includes. A default worker count is a separate question and was not taken here; the
+> constructor's `@remark` says so, and points at `hardware_concurrency()` returning 0 as the way a
+> zero most often arrives.
+>
+> `executor_tests.a_pool_with_no_workers_is_refused` pins it: one line,
+> `EXPECT_THROW(executor(0), std::invalid_argument)`, reporting *"it throws nothing"* before the
+> guard and green after. It states the guard rather than the hang — an empty pool that is never
+> given work destructs cleanly, so the case never reaches the wait and fails in milliseconds
+> instead of wedging the suite for three seconds. The hang's standing evidence is the probe above.
+> A first draft built the pool on its own thread behind a three-second watchdog and did reproduce
+> the hang as a failure; it was dropped once the answer was settled as the throw, because it left a
+> thread parked in `~executor` that cannot be joined and that a leak checker would report.
 
 ### Step 2 · item 2 — `~executor()` mutates `workers_` outside the mutex — OPEN, CONFIRMED
-`executor.hpp:73-78`, `:139-157`, `:160-167` · **CONFIRMED by TSan on CI, 2026-09-21**: data race in
+`executor.hpp:73-78`, `:150-163`, `:171-179` · **CONFIRMED by TSan on CI, 2026-09-21**: data race in
 `executor_smoke_test.concurrent_submission`, GCC 14 / libstdc++ / Linux
 
 `mutex_` guards `workers_` for every reader: `submit()` scans it, `nothing_running()` iterates it,
@@ -202,6 +219,25 @@ Previous atomic read of size 1 by thread T3 (mutexes: write M0):
 
 M0 is the pool's own `mutex_` — T3 holds it, the destructor does not. That is the finding, exactly
 as stated above.
+
+**It now reproduces locally too, and the suite has a case for it.**
+`executor_tests.destroying_a_pool_under_load_does_not_race_its_workers` — 50 rounds of build a
+4-worker pool, submit 64 tasks, leave the scope without waiting — aborts under TSan on macOS/libc++
+as well as on CI's Linux/libstdc++. Not waiting is the mechanism: the queue is still backed up when
+the destructor starts, so workers are inside `take_next_task()` when it reaches `clear()`. The local
+report names the same race one field over — the execution's `action_queue_` deque, which `is_busy()`
+reads through `empty()` (`async.hpp:333`), rather than the `action_mutex_` CI named. Both are inside
+the block being freed.
+
+**Only TSan can see it**, and that is the defect's nature rather than the case's weakness. Pushed to
+16 workers and 200 rounds, a plain build crashed 0 times in 10 and ASan reported nothing in 5: the
+race is a free against a read with nothing ordering them, so ASan faults only if the read actually
+lands after the free, while TSan reports the missing order itself. Do not read an ASan pass as an
+acquittal here.
+
+**The earlier claim that this was Linux-only was wrong.** The suite's other eighteen cases were
+TSan-clean on macOS while CI reported the race, and the difference was never the platform — it was
+that nothing in the suite destroyed a pool often enough to open the window.
 
 **The racing object is not the one this step predicted.** The paragraphs above say the second worker
 "reaches a vector being cleared", i.e. the race is on the `workers_` buffer. What TSan names is one
@@ -321,7 +357,7 @@ written down nowhere, which is what makes an unchecked return worth this step ra
 > turns out to be unreachable after steps 1 to 4, say so in a comment and keep the check.
 
 ### Step 7 · item 7 — work spawned by an in-flight task is refused once shutdown starts — OPEN
-`executor.hpp:67`, `:86-106` · CONFIRMED by test, which had to be written around it
+`executor.hpp:67`, `:101-121` · CONFIRMED by test, which had to be written around it
 
 `~executor()` sets `accepting_ = false` before it waits for the drain. A task already running when
 that happens is still running — the destructor is waiting for it — but the work it submits is
@@ -363,7 +399,7 @@ cache holds, for what a profile of the pool looks like, and for anything per-wor
 
 > Start the scan where the last one stopped. One `std::size_t` member, incremented past the worker
 > that took the task; the placement rule does not change, only which free worker is found first.
-> Land it after step 14, which changed what is being scanned — done at `bf7739b`, so the scan now
+> Land it after step 14, which changed what is being scanned — done at `4c1cba6`, so the scan now
 > reads `workers_[index]->is_busy()` and this step is unblocked.
 
 ### Step 9 · item 9 — the queue is unbounded and nothing pushes back — OPEN, API decision
@@ -387,7 +423,7 @@ Three findings whose cause is upstream. Two are read-only here by nature: the fi
 in `async.hpp` and lands in that repo's plan, not this one.
 
 ### Step 10 · item 10 — the lock order rests on a detail that is not async.hpp's contract — OPEN
-`executor.hpp:129-134`, `:160-167` · read-only
+`executor.hpp:129-134`, `:171-179` · read-only
 
 The pool takes `mutex_` and then, inside it, each worker's `action_mutex_` — through `add_action()`
 and through `is_busy()`. The reverse order would deadlock, and the only thing keeping it from
@@ -446,7 +482,7 @@ either.
 > in that order.
 
 ### Step 14 ✅ · item 14 — `struct worker` is a one-field wrapper
-`executor.hpp:119-121` · read-only
+`executor.hpp:119-121` as imported; the struct is gone, so the site is historical · read-only
 
 ```c++
 struct worker {
@@ -597,13 +633,13 @@ not follow anything.
 ## Group 7 — the task type
 
 One decision, taken after the audit closed: the pool is to run any task type, not only the
-`std::function<void(void)>` fixed at `:40`. It is recorded as its own group rather than folded into
+`std::function<void(void)>` fixed at `:41`. It is recorded as its own group rather than folded into
 group 5 because it reverses half of the API decision the rest of this plan is written against, and
 because it is not a defect — nothing here is wrong today, it is a surface that was decided narrowly
 and is now decided wider.
 
 ### Step 22 · item 19 — `task_t` is fixed at `std::function<void(void)>` — OPEN
-`executor.hpp:40`, `:117` · CONFIRMED by compile probe: `execution` instantiates on other action types
+`executor.hpp:40`, `:132` · CONFIRMED by compile probe: `execution` instantiates on other action types
 
 ```c++
 using task_t = std::function<void(void)>;                                          // :40
