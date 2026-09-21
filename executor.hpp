@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -34,16 +35,23 @@ namespace untangle {
 /**
  * @brief Runs tasks on a fixed pool of untangle::async::execution workers.
  *
- * @remark Tasks are std::function<void(void)>. An execution's action type is fixed by its template
- * argument, so one pool runs one signature; a task that needs to return something carries its own
- * channel, because a continuous worker does not collect results.
+ * @tparam taskT The type of the task the pool runs, specified as std::function<...> like the
+ * execution it is handed to. One pool runs one signature, because an execution's action type is
+ * fixed by its own template argument.
+ *
+ * @remark A task that needs to return something carries its own channel: a continuous worker does
+ * not collect results, so a non-void return is run and dropped.
  */
+template <typename taskT>
 class executor {
- public:
-  //! The work a pool runs. One pool runs one signature, because an execution's action type is
-  //! fixed by its template argument.
-  using task_t = std::function<void(void)>;
+  // add_action() is the only way in, and the pool calls it with no arguments to bind: what it
+  // queues is the task itself, and there is nowhere to keep arguments alongside it until a worker
+  // is free. Stated here so a pool on std::function<void(int)> says why rather than failing inside
+  // std::bind.
+  static_assert(std::is_invocable_v<taskT>,
+                "executor: the task type must be callable with no arguments");
 
+ public:
   /**
    * @brief Starts \p worker_count executions in continuous mode.
    *
@@ -160,7 +168,7 @@ class executor {
    *
    * @return true - the task was accepted. false - the pool is shutting down and refused it.
    */
-  bool submit(task_t task) {
+  bool submit(taskT task) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!accepting_) {
@@ -191,7 +199,7 @@ class executor {
   }
 
  private:
-  using worker_execution = untangle::async::execution<std::function<void(void)>>;
+  using worker_execution = untangle::async::execution<taskT>;
 
   /**
    * @brief Hands one task to a worker. Call with the mutex held.
@@ -199,7 +207,7 @@ class executor {
    * The worker is busy from the moment add_action() returns - it says so itself - so nothing has to
    * be booked here.
    */
-  void give_to_worker(std::size_t index, task_t task) {
+  void give_to_worker(std::size_t index, taskT task) {
     // add_action() takes the execution's own action_mutex while this holds mutex_. That is only
     // safe in one direction, and it holds: a worker calls on_finished with action_mutex released,
     // so it never takes mutex_ while holding action_mutex, and the two never form a cycle.
@@ -213,7 +221,7 @@ class executor {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!pending_.empty()) {
-      task_t next = std::move(pending_.front());
+      taskT next = std::move(pending_.front());
       pending_.pop_front();
       give_to_worker(index, std::move(next));
       return;
@@ -261,8 +269,8 @@ class executor {
    * @brief Names those same workers, for a report that has to say which one.
    *
    * The execution's own name rather than the index, so one worker reads the same here and in
-   * async's own warnings. The task cannot be named: task_t is std::function<void(void)> and carries
-   * nothing to report.
+   * async's own warnings. The task cannot be named: taskT is a callable and carries nothing to
+   * report.
    *
    * @return The matching names behind a ": " separator, empty when none match, so it appends to a
    * message cleanly either way.
@@ -304,7 +312,7 @@ class executor {
    */
   async::execution_poll poll_;
 
-  std::deque<task_t> pending_;  //!< Tasks waiting for a worker, in the order submitted.
+  std::deque<taskT> pending_;  //!< Tasks waiting for a worker, in the order submitted.
   std::vector<std::shared_ptr<worker_execution>> workers_;
   bool accepting_ = true;
 };

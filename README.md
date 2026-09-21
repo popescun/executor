@@ -30,9 +30,10 @@ The headers report warnings with `std::println`, so they need a standard library
 
 ```c++
 #include <executor.hpp>
+#include <functional>
 
 int main() {
-  untangle::executor pool(4);
+  untangle::executor<std::function<void(void)>> pool(4);
 
   for (int i = 0; i < 100; ++i) {
     pool.submit([i] { work(i); });
@@ -41,6 +42,33 @@ int main() {
   return 0;  // ~executor finishes what was submitted, then stops the workers
 }
 ```
+
+## the task type
+
+The pool is a template on the task it runs, the way an `execution` is a template on its action. One
+pool runs one signature, and the caller names it:
+
+```c++
+untangle::executor<std::function<int(void)>> pool(4);   // returns are run and dropped
+```
+
+The task type does not have to be a `std::function`. What an `execution` requires of it is a nested
+`result_type`, which it reads rather than deduces, so any callable declaring one will do — and a
+pool built on such a callable never touches `std::function::result_type`, which the standard removed
+in C++20 and both libc++ and libstdc++ still supply by grace rather than contract.
+
+```c++
+struct my_task {
+  using result_type = void;
+  void operator()() const;
+};
+
+untangle::executor<my_task> pool(4);
+```
+
+A task type that takes arguments is refused, with a `static_assert` rather than an error inside
+`std::bind`: the pool queues tasks, and has nowhere to keep arguments for them until a worker frees
+up.
 
 ## how work is placed
 

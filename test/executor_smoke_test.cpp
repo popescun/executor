@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <executor.hpp>
+#include <functional>
 #include <mutex>
 #include <print>
 #include <thread>
@@ -23,7 +24,9 @@
 
 namespace {
 
-using untangle::executor;
+// The pool under test, named once: executor is a template on its task type, the way the execution
+// it runs tasks on is a template on its action type.
+using executor = untangle::executor<std::function<void(void)>>;
 using namespace std::chrono_literals;
 
 }  // namespace

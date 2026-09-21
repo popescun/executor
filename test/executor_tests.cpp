@@ -20,6 +20,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <executor.hpp>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -29,7 +30,9 @@
 
 namespace {
 
-using untangle::executor;
+// The pool under test, named once: executor is a template on its task type, the way the execution
+// it runs tasks on is a template on its action type.
+using executor = untangle::executor<std::function<void(void)>>;
 using namespace std::chrono_literals;
 using ::testing::InSequence;
 
@@ -58,6 +61,21 @@ bool wait_for(predicateT predicate, std::chrono::milliseconds limit) {
 struct mock_work {
   MOCK_METHOD(void, run, ());
   MOCK_METHOD(void, run_numbered, (int));
+};
+
+/**
+ * @brief A task type that is not a std::function: a callable with a nested result_type.
+ *
+ * What an execution requires of its action type is the typedef, which it reads rather than deduces.
+ * A bare lambda has nowhere to put one; this does, which is what makes it a task type a pool can be
+ * built on.
+ */
+struct counting_task {
+  using result_type = void;
+
+  void operator()() const { ran->fetch_add(1, std::memory_order_relaxed); }
+
+  std::atomic_int* ran = nullptr;
 };
 
 /**
@@ -455,6 +473,54 @@ TEST(executor_tests, a_destructor_stuck_on_a_task_reports_why) {
       << "the stall went unreported; stderr held: " << reported;
   EXPECT_THAT(reported, ::testing::HasSubstr("waiting"))
       << "the stall went unreported; stderr held: " << reported;
+}
+
+/**
+ * @brief A pool runs tasks that return a value, and drops what they return.
+ *
+ * The pool is a template on its task type, so the signature is the caller's to name. A continuous
+ * worker collects nothing, so the return is run and discarded - which is why the count rather than
+ * the results is what this reads.
+ */
+TEST(executor_tests, a_pool_runs_tasks_that_return_a_value) {
+  using int_executor = untangle::executor<std::function<int(void)>>;
+
+  constexpr int tasks = 16;
+  std::atomic_int ran = {0};
+
+  {
+    int_executor pool(2);
+
+    for (int i = 0; i < tasks; ++i) {
+      EXPECT_TRUE(pool.submit([&ran] { return ran.fetch_add(1, std::memory_order_relaxed); }));
+    }
+  }
+
+  EXPECT_EQ(ran.load(), tasks);
+}
+
+/**
+ * @brief A pool runs a task type that is not a std::function.
+ *
+ * Any callable naming its own result_type will do, because that typedef is all an execution reads
+ * from the type. A pool built this way never touches std::function, which is what keeps it clear of
+ * a result_type the standard removed in C++20.
+ */
+TEST(executor_tests, a_pool_runs_a_task_type_that_is_not_a_std_function) {
+  using counting_executor = untangle::executor<counting_task>;
+
+  constexpr int tasks = 16;
+  std::atomic_int ran = {0};
+
+  {
+    counting_executor pool(2);
+
+    for (int i = 0; i < tasks; ++i) {
+      EXPECT_TRUE(pool.submit(counting_task{&ran}));
+    }
+  }
+
+  EXPECT_EQ(ran.load(), tasks);
 }
 
 /**

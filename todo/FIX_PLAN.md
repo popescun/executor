@@ -1,20 +1,20 @@
 # executor.hpp — fix plan
 
-**Status (2026-09-21) — group 1 is done: every blocker closed or disproven.** The pool was imported from
-`async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before it
-can be called production ready. 19 items, in seven groups — item 19 was added after the audit
-closed and is a decision rather than a finding; see group 7. **Four were called blockers**: each was read as a way
-the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed; step 3 was
-probed and does not reproduce, so it is closed as not a defect rather than fixed. What is left in
-the plan is group 2 onwards — what the caller is told, placement, and the surface.
-**Tests:** 20 of 20 green in Debug, 2026-09-21; clang-format clean;
+**Status (2026-09-21) — group 1 is done: every blocker closed or disproven.** The pool was imported
+from `async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before
+it can be called production ready. 19 items, in seven groups — item 19 was added after the audit
+closed and is a decision rather than a finding; see group 7. **Four were called blockers**: each was
+read as a way the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed;
+step 3 was probed and does not reproduce, so it is closed as not a defect rather than fixed. What is
+left is group 2 onwards — what the caller is told, placement, and the surface.
+**Tests:** 21 of 21 green on Debug, ASan and TSan, 2026-09-21; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 23 pages (was 19 at the import), rebuilt with
-`tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `d10d400`). The destructor now waits on an
-`async::execution_poll` until every worker has left its thread and clears them only then, and the
-race TSan named on CI no longer reproduces: 20 of 20 under TSan and under ASan on macOS/libc++,
-where the case that provokes it aborted before the fix. **That is one platform, not both** — the
-Linux/libstdc++ run this plan insists on has not been made since the fix, which is why step 19
-stays open.
+`tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `d10d400`). The destructor waits on an
+`async::execution_poll` until every worker has left its thread and clears them only then, and it
+reports on stderr while either of its waits is stalled rather than parking in silence. The race TSan
+named on CI no longer reproduces: 21 of 21 under TSan and under ASan on macOS/libc++, where the case
+that provokes it aborted before the fix. **That is one platform, not both** — the Linux/libstdc++
+run this plan insists on has not been made since either fix, which is why step 19 stays open.
 **Sites** are line numbers in `executor.hpp` as of `d10d400`, and they move with every fix that
 lands — they were remapped after steps 14 and 1, and steps 2 and 4 moved them again. Re-read them
 before trusting them. **Names move too:** `d10d400` replaced "drain" with "finish" throughout, so
