@@ -2,11 +2,14 @@
 
 **Status (2026-09-21) — opened, nothing landed.** The pool was imported from
 `async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before it
-can be called production ready. 18 items, in six groups. **Four are blockers**: each one is a way
+can be called production ready. 19 items, in seven groups — item 19 was added after the audit
+closed and is a decision rather than a finding; see group 7. **Four are blockers**: each one is a way
 the pool can hang or read freed memory, and three of the four are reachable without any misuse.
 **Tests:** 18 of 18 green in Debug, 20 runs in a row, measured on 2026-09-21; clang-format clean;
-doxygen clean, `doc/refman.pdf` at 19 pages. Neither sanitizer has been run yet — that is step 17,
-and two findings below are waiting on it to be named rather than argued.
+doxygen clean, `doc/refman.pdf` at 19 pages. **Both sanitizers have now been run once** — clean,
+18 of 18 under each, 2026-09-21, before any fix: see step 19, which also says why a clean TSan run
+does not acquit step 2. (An earlier draft of this line called the sanitizers step 17; they are
+step 19.)
 **Source:** read of `executor.hpp` against `async.hpp` at `4acb06d`, 2026-09-21. Five findings are
 confirmed by a probe or by a test that failed before it was corrected; the rest are read-only and
 say so.
@@ -18,15 +21,22 @@ say so.
 arbitrary caller code, so *the submitter* still learns nothing when a task throws — and item 11,
 which is upstream's to fix.
 
-**The API is fixed by a decision, not by this plan.** The pool keeps the prototype's surface:
-`submit()` and `pending()`. No futures, no priorities, no results. Items 9, 16 and 18 are recorded
-against that decision rather than argued with; if the decision changes, they are where to start.
+**The API is fixed by a decision, not by this plan — with one part of it now reversed.** The pool
+keeps the prototype's surface: `submit()` and `pending()`. No futures, no priorities, no results.
+Items 9, 16 and 18 are recorded against that decision rather than argued with; if the decision
+changes, they are where to start. **The task type is no longer part of it:** the pool is to run any
+task type rather than the `std::function<void(void)>` fixed at `:40`. That is item 19, group 7, and
+it pulls items 5, 16 and 18 along with it.
 
 ## Progress
 
-**Nothing done.** No step has landed and no commit is listed below.
+**Nothing landed in the header.** No step has changed `executor.hpp` and no commit is listed
+below. One step has been *started*: step 19's first sanitizer pass ran on 2026-09-21 and produced
+no code change to commit — its "before" half is done, its "after" half waits on step 2.
 
-**NEXT: step 14, then group 1 in order — steps 1, 2, 3, 4.** 14 is three lines and it rewrites the
+**NEXT: step 14, then group 1 in order — steps 1, 2, 3, 4.** Step 22 (any task type) comes after
+those, not before: a hang and a use-after-free outrank a surface change, and templating the class
+is a whole-file diff that is far easier to review against a baseline already known correct. 14 is three lines and it rewrites the
 lines step 2 would otherwise touch twice, which is the only reason it goes first. The four blockers
 then come together, because they are all in the constructor and the destructor and that is one pass
 over those lines rather than four. Step 2 is the one to read first of them: it is the only finding
@@ -40,6 +50,9 @@ experience with its own steps 21 and 28 was that answering it in two passes answ
 badly; settle them together. Step 14 changes what a worker *is* here, and steps 2 and 8 both
 rewrite the lines that name one, so 14 goes before both or gets written three times. Step 13 gives
 the pool a name and step 5 needs something to put in a report, so 13 comes first of those two.
+Step 22 lands on the same lines as 14 and touches every use of `worker_execution`, so it goes after
+14 as well; and it asks step 5's and step 18's question in a third form — what does a task that
+returns something give back — so read those two before deciding what it means for a non-void task.
 
 | Commit | Step |
 |---|---|
@@ -72,6 +85,8 @@ the pool a name and step 5 needs something to put in a report, so 13 comes first
 | 16 | 16 | a move-only task does not compile | `:40` | CONFIRMED (compile probe) |
 | 17 | 17 | `pending()` is advisory and does not say so | `:111-114` | read-only |
 | 18 | 18 | no way to wait for the pool to drain short of destroying it | `:64-79` | read-only, API decision |
+| **Group 7 — the task type** |
+| 22 | 19 | `task_t` is fixed at `std::function<void(void)>` | `:40`, `:117` | CONFIRMED (compile probe) |
 | **Group 6 — the suite** |
 | 19 | — | the sanitizers have never been run against the suite | `.github/workflows/ci.yml` | — |
 | 20 | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp` | — |
@@ -434,16 +449,33 @@ rather than difficulty.
 
 ## Group 6 — the suite
 
-### Step 19 — run the suite under both sanitizers — OPEN
-`.github/workflows/ci.yml` · —
+### Step 19 — run the suite under both sanitizers — HALF DONE (the "before" pass)
+`.github/workflows/ci.yml` · both run locally 2026-09-21, both clean
 
-The CI job exists and has never run, and neither sanitizer has been run locally. Step 2 is a
-suspected use-after-free waiting for TSan to name it rather than for this plan to argue it, and a
-pool is the shape of program the two sanitizers were built for.
+The CI job still has never run. Both sanitizers have now been run **locally**, against the
+unmodified header, before any fix — which is the half of this step that had to happen first:
 
-> Build the suite under `address` and under `thread`, in separate directories, and record what each
-> one says here. Do it before step 2's fix as well as after: a fix for a race that was never
-> observed is a fix that cannot be shown to have worked.
+| Build | Configure | Result |
+|---|---|---|
+| `test/build-address` | `-DCMAKE_BUILD_TYPE=Debug -DEXECUTOR_SANITIZE=address` | 18/18 passed, 1.36s, no report |
+| `test/build-thread` | `-DCMAKE_BUILD_TYPE=Debug -DEXECUTOR_SANITIZE=thread` | 18/18 passed, 4.32s, no report |
+
+Apple clang 21.0.0, arm64-apple-darwin25.6.0, `halt_on_error=1` set for both. Neither emitted a
+single diagnostic. The `EXECUTOR_SANITIZE` plumbing in `test/CMakeLists.txt` works as written, and
+`build-*/` is already ignored, so neither tree is a commit.
+
+**A clean TSan run does not acquit step 2, and it was not expected to.** Step 2's window opens when
+one worker is inside `take_next_task()` while the destructor clears `workers_` — and step 20 is the
+finding that no case in this suite ever puts the pool under the churn that opens it. Every case here
+is short and deterministic; TSan reports races it *observes*, not races it could prove. So the
+result to carry forward is: the suite is clean under both sanitizers, and the suite is not yet
+evidence about step 2 either way.
+
+> Two things still open. **Step 20 first, then re-run TSan** — a stress case is what would make
+> step 2 observable, and re-running TSan against the same 18 cases after the fix would only
+> reproduce this same clean sheet and prove nothing. Then the "after" pass, once step 2 lands. And
+> the CI job itself is still unrun: it builds GCC 14 / libstdc++ on Linux, which is a different
+> library from the libc++ measured here and the one step 22 flags a portability question against.
 
 ### Step 20 — the suite has no case that runs the pool hard — OPEN
 `test/executor_tests.cpp` · —
@@ -465,3 +497,99 @@ not follow anything.
 
 > Last, once group 1 and group 2 have landed. Rewriting it per step is how it goes stale in the
 > middle.
+
+---
+
+## Group 7 — the task type
+
+One decision, taken after the audit closed: the pool is to run any task type, not only the
+`std::function<void(void)>` fixed at `:40`. It is recorded as its own group rather than folded into
+group 5 because it reverses half of the API decision the rest of this plan is written against, and
+because it is not a defect — nothing here is wrong today, it is a surface that was decided narrowly
+and is now decided wider.
+
+### Step 22 · item 19 — `task_t` is fixed at `std::function<void(void)>` — OPEN
+`executor.hpp:40`, `:117` · CONFIRMED by compile probe: `execution` instantiates on other action types
+
+```c++
+using task_t = std::function<void(void)>;                                          // :40
+using worker_execution = untangle::async::execution<std::function<void(void)>>;    // :117
+```
+
+One signature, hard-coded twice — and the second spells it out again instead of saying `task_t`, so
+the two can drift. A caller whose task takes an argument or returns a value has to erase it into
+`void()` and carry the rest itself, which is exactly what the class comment at `:31-35` tells them
+to do.
+
+Nothing upstream requires this. `execution` is already a template on its action type, and a probe
+built both of the shapes the pool refuses:
+
+```
+execution<std::function<int(void)>>   - instantiates, runs, action returns 42
+execution<std::function<void(int)>>   - instantiates, runs, add_action() binds the argument
+```
+
+So the shape is `template <typename task_t = std::function<void(void)>> class executor`, with
+`worker_execution = async::execution<task_t>` and the default keeping every current caller
+source-compatible.
+
+**Three constraints and one open question come with it. They are what this step has to decide,
+rather than discover halfway through.**
+
+*`task_t` is not restricted to `std::function` — but it must name its own `result_type`.*
+`execution` uses `typename actionT::result_type` in five places (`async.hpp:257`, `:268`, `:566`,
+`:602`, `:819`), and it is **read from `actionT`, not deduced from `operator()`**. Three
+instantiations, each built:
+
+```
+execution<decltype([]{})>                          - error: no type named 'result_type' in '(lambda ...)'   async.hpp:566
+execution<struct{ void operator()() const; }>      - error: no type named 'result_type' in 'fn'             async.hpp:566
+execution<struct{ using result_type = void;        - COMPILES; add_action() -> true; the action runs
+                  void operator()() const; }>
+```
+
+So the contract is **any callable type that declares a nested `result_type`**. A hand-written
+functor qualifies and the third case proves it end to end; a bare lambda and a plain function
+pointer do not, because neither has anywhere to put the typedef. `std::function<R(Args...)>`
+qualifies only because it still supplies `result_type` — see the portability note below.
+
+The async suite is consistent with this and does not contradict it: every `execution<...>` there is
+on a `std::function` (`async_tests.cpp:28-30`, `:113`, `async_smoke_test.cpp:38-41`,
+`other_async.hpp:16`). `counting_action` at `async_tests.cpp:97` is a custom `operator()` type, but
+it is the *target carried inside* `counting_action_t = std::function<void(const copy_counter&)>`,
+not the template argument — which is the distinction to keep hold of here: what `add_action()`
+accepts has always been wider than what `execution` can be instantiated on.
+
+That gap is also the choice this step has to make. With `task_t = std::function<void(void)>`,
+`submit()` already takes any lambda, because the conversion happens at the parameter. With
+`task_t = fn`, `submit()` takes an `fn` and nothing else. A `submit()` templated on the callable,
+wrapping into `task_t`, restores the wider door for every instantiation — a separate and smaller
+change that can be had with or without this one; say which of the two is meant before writing
+either.
+
+*A non-void `R` reopens the results question.* The API decision ruled out results — but a pool
+templated on `std::function<int(void)>` is a pool whose tasks return something, and `execution`
+already collects those. Either the pool discards `R` and says so in one line of documentation, or it
+grows a way to read it, which is step 18's `wait_idle()` and step 5's reporting seam arriving
+together by a different door. Decide it with 5 and 18, not on its own.
+
+*Arguments have to be forwarded or refused.* `add_action(actionT, Args&&...)` binds its arguments
+(`async.hpp:422-425`), so a pool on `std::function<void(int)>` needs a `submit()` that takes and
+forwards them — and `pending_` then holds bound callables rather than `task_t`, a second type in the
+class and the place where a template makes the most mess. Refusing arguments (`R(void)` only) is a
+defensible narrowing and costs one `static_assert` with a readable message.
+
+*Portability of the default, unverified.* `std::function::result_type` was removed from the
+standard in C++20. libc++ still provides it, which is why the probes compile and the suite builds
+here — but the CI matrix selects GCC 14 and libstdc++ on Linux, and **CI has never run**. If
+libstdc++ drops the typedef under `-std=c++23`, it is `async.hpp` that stops compiling, not
+anything this step adds: the exposure is upstream's and it is there today at `:40`. Two things
+follow. The first CI run settles it at no cost, so it is worth having before this step rather than
+after. And the widened contract above is itself the escape hatch — a caller who supplies a functor
+with its own `result_type` never touches `std::function` — which is an argument for this step, not
+against it. Carry the finding to the async plan whichever way the run goes.
+
+> Template the class on `task_t`, default `std::function<void(void)>`, and write `worker_execution`
+> in terms of it so the signature appears once. Sequence it **after group 1** and after step 14.
+> Step 16 does not dissolve into this: the move-only gap lives in `queued_action_t` upstream, and a
+> template parameter on the pool does not reach it.
