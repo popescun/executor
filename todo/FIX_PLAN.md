@@ -6,10 +6,12 @@ can be called production ready. 19 items, in seven groups — item 19 was added 
 closed and is a decision rather than a finding; see group 7. **Four are blockers**: each one is a way
 the pool can hang or read freed memory, and three of the four are reachable without any misuse.
 **Tests:** 18 of 18 green in Debug, 20 runs in a row, measured on 2026-09-21; clang-format clean;
-doxygen clean, `doc/refman.pdf` at 19 pages. **Both sanitizers have now been run once** — clean,
-18 of 18 under each, 2026-09-21, before any fix: see step 19, which also says why a clean TSan run
-does not acquit step 2. (An earlier draft of this line called the sanitizers step 17; they are
-step 19.)
+doxygen clean, `doc/refman.pdf` at 19 pages. **Both sanitizers have now been run, and TSan has
+named step 2.** Locally (macOS, libc++) both came back clean; on CI (Linux, GCC 14, libstdc++) TSan
+reported a data race in `concurrent_submission` between `~executor()` and a worker in
+`take_next_task()`. Step 2 moves from read-only to CONFIRMED, and the blocker count stands. See step
+19 for both runs and why the local clean sheet was platform luck rather than evidence. (An earlier
+draft of this line called the sanitizers step 17; they are step 19.)
 **Source:** read of `executor.hpp` against `async.hpp` at `4acb06d`, 2026-09-21. Five findings are
 confirmed by a probe or by a test that failed before it was corrected; the rest are read-only and
 say so.
@@ -31,8 +33,10 @@ it pulls items 5, 16 and 18 along with it.
 ## Progress
 
 **Nothing landed in the header.** No step has changed `executor.hpp` and no commit is listed
-below. One step has been *started*: step 19's first sanitizer pass ran on 2026-09-21 and produced
-no code change to commit — its "before" half is done, its "after" half waits on step 2.
+below. One step has been *started*: step 19's first sanitizer pass ran on 2026-09-21, locally and
+then on CI, and produced no code change to commit — its "before" half is done, its "after" half
+waits on step 2. It paid for itself immediately: CI's TSan named step 2, which had been the one
+blocker resting on a reading rather than on a report.
 
 **NEXT: step 14, then group 1 in order — steps 1, 2, 3, 4.** Step 22 (any task type) comes after
 those, not before: a hang and a use-after-free outrank a surface change, and templating the class
@@ -64,7 +68,7 @@ returns something give back — so read those two before deciding what it means 
 |---|---|---|---|---|
 | **Group 1 — lifetime (blockers)** |
 | 1 | 1 | a pool with no workers takes work nothing can run, and never dies | `:45-59`, `:64-79` | CONFIRMED (hangs; probe) |
-| 2 | 2 | `~executor()` mutates `workers_` outside the mutex every reader takes | `:73-78`, `:139-157`, `:160-167` | read-only (TSan: step 17) |
+| 2 | 2 | `~executor()` mutates `workers_` outside the mutex every reader takes | `:73-78`, `:139-157`, `:160-167` | **CONFIRMED (TSan, CI)** |
 | 3 | 3 | a constructor that throws leaves started workers holding `this` | `:45-59` | read-only |
 | 4 | 4 | the destructor waits forever on a task that never returns | `:64-70` | read-only |
 | **Group 2 — what the caller is told** |
@@ -125,8 +129,9 @@ straight through is the likely way in.
 > pool that cannot run anything never exists rather than existing and hanging. `<stdexcept>` joins
 > the includes. A default worker count is a separate question and is not this step's.
 
-### Step 2 · item 2 — `~executor()` mutates `workers_` outside the mutex — OPEN
-`executor.hpp:73-78`, `:139-157`, `:160-167` · read-only; to be named under TSan at step 17
+### Step 2 · item 2 — `~executor()` mutates `workers_` outside the mutex — OPEN, CONFIRMED
+`executor.hpp:73-78`, `:139-157`, `:160-167` · **CONFIRMED by TSan on CI, 2026-09-21**: data race in
+`executor_smoke_test.concurrent_submission`, GCC 14 / libstdc++ / Linux
 
 `mutex_` guards `workers_` for every reader: `submit()` scans it, `nothing_running()` iterates it,
 `take_next_task()` indexes into it. The destructor is the one writer, and it takes no lock at all:
@@ -153,11 +158,60 @@ What happens next is not a clean crash: `clear()` releases the last `shared_ptr`
 and `~execution()` waits for its worker to leave — the worker that is at that moment reading the
 vector being destroyed.
 
+#### What TSan named — and where the paragraphs above were one level off
+
+The first CI run reported it, in `concurrent_submission` (`executor_smoke_test.cpp:121-145`: three
+workers, 400 tasks from four threads, destructor at the closing brace). The two ends:
+
+```
+Write of size 8 by main thread:
+  operator delete
+  _Sp_counted_ptr_inplace<execution<function<void()>>>::_M_destroy()
+  ~shared_ptr() -> untangle::executor::worker::~worker()
+  std::vector<worker>::clear()
+  untangle::executor::~executor()                       executor_smoke_test.cpp:139
+
+Previous atomic read of size 1 by thread T3 (mutexes: write M0):
+  pthread_mutex_lock -> std::mutex::lock()
+  untangle::async::execution<function<void()>>::is_busy() const
+  untangle::executor::nothing_running() const
+  untangle::executor::take_next_task(unsigned long)
+  executor::executor(...)::{lambda()#1}   (on_finished)
+  execution::notify_finished() -> execute_actions() -> loop()
+```
+
+M0 is the pool's own `mutex_` — T3 holds it, the destructor does not. That is the finding, exactly
+as stated above.
+
+**The racing object is not the one this step predicted.** The paragraphs above say the second worker
+"reaches a vector being cleared", i.e. the race is on the `workers_` buffer. What TSan names is one
+level deeper: the freed block is the *execution* that `make_shared` allocated, and the read is
+`is_busy()` taking that execution's `action_mutex_`. The route runs through the vector; the memory
+in the report is the pointee.
+
+That matters, because it names a second mechanism the paragraphs above do not cover. `clear()`
+destroys elements **in order**, and `~execution()` waits only on **its own** `running_`
+(`async.hpp:208-231`). So destroying worker 0 frees worker 0's `action_mutex_` while workers 1 and 2
+are still alive and still calling `nothing_running()`, which iterates *every* worker and locks
+*every* `action_mutex_`. The destructor does not have to be racing the buffer; element 0 being gone
+while element 2's thread still runs is enough, and no amount of waiting inside `~execution()` closes
+it, because each one waits only for itself.
+
 > The destructor holds `mutex_` across the parts that touch `workers_`, and the parts that must not
 > hold it — `stop()`, which wakes a worker that will want the mutex, and `clear()`, which waits for
 > one — need the workers moved out of the member first, under the lock, and stopped through the
 > local copy. That ordering is the step; a reader-writer split or an `std::atomic` flag is not,
 > because the invariant being protected is "the vector still exists".
+>
+> **The TSan report adds one requirement the sketch above is missing.** Moving the workers out under
+> the lock leaves `workers_` empty, which is what makes it safe — a worker that then enters
+> `take_next_task()` takes `mutex_`, finds an empty vector, and locks nobody's freed
+> `action_mutex_`. But `take_next_task()` also does `give_to_worker(index, ...)`, which indexes
+> `workers_[index]`, and an empty vector makes that an out-of-bounds write rather than a no-op. So
+> the move-out needs a companion: `take_next_task()` must return early once the pool is tearing
+> down, rather than relying on `pending_` being empty by then. It is empty today, after the drain —
+> but step 7 is the open question of whether a running task may still submit, and if that answer is
+> "yes" it is no longer empty. Write the guard now; the two steps meet here.
 
 ### Step 3 · item 3 — a throwing constructor leaves started workers holding `this` — OPEN
 `executor.hpp:45-59` · read-only
@@ -464,18 +518,27 @@ Apple clang 21.0.0, arm64-apple-darwin25.6.0, `halt_on_error=1` set for both. Ne
 single diagnostic. The `EXECUTOR_SANITIZE` plumbing in `test/CMakeLists.txt` works as written, and
 `build-*/` is already ignored, so neither tree is a commit.
 
-**A clean TSan run does not acquit step 2, and it was not expected to.** Step 2's window opens when
-one worker is inside `take_next_task()` while the destructor clears `workers_` — and step 20 is the
-finding that no case in this suite ever puts the pool under the churn that opens it. Every case here
-is short and deterministic; TSan reports races it *observes*, not races it could prove. So the
-result to carry forward is: the suite is clean under both sanitizers, and the suite is not yet
-evidence about step 2 either way.
+**Then CI ran, and TSan named step 2.** Same 18 cases, same `EXECUTOR_SANITIZE=thread`, different
+platform — Linux, GCC 14, libstdc++ — and the thread job reported a data race in
+`executor_smoke_test.concurrent_submission`: `~executor()` freeing an execution on the main thread
+against a worker locking that execution's `action_mutex_` through `nothing_running()`. The report
+and what it changes are recorded in step 2.
 
-> Two things still open. **Step 20 first, then re-run TSan** — a stress case is what would make
-> step 2 observable, and re-running TSan against the same 18 cases after the fix would only
-> reproduce this same clean sheet and prove nothing. Then the "after" pass, once step 2 lands. And
-> the CI job itself is still unrun: it builds GCC 14 / libstdc++ on Linux, which is a different
-> library from the libc++ measured here and the one step 22 flags a portability question against.
+**The local clean sheet was platform luck, not a property of the suite.** This plan briefly held
+that the suite could not observe step 2 and that step 20 had to come first to make it reproducible.
+That was wrong, and CI is what corrected it: `concurrent_submission` — three workers, 400 tasks from
+four submitting threads, destructor at the end of the scope — already opens the window wide enough.
+What differs is the platform. Two sanitizer runs of the same source disagreed, so a clean run on one
+toolchain says nothing about the other, and "clean under TSan" is only ever a statement about the
+configuration that produced it.
+
+> Three things still open. **The "after" pass**, once step 2 lands — and it now has a named report to
+> be measured against rather than a clean sheet, which is the whole reason this step said to run the
+> sanitizers before the fix. **Both platforms, every time**: this repo has now seen the same code
+> come back clean on one and racy on the other, so a fix is not demonstrated until Linux/libstdc++
+> says so. **Step 20 is still worth having**, but its justification has changed: not to make step 2
+> observable — it already is — but to shorten the odds of catching what a three-worker case with one
+> destructor at the end can still miss.
 
 ### Step 20 — the suite has no case that runs the pool hard — OPEN
 `test/executor_tests.cpp` · —
@@ -483,6 +546,11 @@ evidence about step 2 either way.
 Every case is deterministic and short, which is what makes them reportable. None of them puts the
 pool under the sustained churn that steps 2 and 3 live in — construction and destruction under
 load, many workers, tasks finishing while the destructor runs.
+
+**Amended 2026-09-21.** "None of them" was too strong: `concurrent_submission` reaches step 2 on
+Linux under TSan, with three workers and one destruction. What the suite lacks is *repeated*
+construction and destruction under load — which is where step 3 lives, and step 3 is still the
+finding with no observation behind it.
 
 > A stress case, off by default or bounded to a few seconds: construct and destroy repeatedly while
 > submitting, at a worker count above the core count. It is the case most likely to make step 2
@@ -579,15 +647,19 @@ forwards them — and `pending_` then holds bound callables rather than `task_t`
 class and the place where a template makes the most mess. Refusing arguments (`R(void)` only) is a
 defensible narrowing and costs one `static_assert` with a readable message.
 
-*Portability of the default, unverified.* `std::function::result_type` was removed from the
-standard in C++20. libc++ still provides it, which is why the probes compile and the suite builds
-here — but the CI matrix selects GCC 14 and libstdc++ on Linux, and **CI has never run**. If
-libstdc++ drops the typedef under `-std=c++23`, it is `async.hpp` that stops compiling, not
-anything this step adds: the exposure is upstream's and it is there today at `:40`. Two things
-follow. The first CI run settles it at no cost, so it is worth having before this step rather than
-after. And the widened contract above is itself the escape hatch — a caller who supplies a functor
-with its own `result_type` never touches `std::function` — which is an argument for this step, not
-against it. Carry the finding to the async plan whichever way the run goes.
+*Portability of the default — SETTLED, 2026-09-21.* `std::function::result_type` was removed from
+the standard in C++20, so this step was opened with an open question against it: libc++ still
+provides the typedef, which is why the probes compile here, but nothing had been built against
+libstdc++. The first CI run answers it — the Linux thread job compiled `async.hpp` and ran
+`execution<std::function<void()>>` under GCC 14 against `/usr/include/c++/14`, as the TSan stacks in
+step 2 show frame by frame. libstdc++ still supplies `result_type` at `-std=c++23`. Nothing to
+carry to the async plan and nothing for this step to work around.
+
+What survives the answer is the shape of the risk: the default `task_t` depends on a typedef the
+standard removed, on both implementations tested, by grace rather than by contract. The widened
+contract above is the escape hatch if that ever changes — a caller supplying a functor with its own
+`result_type` never touches `std::function` — which is an argument for this step rather than
+against it.
 
 > Template the class on `task_t`, default `std::function<void(void)>`, and write `worker_execution`
 > in terms of it so the signature appears once. Sequence it **after group 1** and after step 14.
