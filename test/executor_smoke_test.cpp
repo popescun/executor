@@ -42,7 +42,7 @@ TEST(executor_smoke_test, tasks_run_and_spread_across_workers) {
   {
     executor pool(4);
     for (int i = 0; i < task_count; ++i) {
-      pool.submit([&ran, &seen_mutex, &seen] {
+      pool.add_task([&ran, &seen_mutex, &seen] {
         ran.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(seen_mutex);
         seen.push_back(std::this_thread::get_id());
@@ -79,7 +79,7 @@ TEST(executor_smoke_test, submission_order_is_preserved) {
   {
     executor pool(1);
     for (int i = 0; i < 50; ++i) {
-      pool.submit([i, &order_mutex, &order] {
+      pool.add_task([i, &order_mutex, &order] {
         std::lock_guard<std::mutex> lock(order_mutex);
         order.push_back(i);
       });
@@ -105,7 +105,7 @@ TEST(executor_smoke_test, a_slow_task_does_not_hold_up_the_others) {
   {
     executor pool(4);
     for (int i = 0; i < 4; ++i) {
-      pool.submit([&ran] {
+      pool.add_task([&ran] {
         std::this_thread::sleep_for(150ms);
         ran.fetch_add(1, std::memory_order_relaxed);
       });
@@ -132,7 +132,7 @@ TEST(executor_smoke_test, concurrent_submission) {
     for (int t = 0; t < submitters; ++t) {
       threads.emplace_back([&pool, &ran] {
         for (int i = 0; i < per_thread; ++i) {
-          pool.submit([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+          pool.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
         }
       });
     }
@@ -148,11 +148,11 @@ TEST(executor_smoke_test, concurrent_submission) {
 }
 
 //! A pool that is still accepting takes the task.
-TEST(executor_smoke_test, submit_is_accepted_while_the_pool_is_up) {
+TEST(executor_smoke_test, add_task_is_accepted_while_the_pool_is_up) {
   executor pool(2);
-  const bool accepted = pool.submit([] {});
+  const bool accepted = pool.add_task([] {});
 
-  std::println("5. submit() while accepting: {}", accepted ? "accepted" : "refused");
+  std::println("5. add_task() while accepting: {}", accepted ? "accepted" : "refused");
 
   EXPECT_TRUE(accepted);
 }

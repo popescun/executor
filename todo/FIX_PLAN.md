@@ -3,7 +3,8 @@
 **Status (2026-09-21) — group 1 is done: every blocker closed or disproven.** The pool was imported
 from `async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before
 it can be called production ready. 19 items, in seven groups — item 19 was added after the audit
-closed and is a decision rather than a finding; see group 7. **Four were called blockers**: each was
+closed and is a decision rather than a finding; see group 7. Item 20 was added the same way and is
+step 23, a rename. **Four were called blockers**: each was
 read as a way the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed;
 step 3 was probed and does not reproduce, so it is closed as not a defect rather than fixed. What is
 left is group 2 onwards — what the caller is told, placement, and the surface.
@@ -31,8 +32,8 @@ arbitrary caller code, so *the submitter* still learns nothing when a task throw
 which is upstream's to fix.
 
 **The API is fixed by a decision, not by this plan — with one part of it now reversed and landed.**
-The pool keeps the prototype's surface: `submit()` and `pending()`. No futures, no priorities, no
-results. Items 9, 16 and 18 are recorded against that decision rather than argued with; if the
+The pool keeps the prototype's surface, under one new name: `add_task()` — `submit()` until step
+23 — and `pending()`. No futures, no priorities, no results. Items 9, 16 and 18 are recorded against that decision rather than argued with; if the
 decision changes, they are where to start. **The task type is no longer part of it:** the pool runs
 any task type, as of `9daec8b`. That was item 19, group 7, and what it pulls along with it — what a
 non-void return gives back — is still items 5 and 18's to settle.
@@ -139,6 +140,7 @@ returns something give back — so read those two before deciding what it means 
 | 16 | 16 | a move-only task does not compile | `:41` | CONFIRMED (compile probe) |
 | 17 | 17 | `pending()` is advisory and does not say so | `:126-129` | read-only |
 | 18 | 18 | no way to wait for the pool to drain short of destroying it | `:79-94` | read-only, API decision |
+| 23 ✅ | 20 | `submit()` does not match `execution::add_action()` | `:171` | naming decision — renamed `add_task()` |
 | **Group 7 — the task type** |
 | 22 ✅ | 19 | `task_t` is fixed at `std::function<void(void)>` | `:45`, `:51`, `:202` | CONFIRMED (probe, tests) — fixed `9daec8b` |
 | **Group 6 — the suite** |
@@ -157,7 +159,7 @@ a fix, 3 by a probe that disproved it.
 ### Step 1 ✅ · item 1 — a pool with no workers takes work nothing can run
 `executor.hpp:45-59`, `:79-94` · CONFIRMED by probe: the destructor does not return
 
-`executor(0)` is accepted. `workers_` is empty, so `submit()` finds no free worker, queues the task
+`executor(0)` is accepted. `workers_` is empty, so `add_task()` finds no free worker, queues the task
 and answers true; `pending()` says 1. The destructor then waits for `pending_.empty()`, which no
 worker will ever make true, and `nothing_running()` — which is vacuously true over no workers —
 never brings the predicate up with it. Nothing notifies `finished_cv_` either, because only
@@ -171,7 +173,7 @@ HUNG: ~executor did not return within 3s
 ```
 
 An empty pool that is never given work destructs cleanly, which is what makes this quiet: the hang
-needs a `submit()`, and `submit()` is the one thing every caller does.
+needs a `add_task()`, and `add_task()` is the one thing every caller does.
 
 `std::thread::hardware_concurrency()` returns 0 when it cannot tell, and a caller passing it
 straight through is the likely way in.
@@ -227,7 +229,7 @@ toolchain that reported the race — see step 19.
 
 The finding as it was diagnosed follows, unchanged.
 
-`mutex_` guards `workers_` for every reader: `submit()` scans it, `nothing_running()` iterates it,
+`mutex_` guards `workers_` for every reader: `add_task()` scans it, `nothing_running()` iterates it,
 `take_next_task()` indexes into it. The destructor is the one writer, and it takes no lock at all:
 
 ```c++
@@ -362,7 +364,7 @@ during the unwind rather than left running.
 **The dangling callback cannot fire either.** `on_finished` does capture `this`, but
 `notify_finished()` (`async.hpp:781`) returns early on `actions_run_ == 0 || !on_finished`. A worker
 that has never run an action never calls back, and during construction no task can exist — nothing
-can reach `submit()` on a pool that has not finished constructing. That is also what keeps step 2's
+can reach `add_task()` on a pool that has not finished constructing. That is also what keeps step 2's
 race off this path: no worker is ever inside `take_next_task()` iterating a `workers_` being
 destroyed.
 
@@ -458,7 +460,7 @@ workers_[index].exec->add_action(std::move(task));
 
 `add_action()` returns `bool` — async's step 21 made it do so precisely so a refusal is not silent
 — and `give_to_worker()` ignores it. A refused task is destroyed inside `add_action()` and the pool
-goes on believing it placed it. `submit()` has already answered true by then, or
+goes on believing it placed it. `add_task()` has already answered true by then, or
 `take_next_task()` has already popped it off `pending_`, so the task is gone from both ends.
 
 It cannot happen today: a worker refuses only after `stop()`, and `stop()` is only called by the
@@ -466,7 +468,7 @@ destructor, after the drain. That is an invariant held in place by the order of 
 written down nowhere, which is what makes an unchecked return worth this step rather than a shrug.
 
 > Check it. In `take_next_task()`, a refusal puts the task back at the front of `pending_`, which
-> is where it came from. In `submit()`, a refusal falls through to the queue. Neither can loop,
+> is where it came from. In `add_task()`, a refusal falls through to the queue. Neither can loop,
 > because a refusal means the pool is shutting down and the drain is what ends it. If the answer
 > turns out to be unreachable after steps 1 to 4, say so in a comment and keep the check.
 
@@ -520,14 +522,14 @@ cache holds, for what a profile of the pool looks like, and for anything per-wor
 `executor.hpp:104` · read-only
 
 `pending_.push_back()` always succeeds. A producer faster than the pool grows the deque until the
-process runs out of memory, and `submit()` answers true the whole way down. The only thing a caller
+process runs out of memory, and `add_task()` answers true the whole way down. The only thing a caller
 can do about it is read `pending()` and decide for itself.
 
 Recorded, not planned: a capacity is a change to the interface, and the interface is decided. The
 argument for taking it anyway is that an unbounded queue is not a smaller interface, it is a policy
 - unbounded - chosen silently.
 
-> If this is taken: a capacity given at construction, `submit()` answering false when it is full,
+> If this is taken: a capacity given at construction, `add_task()` answering false when it is full,
 > and the existing false-means-refused contract already carries it. Zero means unbounded, which
 > keeps every current caller.
 
@@ -677,6 +679,29 @@ rather than difficulty.
 > If taken: `wait_idle()`, the same predicate, no `accepting_ = false`, and the destructor calls
 > it. Sequence it after step 7, which decides what "idle" means for a task that submits more work.
 
+### Step 23 ✅ · item 20 — `submit()` does not match the interface it wraps — DONE
+`executor.hpp:171` · not a finding; a naming decision taken after step 22
+
+`submit()` is now `add_task()`. The pool is a template on its task type and a thin layer over
+`async::execution`, which takes work through `add_action()`; one of the two verbs had to go, and the
+pool is the side that should follow. A reader moving between the two headers meets `add_action` and
+`add_task` rather than `add_action` and `submit`, and the pair says which is the layer above.
+
+Nothing about the behaviour changed: it still queues a task or hands it straight to a free worker,
+still answers `false` once the pool has stopped accepting. It is a rename and the call sites moved
+with it — `test/executor_tests.cpp`, `test/executor_smoke_test.cpp` and the README example. Three
+case names went with it, because they named the method rather than the behaviour:
+`submit_is_refused_once_the_pool_is_shutting_down` and `submit_is_accepted_while_the_pool_is_up`
+became `add_task_is_...`, and `a_task_can_submit_more_work` became `a_task_can_add_more_work`.
+
+**The English is not the API.** "submitted", "submitter" and "submission" are left alone wherever
+they are prose — a task is still submitted to a pool, and `executor_smoke_test.concurrent_submission`
+keeps its name. Only the three places that read as the method were reworded.
+
+**Verified:** 23 of 23 on `debug`, `asan` and `tsan`; clang-format clean; `doc/refman.pdf` at 25
+pages. The probe transcript in step 1 still prints `submit() returned true`, and is left as it was
+run rather than edited to match.
+
 ## Group 6 — the suite
 
 ### Step 19 — run the suite under both sanitizers — OPEN (both passes run, one platform)
@@ -791,7 +816,7 @@ parameter the class did not have.
 whether to forward `Args&&...` the way `add_action()` does. It is not available:
 `add_action(actionT, Args&&...)` is the only public way into an execution, `add_queued_action()`
 being private (`async.hpp:668`), so what the pool can hand a worker is a `taskT` and nothing else. A
-`submit()` that bound arguments would have nowhere to keep them until a worker frees up — the "second
+`add_task()` that bound arguments would have nowhere to keep them until a worker frees up — the "second
 type in the class" this step warned about, now ruled out by the interface instead of by taste. What
 it costs is one `static_assert` (`:51`), which turns the failure into a sentence:
 
@@ -800,7 +825,7 @@ error: static assertion failed due to requirement 'std::is_invocable_v<std::func
 executor: the task type must be callable with no arguments
 ```
 
-**`submit()` stayed narrow**, taking `taskT`. The templated `submit()` that would widen the door for
+**`add_task()` stayed narrow**, taking `taskT`. The templated `add_task()` that would widen the door for
 a custom `taskT` is still the separate, smaller change this step described, and is not in `9daec8b`.
 It is worth having only if a caller is found who wants a functor pool and lambda submission at once.
 

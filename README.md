@@ -36,7 +36,7 @@ int main() {
   untangle::executor<std::function<void(void)>> pool(4);
 
   for (int i = 0; i < 100; ++i) {
-    pool.submit([i] { work(i); });
+    pool.add_task([i] { work(i); });
   }
 
   return 0;  // ~executor finishes what was submitted, then stops the workers
@@ -83,7 +83,7 @@ raised by `execution` the moment its list empties — it takes the front of the 
 what spreads the work, with no scheduling logic of its own: 400 tasks over 4 workers come out
 100/100/100/100.
 
-**A worker is asked, not tracked.** `execution::is_busy()` is what `submit()` reads to find a free
+**A worker is asked, not tracked.** `execution::is_busy()` is what `add_task()` reads to find a free
 worker and what the destructor reads to decide the pool is idle. A tally kept here would be the
 pool's belief about its workers; this is the workers' own answer, and it cannot drift.
 
@@ -93,7 +93,7 @@ pool's belief about its workers; this is the workers' own answer, and it cannot 
 worker to go idle, and only then stops them. A task submitted before the pool goes out of scope has
 run by the time it does.
 
-**`submit()` says whether the task was taken.** It returns false once the pool is shutting down,
+**`add_task()` says whether the task was taken.** It returns false once the pool is shutting down,
 which a task submitting more work from inside the pool can see.
 
 **A task that throws does not take the worker with it.** `execution` catches it, reports it on

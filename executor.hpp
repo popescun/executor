@@ -168,7 +168,7 @@ class executor {
    *
    * @return true - the task was accepted. false - the pool is shutting down and refused it.
    */
-  bool submit(taskT task) {
+  bool add_task(taskT task) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!accepting_) {
