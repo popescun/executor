@@ -74,10 +74,11 @@ own hash, so the table below is filled by the `chore: update fix plan` that foll
 also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` under an amend and left
 three dangling references behind it.
 
-**NEXT: group 3 — steps 8 and 9, placement.** Group 2 is done: 5 through async's step 38 rather
-than here, 6 once step 25 made its state reachable, and 7 decided rather than fixed. Step 8 is the
-free-worker scan always starting at worker 0, confirmed by a probe; step 9 is the unbounded queue,
-recorded against the API decision. Groups 1 and 7 are done, and step 22
+**NEXT: step 9, and it is the last of group 3.** Group 2 is done — 5 through async's step 38
+rather than here, 6 once step 25 made its state reachable, 7 decided rather than fixed — and step 8
+is closed by declining it: the reuse it called a defect is the behaviour worth having. Step 9 is the
+unbounded queue, recorded against the API decision rather than planned, so it is a decision too
+rather than a fix. Groups 1 and 7 are done, and step 22
 sharpened what group 2 has to answer: a pool can now be built on `std::function<int(void)>`, and
 what it does with the `int` is nothing. That is steps 5 and 18's question arriving by a third door,
 which is what this plan predicted. The couplings below say to settle 5 and 6 together rather than in
@@ -131,7 +132,7 @@ returns something give back — so read those two before deciding what it means 
 | 6 ✅ | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:163`, `:260`, `:278` | CONFIRMED (test) — fixed |
 | 7 ✅ | 7 | work spawned by an in-flight task is refused once shutdown starts | `:85`, `:156`, `:205` | decided, documented, tested |
 | **Group 3 — placement** |
-| 8 | 8 | the free-worker scan always starts at worker 0 | `:110-117` | CONFIRMED (20 tasks, 1 of 4; probe) |
+| 8 ✅ | 8 | the free-worker scan always starts at worker 0 | `:152`, `:169` | CONFIRMED (probe) — declined, the reuse is intended |
 | 9 | 9 | the queue is unbounded and nothing pushes back | `:119` | read-only, API decision |
 | **Group 4 — what async.hpp imposes** |
 | 10 | 10 | the lock order rests on an async.hpp detail that is not its contract | `:140-145`, `:171-179` | read-only |
@@ -556,33 +557,46 @@ had simply never been stated.
 
 ## Group 3 — placement
 
-### Step 8 · item 8 — the free-worker scan always starts at worker 0 — OPEN
-`executor.hpp:95-101` · CONFIRMED by probe: 20 tasks, 1 of 4 workers
+### Step 8 ✅ · item 8 — the free-worker scan always starts at worker 0 — CLOSED, DECLINED
+`executor.hpp:152` (the remark), `:169` (the scan) · CONFIRMED by probe, and kept anyway
 
-```c++
-for (std::size_t index = 0; index < workers_.size(); ++index) {
-  if (!workers_[index].exec->is_busy()) {
-```
-
-The scan restarts at 0 for every submission, so with the queue empty the first idle worker is
-always the same one. The probe submitted 20 tasks, each after the last had finished, and every one
-of them ran on the same thread:
+The scan restarts at 0 on every call, so a pool that is not busy hands every task to the same
+worker. A probe measures both load shapes on one 4-worker pool:
 
 ```
-20 sporadic tasks landed on 1 of 4 worker thread(s)
+400 tasks, added as fast as possible -> 4 worker(s): 110 106 86 98
+ 20 tasks, each awaited before the next -> 1 worker(s): 20
 ```
 
-The even spread the prototype measured — 400 tasks, 100/100/100/100 — is the *queue* path, which
-only runs when every worker is busy. Under a load that never saturates the pool, three of four
-workers are decoration.
+The even spread is the *queue* path, which runs only when every worker is busy; the one-worker
+result is the hand-to-a-free-worker path, and it is what this step was opened about.
 
-Not a correctness defect: each task still runs, promptly, on a free worker. It matters for what a
-cache holds, for what a profile of the pool looks like, and for anything per-worker a task touches.
+**The rotation this step asked for was written, measured, and declined.** The case that shows it —
+20 sporadic tasks landing on 1 of 4 workers — was written and passed as a red test, and then
+dropped. What broke the step was reading its own harms back:
 
-> Start the scan where the last one stopped. One `std::size_t` member, incremented past the worker
-> that took the task; the placement rule does not change, only which free worker is found first.
-> Land it after step 14, which changed what is being scanned — done at `4c1cba6`, so the scan now
-> reads `workers_[index]->is_busy()` and this step is unblocked.
+- *"what a cache holds"* argues the other way. Reusing the worker that just ran keeps one stack and
+  one set of cache lines warm; rotating cools four and pays a wake-up and a migration per task.
+- *"what a profile looks like"* is cosmetic. Three idle threads under light load is an accurate
+  picture of a pool that is not busy.
+- *"anything per-worker a task touches"* is real in principle and empty in fact: nothing here keeps
+  per-worker state, and a caller cannot reach a worker at all (step 24).
+
+The step's own first line was the giveaway — *"not a correctness defect: each task still runs,
+promptly, on a free worker"*. Pools that care about locality prefer the thread that just ran for
+exactly this reason.
+
+**Where rotation would win** is narrower than the step implies: tasks long enough to overlap, arriving
+just far enough apart that worker 0 is free each time, so one worker does everything while three
+idle and the queue path never engages. Real, specific, and handled correctly today — unevenly, but
+correctly.
+
+**What landed is the decision, on `add_task()`**: the first free worker takes it, counting from the
+start, because the worker that just ran is the warm one. Said there so it is not rediscovered as a
+bug.
+
+> Reopen it if a caller appears who needs the spread — per-worker connections, or anything else
+> pinned to a thread. That caller would need step 24 first, to reach a worker at all.
 
 ### Step 9 · item 9 — the queue is unbounded and nothing pushes back — OPEN, API decision
 `executor.hpp:104` · read-only

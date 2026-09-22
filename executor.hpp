@@ -149,6 +149,10 @@ class executor {
   /**
    * @brief Queues a task, or hands it to a worker that has nothing to do.
    *
+   * @remark The first free worker takes it, counting from the start, so a pool that is not busy
+   * keeps giving work to the same one. That is the intent: the worker that just ran a task is the
+   * warm one, and a free worker is free whichever it is.
+   *
    * @return true - the task was accepted. false - it was refused, by a pool that has not been
    * started, has been stopped, or is being destroyed, or by a worker that has stopped. Either way
    * it will not run. A task calling this from a worker thread is answered like any other caller.
@@ -162,6 +166,8 @@ class executor {
 
     // The queue comes first: a task does not overtake one already waiting in it.
     if (pending_.empty()) {
+      // Always from the start, so a free pool reuses its warmest worker rather than waking a cold
+      // one. Under load the workers are busy and the queue below is what spreads the work.
       for (std::size_t index = 0; index < workers_.size(); ++index) {
         if (!workers_[index]->is_busy()) {
           // A refused task is already destroyed, and stop() stops every worker together, so there
