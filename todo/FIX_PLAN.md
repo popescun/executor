@@ -3,8 +3,8 @@
 **Status (2026-09-21) — group 1 is done: every blocker closed or disproven.** The pool was imported
 from `async/prototypes/executor.hpp` as it stood, and this is the audit of what has to change before
 it can be called production ready. 19 items, in seven groups — item 19 was added after the audit
-closed and is a decision rather than a finding; see group 7. Item 20 was added the same way and is
-step 23, a rename. **Four were called blockers**: each was
+closed and is a decision rather than a finding; see group 7. Items 20 and 21 were added the same
+way and are steps 23 and 24, a rename and an open question about reaching the workers. **Four were called blockers**: each was
 read as a way the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed;
 step 3 was probed and does not reproduce, so it is closed as not a defect rather than fixed. What is
 left is group 2 onwards — what the caller is told, placement, and the surface.
@@ -142,6 +142,7 @@ returns something give back — so read those two before deciding what it means 
 | 17 | 17 | `pending()` is advisory and does not say so | `:126-129` | read-only |
 | 18 | 18 | no way to wait for the pool to drain short of destroying it | `:79-94` | read-only, API decision |
 | 23 ✅ | 20 | `submit()` does not match `execution::add_action()` | `:171` | naming decision — renamed `add_task()` |
+| 24 | 21 | the workers are unreachable, and so is every seam on them | `:375` | read-only, surface decision |
 | **Group 7 — the task type** |
 | 22 ✅ | 19 | `task_t` is fixed at `std::function<void(void)>` | `:45`, `:51`, `:202` | CONFIRMED (probe, tests) — fixed `9daec8b` |
 | **Group 6 — the suite** |
@@ -739,6 +740,35 @@ keeps its name. Only the three places that read as the method were reworded.
 **Verified:** 23 of 23 on `debug`, `asan` and `tsan`; clang-format clean; `doc/refman.pdf` at 25
 pages. The probe transcript in step 1 still prints `submit() returned true`, and is left as it was
 run rather than edited to match.
+
+### Step 24 · item 21 — the workers are unreachable, and so is anything on them — OPEN
+`executor.hpp:375` (`workers_`) · read-only · raised 2026-09-22, while wiring step 5
+
+The pool builds its executions in the constructor and keeps them in a private `workers_`. Nothing a
+caller holds can reach one, so every seam an `execution` has is reachable only if the pool chooses
+to forward it. Step 5 forwards exactly one — `on_error`, and only as far as `on_task_error` —
+and that is the whole of it. `is_busy()` per worker, a worker's `name`, `is_running()`, a second
+`on_finished`: all present on the object, none reachable.
+
+**This was found by building the wrong thing.** A first attempt at giving callers `execution`'s
+`on_error` added a *second* handler on the pool that shadowed the pool's own. That is not access to
+the execution's seam; it is a parallel one that happens to pre-empt it, so the pool then had two
+members doing one job. It was reverted. The question the attempt was really asking is this step.
+
+> Two shapes, and the choice is about what escapes. A `workers()` accessor hands out the vector and
+> everything in it. `for_each_worker(f)` keeps the vector private and hands each execution to a
+> callable, which is narrower but still hands out a mutable reference.
+>
+> **Either way the danger is the same, and it is not the access itself.** The destructor's teardown
+> depends on these objects — the poll wait, `stop()`, then `clear()` — and a caller holding a
+> reference past the pool's life, or assigning to `on_error` while tasks are running, is a
+> use-after-free or a data race respectively. Step 2 is the record of how the first of those goes.
+> So: `const` access is cheap and safe and answers the reading half (names, `is_busy()`); mutable
+> access is the one that wants a rule about when it may be used, and that rule is "before the first
+> `add_task()`", which nothing can enforce.
+>
+> Not urgent. Nothing has asked for it yet, and step 5's handler covers the case that prompted it.
+> Take it when a second seam is actually wanted, and take the `const` half first.
 
 ## Group 6 — the suite
 
