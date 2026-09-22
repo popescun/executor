@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -77,6 +78,18 @@ class executor {
       // How a worker learns there is more waiting for it. is_busy() answers whether a worker has
       // room; this is what tells the pool the moment one frees up, without anybody polling.
       next->on_finished = [this, index] { take_next_task(index); };
+
+      // What a task throws, on its way to whoever submitted it. The worker catches it and would
+      // otherwise print a warning naming itself, which reaches a log and no code.
+      //
+      // Assigned whether or not a caller has set on_task_error, because it cannot be assigned later
+      // - a worker thread reads it, and this is the last moment nothing is running. The name is
+      // captured rather than looked up for the same reason: report_task_error() runs on the
+      // worker's thread and taking mutex_ there to read workers_ would be a lock this path does not
+      // need.
+      next->on_error = [this, name = next->name](std::exception_ptr thrown) {
+        report_task_error(name, thrown);
+      };
 
       // A worker runs in a detached thread and cannot be joined, so asking whether it is still
       // running is the only way to wait for one, and the poll answers that for any number of them
@@ -198,7 +211,53 @@ class executor {
     return pending_.size();
   }
 
+  /**
+   * @brief Called with whatever a task threw. Assigned by the caller.
+   *
+   * The pool runs the caller's code and nothing comes back from it: add_task() has answered true
+   * long before the task runs, and a task that failed is otherwise indistinguishable from one that
+   * succeeded. This is the one way out. Without it the only record is a warning on stderr naming a
+   * worker the caller neither chose nor can look up.
+   *
+   * @remark It receives a std::exception_ptr because a task may throw something that is not a
+   * std::exception, and that case is the one most worth hearing about. Rethrow it to read it.
+   *
+   * @attention It runs on a worker's thread, and more than one worker may be in it at once -
+   * whatever it touches has to be safe for that. Assign it before the first add_task(): a worker
+   * reads it, so assigning it while tasks are running is a data race.
+   *
+   * @attention Nothing may escape it. It is called from inside the worker's own catch, and an
+   * exception leaving a detached thread function calls std::terminate - async catches around it to
+   * keep that from being fatal, but the exception is then lost.
+   */
+  std::function<void(std::exception_ptr)> on_task_error;
+
  private:
+  /**
+   * @brief Hands what a task threw to \ref on_task_error, or keeps the floor if nobody is
+   * listening.
+   *
+   * @param worker - The name of the worker that ran the task, for the warning.
+   * @param thrown - What the task threw.
+   */
+  void report_task_error(const std::string& worker, std::exception_ptr thrown) {
+    if (on_task_error) {
+      on_task_error(thrown);
+      return;
+    }
+
+    // Nobody is listening, so this stands in for the warning async would have printed had the pool
+    // not taken its on_error. Losing it silently would make a pool worse than the execution it
+    // wraps.
+    try {
+      std::rethrow_exception(thrown);
+    } catch (const std::exception& e) {
+      std::println(stderr, "warning: executor task on '{}' threw: {}", worker, e.what());
+    } catch (...) {
+      std::println(stderr, "warning: executor task on '{}' threw an unknown type", worker);
+    }
+  }
+
   using worker_execution = untangle::async::execution<taskT>;
 
   /**

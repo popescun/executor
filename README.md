@@ -96,10 +96,28 @@ run by the time it does.
 **`add_task()` says whether the task was taken.** It returns false once the pool is shutting down,
 which a task submitting more work from inside the pool can see.
 
-**A task that throws does not take the worker with it.** `execution` catches it, reports it on
-stderr, and the worker carries on with the next task. Nothing reaches the submitter — a task that
-has something to report carries its own channel, because a continuous worker does not collect
-results.
+**A task that throws does not take the worker with it**, and what it threw is not lost. The worker
+catches it and carries on with the next task; `on_task_error` is where the throw goes:
+
+```c++
+untangle::executor<std::function<void(void)>> pool(4);
+
+pool.on_task_error = [](std::exception_ptr thrown) {
+  try {
+    std::rethrow_exception(thrown);
+  } catch (const std::exception& e) {
+    log(e.what());
+  }
+};
+```
+
+It carries a `std::exception_ptr` because a task may throw something that is not a `std::exception`,
+and that is the case most worth hearing about. Assign it before the first `add_task()` — a worker
+reads it — and expect it on a worker's thread, with more than one worker possibly inside it at once.
+Leave it unset and the pool warns on stderr instead, naming the worker.
+
+A *return value* is still not collected: a continuous worker keeps none, so a task with something to
+report carries its own channel.
 
 ## building the tests
 

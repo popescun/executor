@@ -340,6 +340,48 @@ TEST(executor_tests, a_throwing_task_does_not_stop_the_worker) {
 }
 
 /**
+ * @brief What a task throws reaches the caller, and not only stderr.
+ *
+ * async::execution catches everything an action throws and prints a warning naming the execution,
+ * which is the only record there is. It names a worker the caller never chose and cannot look up,
+ * and it says nothing to the code that handed the task over: a task that failed and a task that
+ * succeeded are the same from outside. This states the other half - the executor hands the caller
+ * what was thrown.
+ *
+ * @remark Both arms are read, because async catches in two: one for a std::exception and one for
+ * anything else. A handler given only the first would leave the second exactly as silent as it is
+ * now.
+ */
+TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
+  std::atomic_int reported = {0};
+  std::string reported_what;
+  std::atomic_int reported_unknown = {0};
+
+  {
+    executor executor(1);
+
+    executor.on_task_error = [&](std::exception_ptr thrown) {
+      reported.fetch_add(1, std::memory_order_relaxed);
+
+      try {
+        std::rethrow_exception(thrown);
+      } catch (const std::exception& e) {
+        reported_what = e.what();
+      } catch (...) {
+        reported_unknown.fetch_add(1, std::memory_order_relaxed);
+      }
+    };
+
+    executor.add_task([] { throw std::runtime_error("a task that throws"); });
+    executor.add_task([] { throw 42; });  // not a std::exception; the catch-all arm
+  }
+
+  EXPECT_EQ(reported.load(), 2) << "the executor swallowed what the tasks threw";
+  EXPECT_EQ(reported_what, "a task that throws");
+  EXPECT_EQ(reported_unknown.load(), 1);
+}
+
+/**
  * @brief A task may add more work, and it runs.
  *
  * The inner submission has to be waited for rather than assumed: leaving the scope starts the

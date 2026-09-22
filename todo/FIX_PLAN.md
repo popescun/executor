@@ -8,12 +8,12 @@ step 23, a rename. **Four were called blockers**: each was
 read as a way the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed;
 step 3 was probed and does not reproduce, so it is closed as not a defect rather than fixed. What is
 left is group 2 onwards — what the caller is told, placement, and the surface.
-**Tests:** 23 of 23 green on Debug, ASan and TSan, 2026-09-21; clang-format clean;
+**Tests:** 24 of 24 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
 `async::execution_poll` until every worker has left its thread and clears them only then, and it
 reports on stderr while either of its waits is stalled rather than parking in silence. The race TSan
-named on CI no longer reproduces: 23 of 23 under TSan and under ASan on macOS/libc++, where the case
+named on CI no longer reproduces: 24 of 24 under TSan and under ASan on macOS/libc++, where the case
 that provokes it aborted before the fix. **That is one platform, not both** — the Linux/libstdc++
 run this plan insists on has not been made since either fix, which is why step 19 stays open.
 **Sites** are line numbers in `executor.hpp` as of `032da65`, and they move with every fix that
@@ -73,7 +73,8 @@ own hash, so the table below is filled by the `chore: update fix plan` that foll
 also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` under an amend and left
 three dangling references behind it.
 
-**NEXT: group 2 — steps 5, 6 and 7, what the caller is told.** Groups 1 and 7 are done, and step 22
+**NEXT: steps 6 and 7, the rest of group 2.** Step 5 is done — through async's step 38 rather than
+here, see below. Groups 1 and 7 are done, and step 22
 sharpened what group 2 has to answer: a pool can now be built on `std::function<int(void)>`, and
 what it does with the `int` is nothing. That is steps 5 and 18's question arriving by a third door,
 which is what this plan predicted. The couplings below say to settle 5 and 6 together rather than in
@@ -123,7 +124,7 @@ returns something give back — so read those two before deciding what it means 
 | 3 ✅ | 3 | a constructor that throws leaves started workers holding `this` | `:59-84` | DISPROVEN (probe) — not a defect |
 | 4 ✅ | 4 | the destructor waits forever on a task that never returns | `:112-129`, `:144-160` | CONFIRMED (test) — fixed `032da65` |
 | **Group 2 — what the caller is told** |
-| 5 | 5 | a task that throws is reported to stderr and to nobody else | `:140-145` | CONFIRMED (test) |
+| 5 ✅ | 5 | a task that throws is reported to stderr and to nobody else | `:90-92`, `:233`, `:243` | CONFIRMED (test) — fixed via async `on_error` |
 | 6 | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:140-145` | read-only |
 | 7 | 7 | work spawned by an in-flight task is refused once shutdown starts | `:82`, `:101-121` | CONFIRMED (test) |
 | **Group 3 — placement** |
@@ -431,25 +432,54 @@ with an empty capture after two seconds. 23 of 23 on `debug`, `asan` and `tsan`.
 
 ## Group 2 — what the caller is told
 
-### Step 5 · item 5 — a task that throws is reported to stderr and to nobody else — OPEN
-`executor.hpp:129-134` · CONFIRMED by test: `a_throwing_task_does_not_stop_the_worker`
+### Step 5 ✅ · item 5 — a task that throws is reported to stderr and to nobody else — DONE
+`executor.hpp:90-92` (the wiring), `:233` (the member), `:243` (`report_task_error()`) · CONFIRMED
+by test: `what_a_task_throws_reaches_the_caller`
 
-`execute_actions()` catches everything an action throws, in three arms, and prints a warning naming
-the execution. The worker survives and the next task runs — the test states exactly that, and it
-passes.
+The pool has an `on_task_error`, assigned by the caller and called with a `std::exception_ptr`:
 
-What the submitter gets is nothing. Not an exception, not a return value, not a callback: a task
-that failed and a task that succeeded are indistinguishable from outside the pool, and the only
-record is a line on stderr naming `pool_worker_2`, which is not a name the caller chose or knows.
+```c++
+pool.on_task_error = [](std::exception_ptr thrown) { ... };
+```
 
-This is the half of the prototype's gap 1 that `async.hpp` could not close, because it is about the
-pool's caller and `async.hpp` has never met them. It was tolerable for the prototype. It is the
-thing most likely to be asked for first by anything real.
+**It could not be built here, and that is the finding this step turned on.** `execute_actions()`
+catches what a task throws, prints, and drops it; nothing readable survives, and `actions_run_`
+counts a throw as run. For the pool to see an exception it would have to wrap every task in its own
+try/catch — which means constructing a `taskT` from a lambda. That works for `std::function` and not
+for the bare functor step 22 had just made legal and tested. **Three routes were weighed:**
 
-> The API decision rules out futures, so the remaining shape is a reporting seam the pool owns: one
-> handler, settable once, called with the exception and whatever identifies the task. Decide it
-> with step 6 rather than separately - both are "what happened to the task I gave you", and the
-> async plan's steps 21 and 28 are the record of what answering that in two passes costs.
+| Route | Cost |
+|---|---|
+| Constrain `taskT` to what a lambda converts into | walks back step 22 a day after it landed; `a_pool_runs_a_task_type_that_is_not_a_std_function` stops compiling; every task pays a wrap |
+| Wrap only where it compiles, handler gated by `static_assert` | two classes of pool with different capabilities, split by the template argument; the handler must become a method, so it stops mirroring `on_finished` |
+| **Taken:** a seam upstream, in `execution` | a two-repo change — async's step 38, then the submodule bump |
+
+The exception belongs to whoever queued the action, and `execution` is the one holding it. async
+step 38 added `on_error` there; this step is the pool wiring it through. No wrapping, so `taskT` is
+never constructed from a lambda and step 22 is untouched — a functor pool reports errors like any
+other.
+
+**The pool takes `on_error` whether or not a caller has set `on_task_error`**, because it cannot be
+assigned later: a worker thread reads it, and construction is the last moment nothing is running.
+That would have made a pool *worse* than the execution it wraps — async prints only when no handler
+is set, and the pool having taken the handler would have silenced it. So `report_task_error()` keeps
+the floor, and names the worker while it is at it:
+
+```
+warning: executor task on 'pool_worker_0' threw: nobody is listening
+warning: executor task on 'pool_worker_0' threw an unknown type
+```
+
+**Results are still not collected**, and this does not reopen that. A throw is not a return value;
+steps 18 and 22 keep that question.
+
+**Verified:** 24 of 24 on `debug`, `asan` and `tsan`; clang-format clean; `doc/refman.pdf` at 25
+pages. README gains the handler and the warning it replaces.
+
+> **Step 13 is no longer a prerequisite, and is still worth having.** This step was sequenced after
+> it because a report needs a name the caller recognises. What the handler delivers is the exception
+> itself, which needs no name at all — so 13 became optional here. It still matters for the stderr
+> floor above and for step 4's stall report, both of which name a worker that two pools would share.
 
 ### Step 6 · item 6 — `add_action()`'s answer is dropped — OPEN
 `executor.hpp:129-134` · read-only
@@ -467,10 +497,18 @@ It cannot happen today: a worker refuses only after `stop()`, and `stop()` is on
 destructor, after the drain. That is an invariant held in place by the order of two functions and
 written down nowhere, which is what makes an unchecked return worth this step rather than a shrug.
 
-> Check it. In `take_next_task()`, a refusal puts the task back at the front of `pending_`, which
-> is where it came from. In `add_task()`, a refusal falls through to the queue. Neither can loop,
-> because a refusal means the pool is shutting down and the drain is what ends it. If the answer
-> turns out to be unreachable after steps 1 to 4, say so in a comment and keep the check.
+> Check it. **The recovery this step asked for cannot be written, though — found while wiring step
+> 5, 2026-09-22.** "A refusal puts the task back at the front of `pending_`" assumes the task still
+> exists when the answer arrives, and it does not: `add_action(actionT action, ...)` takes it by
+> value and `std::move`s it into `std::bind` before `add_queued_action()` (`async.hpp:668`) sees
+> `stopped_` and destroys it. By the time `false` comes back there is nothing left to put anywhere.
+>
+> So what is available is the check and a report, not a recovery. In `take_next_task()`, say on
+> stderr that a queued task was refused and is lost — the caller was told it had been accepted, and
+> that is now untrue. In `add_task()`, a refusal means this worker is stopped, so the pool is going
+> away: answer `false` rather than trying the next worker or queueing a task that no longer exists.
+> Neither can loop, because a refusal means the destructor is running and the finish is what ends
+> it. It is unreachable today, so say that in a comment and keep the check.
 
 ### Step 7 · item 7 — work spawned by an in-flight task is refused once shutdown starts — OPEN
 `executor.hpp:67`, `:101-121` · CONFIRMED by test, which had to be written around it
