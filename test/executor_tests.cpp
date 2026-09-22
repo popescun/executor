@@ -4,11 +4,8 @@
  * @brief Behaviour tests for untangle::executor.
  *
  * Unlike executor_smoke_test.cpp, which walks the pool through its scenarios and prints what
- * happened, every case here states an expectation and fails when it does not hold.
- *
- * A task is a callable the pool is meant to invoke, so what most of these cases are really about is
- * a call count and a call order. Both are gmock's to state rather than the test's to tally, which
- * is why the work submitted below is mostly a mock's method.
+ * happened, every case here states an expectation and fails when it does not hold. Most are about a
+ * call count or a call order, which is why the work added below is mostly a mock's method.
  *
  * @remark A few cases are sanitizer-sensitive. Configure with -DEXECUTOR_SANITIZE=thread or
  * =address to run them where a race or a dangling read is named rather than inferred.
@@ -30,8 +27,7 @@
 
 namespace {
 
-// The pool under test, named once: executor is a template on its task type, the way the execution
-// it runs tasks on is a template on its action type.
+// The pool under test, named once: executor is a template on its task type.
 using executor = untangle::executor<std::function<void(void)>>;
 using namespace std::chrono_literals;
 using ::testing::InSequence;
@@ -66,9 +62,8 @@ struct mock_work {
 /**
  * @brief A task type that is not a std::function: a callable with a nested result_type.
  *
- * What an execution requires of its action type is the typedef, which it reads rather than deduces.
- * A bare lambda has nowhere to put one; this does, which is what makes it a task type a pool can be
- * built on.
+ * An execution reads that typedef off its action type rather than deducing it, and a bare lambda
+ * has nowhere to put one.
  */
 struct counting_task {
   using result_type = void;
@@ -81,8 +76,7 @@ struct counting_task {
 /**
  * @brief A task that stops on entry and stays there until it is released.
  *
- * What makes a busy worker something a test can arrange rather than wait out: a pool holding one of
- * these per worker is fully occupied, and stays that way until the test says otherwise.
+ * A pool holding one per worker is fully occupied until the test says otherwise.
  */
 class gate {
  public:
@@ -115,10 +109,9 @@ class gate {
 }  // namespace
 
 /**
- * @brief Every submitted task is invoked, once each.
+ * @brief Every added task is invoked, once each.
  *
- * The mock outlives the pool, so the expectation is verified after the destructor has finished -
- * which is also what makes this a test of the finish.
+ * The mock outlives the pool, so the expectation is verified after the destructor has finished.
  */
 TEST(executor_tests, every_submitted_task_runs_exactly_once) {
   constexpr int task_count = 200;
@@ -136,8 +129,7 @@ TEST(executor_tests, every_submitted_task_runs_exactly_once) {
 /**
  * @brief The destructor does not return until the work already in flight has finished.
  *
- * Long enough that a destructor which only stopped the workers would be caught leaving a task
- * unrun, rather than winning the race by chance.
+ * The task is slow enough that a destructor which only stopped the workers would be caught.
  */
 TEST(executor_tests, the_destructor_finishes_work_in_flight) {
   std::atomic_bool finished = {false};
@@ -161,8 +153,7 @@ TEST(executor_tests, the_queue_preserves_submission_order) {
   mock_work work;
 
   {
-    // InSequence is the ordering claim itself: any pair of calls arriving the other way round is a
-    // failure, rather than something the test has to reconstruct from a vector afterwards.
+    // InSequence is the ordering claim itself: any pair arriving the other way round fails.
     InSequence ordered;
     for (int i = 0; i < task_count; ++i) {
       EXPECT_CALL(work, run_numbered(i));
@@ -178,11 +169,10 @@ TEST(executor_tests, the_queue_preserves_submission_order) {
 }
 
 /**
- * @brief A task submitted while the queue has work in it joins the back of it.
+ * @brief A task added while the queue has work in it joins the back of it.
  *
- * The rule the pool was asked for: finding a free worker does not let a task jump a queue that
- * already has work in it. With every worker held at the gate there is no free worker to find, so
- * what this states is the other half - each submission lands in the queue, in turn.
+ * Every worker is held at the gate, so there is no free worker to find and each task lands in the
+ * queue in turn.
  */
 TEST(executor_tests, tasks_queue_while_every_worker_is_busy) {
   constexpr std::size_t worker_count = 2;
@@ -199,8 +189,7 @@ TEST(executor_tests, tasks_queue_while_every_worker_is_busy) {
       pool.add_task([&busy] { busy(); });
     }
 
-    // Every worker has to be at the gate before the queue means anything: a submission racing a
-    // worker that has not started yet would be handed straight to it.
+    // Every worker must be at the gate first: one not yet started would be handed the task.
     ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == static_cast<int>(worker_count); }, 5s));
     EXPECT_EQ(pool.pending(), 0u);
 
@@ -216,8 +205,7 @@ TEST(executor_tests, tasks_queue_while_every_worker_is_busy) {
 /**
  * @brief A task handed straight to a free worker, because the queue is empty.
  *
- * The first half of the placement rule: with nothing waiting, a submission does not sit in the
- * queue behind a busy worker when another one is idle.
+ * With nothing waiting, a task does not sit in the queue while a worker is idle.
  */
 TEST(executor_tests, a_free_worker_takes_a_task_with_an_empty_queue) {
   gate busy;
@@ -231,8 +219,7 @@ TEST(executor_tests, a_free_worker_takes_a_task_with_an_empty_queue) {
 
     pool.add_task([&ran] { ran = true; });
 
-    // The second worker is free and the queue is empty, so this runs while the first worker is
-    // still held - no release is needed to get it to run.
+    // The second worker is free and the queue empty, so this runs with the first still held.
     EXPECT_TRUE(wait_for([&ran] { return ran.load(); }, 5s));
     EXPECT_EQ(pool.pending(), 0u);
 
@@ -273,8 +260,7 @@ TEST(executor_tests, workers_take_the_queue_as_they_free_up) {
 /**
  * @brief Tasks that wait run at the same time, not one after another.
  *
- * Four 150ms tasks on four workers. The bound is loose on purpose: what would fail here is a pool
- * that serialised them, which costs 600ms, not a runner that was a little slow.
+ * Four 150ms tasks on four workers, against a loose bound: a pool that serialised them costs 600ms.
  */
 TEST(executor_tests, tasks_run_concurrently) {
   const auto started = std::chrono::steady_clock::now();
@@ -321,8 +307,7 @@ TEST(executor_tests, concurrent_submission_loses_nothing) {
 /**
  * @brief A task that throws does not take its worker with it.
  *
- * untangle::async::execution catches what escapes an action and reports it on stderr; the worker
- * carries on. Nothing reaches the submitter, which is why the task after it is what this reads.
+ * The worker carries on, so what this reads is the task after the throw.
  */
 TEST(executor_tests, a_throwing_task_does_not_stop_the_worker) {
   mock_work work;
@@ -342,15 +327,8 @@ TEST(executor_tests, a_throwing_task_does_not_stop_the_worker) {
 /**
  * @brief What a task throws reaches the caller, and not only stderr.
  *
- * async::execution catches everything an action throws and prints a warning naming the execution,
- * which is the only record there is. It names a worker the caller never chose and cannot look up,
- * and it says nothing to the code that handed the task over: a task that failed and a task that
- * succeeded are the same from outside. This states the other half - the executor hands the caller
- * what was thrown.
- *
- * @remark Both arms are read, because async catches in two: one for a std::exception and one for
- * anything else. A handler given only the first would leave the second exactly as silent as it is
- * now.
+ * @remark Both arms are read: async catches a std::exception and anything else separately, and a
+ * handler given only the first would leave the second as silent as it was.
  */
 TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
   std::atomic_int reported = {0};
@@ -384,14 +362,8 @@ TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
 /**
  * @brief A task a worker refuses is not reported to the caller as taken.
  *
- * give_to_worker() drops what add_action() answers. A worker refuses once it is stopped, and what
- * it refuses it destroys, so the task is gone - while add_task() has already returned true and
- * pending() counts nothing, the caller's two ways of asking whether the work is safe both saying
- * yes about a task that will never run.
- *
- * @remark stop() is what makes this reachable. A worker refuses only once it is stopped, and until
- * stop() was a caller's to call, the pool stopped its own only in the destructor - after the queue
- * was empty and nothing was left to hand over.
+ * A stopped worker refuses what it is handed and destroys it, so a task answered for with true
+ * would never run and pending() would not count it either.
  */
 TEST(executor_tests, a_task_refused_by_a_worker_is_not_reported_as_taken) {
   std::atomic_int ran = {0};
@@ -412,10 +384,8 @@ TEST(executor_tests, a_task_refused_by_a_worker_is_not_reported_as_taken) {
 /**
  * @brief A task may add more work, and it runs.
  *
- * The inner submission has to be waited for rather than assumed: leaving the scope starts the
- * destructor, and a pool that has stopped accepting refuses the task its own worker is about to
- * hand it. That is the pool's behaviour today - work spawned by an in-flight task is only accepted
- * while the pool is still up.
+ * The inner task is waited for inside the scope: once the destructor starts, the pool refuses the
+ * work its own worker is about to add.
  */
 TEST(executor_tests, a_task_can_add_more_work) {
   mock_work work;
@@ -497,10 +467,8 @@ TEST(executor_tests, an_idle_pool_shuts_down) {
 /**
  * @brief A pool that can run nothing is refused before it exists.
  *
- * A pool with no workers would take work and never run it: add_task() queues the task and answers
- * true, and the destructor then waits for a queue only a worker can empty.
- * std::thread::hardware_concurrency() returns 0 when it cannot tell how many cores there are, and a
- * caller passing that straight through is the likely way in.
+ * With no workers it would take work and then wait, in the destructor, for a queue nothing can
+ * empty.
  */
 TEST(executor_tests, a_pool_with_no_workers_is_refused) {
   EXPECT_THROW(executor(0), std::invalid_argument);
@@ -509,18 +477,13 @@ TEST(executor_tests, a_pool_with_no_workers_is_refused) {
 /**
  * @brief A destructor waiting on a task that has not returned reports why, and keeps waiting.
  *
- * Abandoning a running task would be worse than waiting for it, so the wait stays unbounded; what
- * it stops doing is keeping quiet about itself. The task holds the pool's only worker, so
- * nothing_running() cannot come true and the closing brace is where this case spends its time.
+ * The task holds the pool's only worker, so the closing brace is where this case spends its time.
  *
- * @remark The task times its own stall instead of waiting to be released, which is what lets a
- * plain scope destroy the pool: ~executor() has already begun by the time the scope is left, so
- * anything that released it would have to live outside. `started` is declared before the pool for
- * the same reason - reversed, it would be destroyed while the task was still reading it.
+ * @remark The task times its own stall rather than waiting to be released, so a plain scope can
+ * destroy the pool. `started` is declared before the pool so that it outlives the destructor.
  */
 TEST(executor_tests, a_destructor_stuck_on_a_task_reports_why) {
-  //! How long the task holds its worker - longer than a first report is due, so the destructor is
-  //! stuck across at least one of them.
+  //! Longer than a first report is due, so the destructor is stuck across at least one.
   constexpr auto stall = 2s;
 
   testing::internal::CaptureStderr();
@@ -549,9 +512,7 @@ TEST(executor_tests, a_destructor_stuck_on_a_task_reports_why) {
 /**
  * @brief A pool runs tasks that return a value, and drops what they return.
  *
- * The pool is a template on its task type, so the signature is the caller's to name. A continuous
- * worker collects nothing, so the return is run and discarded - which is why the count rather than
- * the results is what this reads.
+ * A continuous worker collects nothing, so the count rather than the results is what this reads.
  */
 TEST(executor_tests, a_pool_runs_tasks_that_return_a_value) {
   using int_executor = untangle::executor<std::function<int(void)>>;
@@ -573,9 +534,8 @@ TEST(executor_tests, a_pool_runs_tasks_that_return_a_value) {
 /**
  * @brief A pool runs a task type that is not a std::function.
  *
- * Any callable naming its own result_type will do, because that typedef is all an execution reads
- * from the type. A pool built this way never touches std::function, which is what keeps it clear of
- * a result_type the standard removed in C++20.
+ * Any callable naming its own result_type will do, and such a pool never touches
+ * std::function::result_type, which C++20 removed.
  */
 TEST(executor_tests, a_pool_runs_a_task_type_that_is_not_a_std_function) {
   using counting_executor = untangle::executor<counting_task>;
@@ -597,19 +557,14 @@ TEST(executor_tests, a_pool_runs_a_task_type_that_is_not_a_std_function) {
 /**
  * @brief Destroying a pool while its workers are still turning over does not race them.
  *
- * ~executor() waits on the poll until no worker is left in its thread, and destroys them only then.
- * Without that wait a worker could still be inside take_next_task(), reading every execution
- * through nothing_running() and is_busy() while the vector holding them was being cleared. Not
- * waiting here is what opens the window: the queue is still backed up when the destructor starts.
+ * Leaving the scope without waiting is what opens the window: the queue is still backed up when the
+ * destructor starts, so workers are inside take_next_task() as it reaches the executions.
  *
- * @attention Sanitizer-sensitive. On an ordinary build the accesses are unsynchronised rather than
- * wrong in any order it can observe, so passing there proves nothing; configure with
- * -DEXECUTOR_SANITIZE=thread, where this aborted before the wait existed. ASan stays silent even
- * so - the race is a free against a read with nothing ordering them, so it faults only when the
- * read lands after the free.
+ * @attention Sanitizer-sensitive, and only under -DEXECUTOR_SANITIZE=thread. A plain build cannot
+ * observe the race and ASan does not report it, so passing on either proves nothing.
  *
- * @remark What it states on any build is the finish: every task submitted before the scope closed
- * has run by the time the destructor returns.
+ * @remark What it states on any build is the finish: every task added before the scope closed has
+ * run by the time the destructor returns.
  */
 TEST(executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
   constexpr int rounds = 50;
@@ -623,8 +578,7 @@ TEST(executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
       pool.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
     }
 
-    // Deliberately no wait: leaving the scope with the queue still backed up is what puts workers
-    // inside take_next_task() at the moment the destructor reaches clear().
+    // Deliberately no wait: a backed-up queue is what puts workers inside take_next_task().
   }
 
   EXPECT_EQ(ran.load(), rounds * tasks_per_round);

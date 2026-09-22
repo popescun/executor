@@ -3,13 +3,9 @@
 /**
  * @brief A thread pool executor built out of untangle::async::execution objects.
  *
- * Imported from the async repo's prototypes/executor.hpp, unchanged apart from its namespace and
- * this comment. The hardening the prototype's README asks for has not been done yet.
- *
- * The pool holds N executions in continuous mode and a shared queue of tasks. A task is handed
- * straight to a free worker only when the shared queue is empty; otherwise it goes to the back of
- * the queue, and a worker takes the front of the queue as it frees up. Nothing overtakes: finding a
- * free worker does not let a task jump a queue that already has work in it.
+ * N workers run in continuous mode behind a shared queue. A task goes straight to a free worker
+ * only when the queue is empty; otherwise it joins the back, and a worker takes the front as it
+ * frees up.
  */
 #pragma once
 
@@ -36,34 +32,23 @@ namespace untangle {
 /**
  * @brief Runs tasks on a fixed pool of untangle::async::execution workers.
  *
- * @tparam taskT The type of the task the pool runs, specified as std::function<...> like the
- * execution it is handed to. One pool runs one signature, because an execution's action type is
- * fixed by its own template argument.
- *
- * @remark A task that needs to return something carries its own channel: a continuous worker does
- * not collect results, so a non-void return is run and dropped.
+ * @tparam taskT The type of the task the pool runs. One pool runs one signature, and a non-void
+ * return is run and dropped.
  */
 template <typename taskT>
 class executor {
-  // add_action() is the only way in, and the pool calls it with no arguments to bind: what it
-  // queues is the task itself, and there is nowhere to keep arguments alongside it until a worker
-  // is free. Stated here so a pool on std::function<void(int)> says why rather than failing inside
-  // std::bind.
+  // A task is queued as it stands, with nothing bound to it, so it must take no arguments.
   static_assert(std::is_invocable_v<taskT>,
                 "executor: the task type must be callable with no arguments");
 
  public:
   /**
-   * @brief Starts \p worker_count executions in continuous mode.
+   * @brief Starts \p worker_count workers in continuous mode.
    *
    * @param worker_count - How many workers to run. Must not be zero.
    *
-   * @throws std::invalid_argument - \p worker_count is zero. Such a pool would take work and never
-   * run it, so it is refused before any worker starts rather than left to hang in the destructor.
-   *
-   * @remark std::thread::hardware_concurrency() returns 0 when it cannot tell how many cores there
-   * are, and a caller passing that straight through is the likely way in. Choosing a default then
-   * is the caller's call, not the pool's.
+   * @throws std::invalid_argument - \p worker_count is zero. Such a pool would take work it could
+   * never run.
    */
   explicit executor(std::size_t worker_count) {
     if (worker_count == 0) {
@@ -75,28 +60,15 @@ class executor {
     for (std::size_t index = 0; index < worker_count; ++index) {
       auto next = worker_execution::create_instance("pool_worker_" + std::to_string(index));
 
-      // How a worker learns there is more waiting for it. is_busy() answers whether a worker has
-      // room; this is what tells the pool the moment one frees up, without anybody polling.
+      // Tells the pool the moment this worker has room for more.
       next->on_finished = [this, index] { take_next_task(index); };
 
-      // What a task throws, on its way to whoever submitted it. The worker catches it and would
-      // otherwise print a warning naming itself, which reaches a log and no code.
-      //
-      // Assigned whether or not a caller has set on_task_error, because it cannot be assigned later
-      // - a worker thread reads it, and this is the last moment nothing is running. The name is
-      // captured rather than looked up for the same reason: report_task_error() runs on the
-      // worker's thread and taking mutex_ there to read workers_ would be a lock this path does not
-      // need.
+      // Carries what a task throws to the caller. Assigned here because a worker thread reads it.
       next->on_error = [this, name = next->name](std::exception_ptr thrown) {
         report_task_error(name, thrown);
       };
 
-      // A worker runs in a detached thread and cannot be joined, so asking whether it is still
-      // running is the only way to wait for one, and the poll answers that for any number of them
-      // at once. A poll answers for the executions added to it, and this one is added the pool's
-      // own workers and nothing else, so what the destructor waits for is exactly these. Nothing
-      // here has to unregister - the record runs both ways, so whichever of the two dies first
-      // takes itself out of the other.
+      // Adds the worker to the poll the destructor waits on.
       poll_.add(*next);
 
       workers_.push_back(std::move(next));
@@ -105,24 +77,17 @@ class executor {
   }
 
   /**
-   * @brief Finishes what has been submitted, then stops every worker.
+   * @brief Finishes what has been added, then stops every worker.
    *
-   * Both waits are unbounded - a pool that abandoned a running task would be worse than one that
-   * waits for it - and both report on stderr rather than stalling in silence, naming the workers
-   * they are still waiting on.
-   *
-   * @remark Every worker has left its thread before the first execution is destroyed. ~execution()
-   * waits only for its *own* worker, so destroying them one at a time would free the first while
-   * another's thread was still reading it through nothing_running(); the poll waits for all of
-   * them. It is this pool's own poll, so a second pool running alongside it is not waited for.
+   * Both waits are unbounded, and both report on stderr while they last, naming the workers they
+   * are waiting on.
    */
   ~executor() {
     {
       std::unique_lock<std::mutex> lock(mutex_);
       accepting_ = false;
 
-      // Unbounded, and reported rather than bounded. Both waits below keep waiting for as long as
-      // it takes; what they stop doing is keeping it to themselves.
+      // Waits for the queue to empty and every worker to go idle.
       auto interval = std::chrono::milliseconds(report_first_ms);
       auto waited = std::chrono::milliseconds(0);
 
@@ -130,9 +95,7 @@ class executor {
                                     [this] { return pending_.empty() && nothing_running(); })) {
         waited += interval;
 
-        // The lock is held here, which is what makes both reads consistent with the predicate that
-        // just failed. is_busy() takes each execution's action_mutex_ under this one, which is the
-        // same order give_to_worker() uses - no new lock order is introduced by reporting.
+        // Under the lock, so the counts agree with the predicate that just failed.
         std::println(
             stderr, "executor: still waiting to finish after {}s - {} queued, {} in a task{}",
             waited.count() / 1000, pending_.size(), count_workers(&worker_execution::is_busy),
@@ -142,17 +105,10 @@ class executor {
       }
     }
 
-    // The workers are stopped through the same call a caller would make, after the wait above has
-    // left nothing for them to do.
     stop();
 
-    // The poll stands in for a join. Until it reports idle, a worker can still be inside
-    // take_next_task(), reading every execution through nothing_running() and is_busy() - which is
-    // what makes destroying them here a use-after-free rather than a teardown.
-    //
-    // A different question from the finish above, and reported as one: that wait is about workers
-    // still inside a task, this is about workers whose thread has not left. A worker can be idle
-    // and still be here.
+    // Waits for every worker to leave its thread, which is what makes destroying them safe. A
+    // different question from the wait above: a worker can be idle and still be in its thread.
     auto interval = std::chrono::milliseconds(report_first_ms);
     auto waited = std::chrono::milliseconds(0);
 
@@ -170,15 +126,15 @@ class executor {
       }
     }
 
-    // time of use: no worker thread is left to reach workers_, so clearing it races nothing.
+    // time of use: no worker thread is left to reach workers_.
     workers_.clear();
   }
 
   /**
    * @brief Queues a task, or hands it to a worker that has nothing to do.
    *
-   * @return true - the task was accepted. false - it was refused, because the pool has stopped
-   * accepting or because the worker it was offered to has stopped. Either way it will not run.
+   * @return true - the task was accepted. false - it was refused, by a pool that has stopped
+   * accepting or by a worker that has stopped. Either way it will not run.
    */
   bool add_task(taskT task) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -187,15 +143,12 @@ class executor {
       return false;
     }
 
-    // The queue comes first whenever it has anything in it: a task that arrives while others are
-    // waiting does not get to overtake them just because a worker happens to be free.
+    // The queue comes first: a task does not overtake one already waiting in it.
     if (pending_.empty()) {
       for (std::size_t index = 0; index < workers_.size(); ++index) {
         if (!workers_[index]->is_busy()) {
-          // A refusal is not a reason to offer it to the next worker, and it cannot be queued
-          // instead: add_action() has already destroyed the task. It means this worker is stopped,
-          // and a stopped worker is one stop() stopped - so the rest are stopped too, and false is
-          // the answer for all of them.
+          // A refused task is already destroyed, and stop() stops every worker together, so there
+          // is nothing to queue and no other worker to try.
           return give_to_worker(index, std::move(task));
         }
       }
@@ -216,21 +169,13 @@ class executor {
   /**
    * @brief Stops every worker. What they are already running, they finish.
    *
-   * A worker stops taking work from the moment this returns, so anything still in the queue stays
-   * there unrun, and a task added afterwards is refused by the worker it is handed to. The
-   * destructor calls this itself, after waiting for the queue to empty - which is the difference
-   * between stopping a pool and finishing one.
-   *
-   * @remark Calling it twice is harmless: the second stop() finds a worker that has already
-   * stopped and does nothing.
+   * Queued tasks stay unrun and a task added afterwards is refused. Calling it twice is harmless.
    *
    * @attention It does not wait for the workers to leave their threads. Only the destructor does
-   * that, and it is what makes destroying the pool safe rather than this.
+   * that, and that wait is what makes destroying the pool safe.
    */
   void stop() {
-    // Outside any lock: stop() wakes each worker, and a worker waking up runs on_finished, which
-    // wants mutex_. workers_ is not written after the constructor, so reading it here races
-    // nothing - only the destructor clears it, and only after the poll says no worker is left.
+    // Outside any lock: a worker waking from stop() runs on_finished, which takes mutex_.
     for (auto& one : workers_) {
       one->stop();
     }
@@ -239,30 +184,22 @@ class executor {
   /**
    * @brief Called with whatever a task threw. Assigned by the caller.
    *
-   * The pool runs the caller's code and nothing comes back from it: add_task() has answered true
-   * long before the task runs, and a task that failed is otherwise indistinguishable from one that
-   * succeeded. This is the one way out. Without it the only record is a warning on stderr naming a
-   * worker the caller neither chose nor can look up.
+   * Nothing else reports a failed task: add_task() has answered long before the task runs. Left
+   * unset, the pool warns on stderr instead.
    *
-   * @remark It receives a std::exception_ptr because a task may throw something that is not a
-   * std::exception, and that case is the one most worth hearing about. Rethrow it to read it.
+   * @remark It receives a std::exception_ptr, because a task may throw what is not a
+   * std::exception. Rethrow it to read it.
    *
-   * @attention It runs on a worker's thread, and more than one worker may be in it at once -
-   * whatever it touches has to be safe for that. Assign it before the first add_task(): a worker
-   * reads it, so assigning it while tasks are running is a data race.
-   *
-   * @attention Nothing may escape it. It is called from inside the worker's own catch, and an
-   * exception leaving a detached thread function calls std::terminate - async catches around it to
-   * keep that from being fatal, but the exception is then lost.
+   * @attention It runs on a worker's thread, and several workers may be in it at once. Assign it
+   * before the first add_task(), and let nothing escape it.
    */
   std::function<void(std::exception_ptr)> on_task_error;
 
  private:
   /**
-   * @brief Hands what a task threw to \ref on_task_error, or keeps the floor if nobody is
-   * listening.
+   * @brief Hands what a task threw to \ref on_task_error, or warns on stderr when none is set.
    *
-   * @param worker - The name of the worker that ran the task, for the warning.
+   * @param worker - The name of the worker that ran the task.
    * @param thrown - What the task threw.
    */
   void report_task_error(const std::string& worker, std::exception_ptr thrown) {
@@ -271,9 +208,6 @@ class executor {
       return;
     }
 
-    // Nobody is listening, so this stands in for the warning async would have printed had the pool
-    // not taken its on_error. Losing it silently would make a pool worse than the execution it
-    // wraps.
     try {
       std::rethrow_exception(thrown);
     } catch (const std::exception& e) {
@@ -288,24 +222,12 @@ class executor {
   /**
    * @brief Hands one task to a worker. Call with the mutex held.
    *
-   * The worker is busy from the moment add_action() returns - it says so itself - so nothing has to
-   * be booked here.
-   *
-   * @return true - the worker took it. false - the worker is stopped and destroyed it, so nobody
-   * holds the task any more and it will not run.
-   *
-   * @attention \p task is gone either way. add_action() takes it by value and moves it into the
-   * binding before it looks at whether it is stopped, so a caller cannot put a refused task back:
-   * there is nothing left to put anywhere.
+   * @return true - the worker took it, and is busy from here. false - the worker is stopped and has
+   * destroyed the task, so \p task is gone either way and cannot be put back.
    */
   [[nodiscard]] bool give_to_worker(std::size_t index, taskT task) {
-    // add_action() takes the execution's own action_mutex while this holds mutex_. That is only
-    // safe in one direction, and it holds: a worker calls on_finished with action_mutex released,
-    // so it never takes mutex_ while holding action_mutex, and the two never form a cycle.
-    //
-    // The answer is checked rather than dropped. Until stop() was a caller's to call this could not
-    // be false - a worker refuses only once stopped, and only the destructor stopped one, after the
-    // queue was empty - so an unchecked answer cost nothing. It costs a lost task now.
+    // add_action() takes the worker's action_mutex under mutex_. The two never cycle, because a
+    // worker calls on_finished with its action_mutex released.
     return workers_[index]->add_action(std::move(task));
   }
 
@@ -320,8 +242,7 @@ class executor {
       pending_.pop_front();
 
       if (!give_to_worker(index, std::move(next))) {
-        // Not put back, because there is nothing left to put back. Reported instead: add_task()
-        // told this task's submitter it had been taken, and that has just stopped being true.
+        // The task is already destroyed, so it is reported rather than put back.
         std::println(stderr, "executor: {} refused a queued task, which is lost",
                      workers_[index]->name);
       }
@@ -337,8 +258,7 @@ class executor {
   /**
    * @brief Is every worker idle? Call with the mutex held.
    *
-   * Asked of the workers rather than counted here. A tally of what the pool dispatched would be the
-   * pool's belief about the workers; this is the workers' own answer, and it cannot drift.
+   * Asked of the workers rather than tallied here, so it cannot drift from what they are doing.
    */
   bool nothing_running() const {
     for (const auto& one : workers_) {
@@ -351,7 +271,7 @@ class executor {
   }
 
   /**
-   * @brief Counts the workers a predicate holds for. Call the is_busy() form with the mutex held.
+   * @brief How many workers \p state holds for. Call the is_busy() form with the mutex held.
    *
    * @param state - \ref worker_execution::is_busy or \ref worker_execution::is_running.
    */
@@ -368,11 +288,7 @@ class executor {
   }
 
   /**
-   * @brief Names those same workers, for a report that has to say which one.
-   *
-   * The execution's own name rather than the index, so one worker reads the same here and in
-   * async's own warnings. The task cannot be named: taskT is a callable and carries nothing to
-   * report.
+   * @brief The names of those same workers, for a report that has to say which one.
    *
    * @return The matching names behind a ": " separator, empty when none match, so it appends to a
    * message cleanly either way.
@@ -390,12 +306,10 @@ class executor {
     return names;
   }
 
-  //! How often the destructor asks the poll whether the workers have left. Matches the interval
-  //! async's own smoke test waits at.
+  //! How often the destructor asks the poll whether the workers have left.
   static constexpr int poll_interval_ms = 50;
 
-  //! How long a shutdown may be silent before it reports, and the ceiling the interval doubles to.
-  //! A stuck teardown says something almost at once; a long one does not turn into a log flood.
+  //! How long a wait may be silent before it reports, and the ceiling its interval doubles to.
   static constexpr int report_first_ms = 1000;
   static constexpr int report_max_ms = 30000;
 
@@ -403,18 +317,13 @@ class executor {
   std::condition_variable finished_cv_;
 
   /**
-   * @brief Stands in for joining this pool's workers, which are detached and cannot be joined.
+   * @brief Stands in for joining the workers, which are detached and cannot be joined.
    *
-   * Holds this pool's workers and nothing else. A poll answers for the executions added to it, so
-   * one shared with a second pool would make this destructor wait for that pool's workers too -
-   * and a continuous worker runs for the life of its execution, so that wait would not end.
-   *
-   * Declared before the workers so it outlives them, though it does not depend on that: an
-   * execution withdraws from every poll holding it, and a poll releases every execution it holds.
+   * Holds this pool's workers and nothing else, so the destructor waits for those and no others.
    */
   async::execution_poll poll_;
 
-  std::deque<taskT> pending_;  //!< Tasks waiting for a worker, in the order submitted.
+  std::deque<taskT> pending_;  //!< Tasks waiting for a worker, in the order added.
   std::vector<std::shared_ptr<worker_execution>> workers_;
   bool accepting_ = true;
 };
