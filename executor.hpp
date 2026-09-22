@@ -142,11 +142,9 @@ class executor {
       }
     }
 
-    // Outside the lock: stop() wakes each worker, and a worker waking up runs on_finished, which
-    // wants this mutex.
-    for (auto& one : workers_) {
-      one->stop();
-    }
+    // The workers are stopped through the same call a caller would make, after the wait above has
+    // left nothing for them to do.
+    stop();
 
     // The poll stands in for a join. Until it reports idle, a worker can still be inside
     // take_next_task(), reading every execution through nothing_running() and is_busy() - which is
@@ -209,6 +207,29 @@ class executor {
   std::size_t pending() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return pending_.size();
+  }
+
+  /**
+   * @brief Stops every worker. What they are already running, they finish.
+   *
+   * A worker stops taking work from the moment this returns, so anything still in the queue stays
+   * there unrun, and a task added afterwards is refused by the worker it is handed to. The
+   * destructor calls this itself, after waiting for the queue to empty - which is the difference
+   * between stopping a pool and finishing one.
+   *
+   * @remark Calling it twice is harmless: the second stop() finds a worker that has already
+   * stopped and does nothing.
+   *
+   * @attention It does not wait for the workers to leave their threads. Only the destructor does
+   * that, and it is what makes destroying the pool safe rather than this.
+   */
+  void stop() {
+    // Outside any lock: stop() wakes each worker, and a worker waking up runs on_finished, which
+    // wants mutex_. workers_ is not written after the constructor, so reading it here races
+    // nothing - only the destructor clears it, and only after the poll says no worker is left.
+    for (auto& one : workers_) {
+      one->stop();
+    }
   }
 
   /**
