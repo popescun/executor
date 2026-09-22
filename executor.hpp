@@ -33,15 +33,11 @@ namespace untangle {
 /**
  * @brief Runs tasks on a fixed pool of untangle::async::execution workers.
  *
- * @tparam taskT The type of the task the pool runs. One pool runs one signature, and a non-void
- * return is run and dropped.
+ * @tparam taskT The type of the task the pool runs. One pool runs one signature - its arguments as
+ * much as its result - and a non-void return is run and dropped.
  */
 template <typename taskT>
 class executor {
-  // A task is queued as it stands, with nothing bound to it, so it must take no arguments.
-  static_assert(std::is_invocable_v<taskT>,
-                "executor: the task type must be callable with no arguments");
-
  public:
   /**
    * @brief Builds \p worker_count workers. They do not run until \ref start().
@@ -147,20 +143,40 @@ class executor {
   }
 
   /**
-   * @brief Queues a task, or hands it to a worker that has nothing to do.
+   * @brief Queues a task bound to \p args, or hands it to a worker that has nothing to do.
+   *
+   * The arguments are bound here, while the caller still holds them, and what waits for a worker is
+   * one callable carrying its own. That is the shape async::execution::add_action() offers at its
+   * door, and it is bound here for the same reason it is bound there: a queue holds callables, and
+   * a call site cannot be queued.
    *
    * @remark The first free worker takes it, counting from the start, so a pool that is not busy
    * keeps giving work to the same one. That is the intent: the worker that just ran a task is the
    * warm one, and a free worker is free whichever it is.
    *
+   * @tparam Args - The argument types to bind to \p task.
+   * @param task - The task to run.
+   * @param args - What to bind to it. Copied here and handed to the task as the pool's own lvalues
+   * when it runs, so a task taking a reference is given that copy rather than the caller's object,
+   * which may be gone by then.
+   *
    * @return true - the task was accepted. false - it was refused, by a pool that has not been
    * started, has been stopped, or is being destroyed, or by a worker that has stopped. Either way
    * it will not run. A task calling this from a worker thread is answered like any other caller.
    */
-  bool add_task(taskT task) {
+  template <typename... Args>
+  bool add_task(taskT task, Args&&... args) {
+    // The call the pool will make, which is not quite the one written at the call site: what
+    // reaches the task is the copies bound below, so that is the call that has to compile.
+    static_assert(std::is_invocable_v<taskT, std::decay_t<Args>&...>,
+                  "executor: the task cannot be called with the arguments given to add_task()");
+
     if (!running_) {
       return false;
     }
+
+    // Bound before the lock: it copies the caller's arguments, and nothing here needs the queue.
+    task_call call = bind_task(std::move(task), std::forward<Args>(args)...);
 
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -172,12 +188,12 @@ class executor {
         if (!workers_[index]->is_busy()) {
           // A refused task is already destroyed, and stop() stops every worker together, so there
           // is nothing to queue and no other worker to try.
-          return give_to_worker(index, std::move(task));
+          return give_to_worker(index, std::move(call));
         }
       }
     }
 
-    pending_.push_back(std::move(task));
+    pending_.push_back(std::move(call));
     return true;
   }
 
@@ -262,7 +278,41 @@ class executor {
     }
   }
 
-  using worker_execution = untangle::async::execution<taskT>;
+  /**
+   * @brief A task with its arguments already bound: what the pool queues, and what a worker runs.
+   *
+   * @remark It names its own result_type rather than leaving async to read one off a std::function,
+   * whose result_type C++20 removed. A pool built on a caller's own functor therefore still never
+   * touches that typedef, which is what keeps \ref taskT free to be something other than a
+   * std::function.
+   */
+  struct task_call {
+    using result_type = typename taskT::result_type;
+
+    result_type operator()() { return call(); }
+
+    std::function<result_type(void)> call;
+  };
+
+  /**
+   * @brief Binds \p args into \p task, making the one callable the queue and the workers both take.
+   *
+   * @remark With no arguments to bind, the task is that callable already, and wrapping it would add
+   * a layer to every pool that never had an argument to give.
+   */
+  template <typename... Args>
+  static task_call bind_task(taskT task, Args&&... args) {
+    if constexpr (sizeof...(Args) == 0) {
+      return task_call{std::move(task)};
+    } else {
+      // Captured by value and called as lvalues, which is all a call deferred to a worker can
+      // promise: whatever was passed to add_task() may be gone by the time this runs.
+      return task_call{[task = std::move(task), ... args = std::forward<Args>(args)]() mutable ->
+                       typename task_call::result_type { return task(args...); }};
+    }
+  }
+
+  using worker_execution = untangle::async::execution<task_call>;
 
   /**
    * @brief Hands one task to a worker. Call with the mutex held.
@@ -270,7 +320,7 @@ class executor {
    * @return true - the worker took it, and is busy from here. false - the worker is stopped and has
    * destroyed the task, so \p task is gone either way and cannot be put back.
    */
-  [[nodiscard]] bool give_to_worker(std::size_t index, taskT task) {
+  [[nodiscard]] bool give_to_worker(std::size_t index, task_call task) {
     // add_action() takes the worker's action_mutex under mutex_. The two never cycle, because a
     // worker calls on_finished with its action_mutex released.
     return workers_[index]->add_action(std::move(task));
@@ -283,7 +333,7 @@ class executor {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!pending_.empty()) {
-      taskT next = std::move(pending_.front());
+      task_call next = std::move(pending_.front());
       pending_.pop_front();
 
       if (!give_to_worker(index, std::move(next))) {
@@ -368,7 +418,8 @@ class executor {
    */
   async::execution_poll poll_;
 
-  std::deque<taskT> pending_;  //!< Tasks waiting for a worker, in the order added.
+  //! Tasks waiting for a worker, each bound to its arguments, in the order added.
+  std::deque<task_call> pending_;
   std::vector<std::shared_ptr<worker_execution>> workers_;
   //! False until start(), and false again from stop() or the destructor. Read without the mutex.
   std::atomic_bool running_ = {false};

@@ -5,16 +5,19 @@ from `async/prototypes/executor.hpp` as it stood, and this is the audit of what 
 it can be called production ready. 19 items, in seven groups — item 19 was added after the audit
 closed and is a decision rather than a finding; see group 7. Items 20 to 23 were added the same way
 and are steps 23 to 26 — a rename, an open question about reaching the workers, `stop()`, and the
-`start()` that should answer it. **Four were called blockers**: each was
+`start()` that should answer it. **Item 24 is step 27, and it is unlike all of them**: not a finding
+from the audit and not a decision either, but the first entry here that overturns a step already
+closed — step 22 ruled out task arguments on a reading of `async.hpp` that a probe has since
+disproven. **Four were called blockers**: each was
 read as a way the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed;
 step 3 was probed and does not reproduce, so it is closed as not a defect rather than fixed. What is
 left is group 2 onwards — what the caller is told, placement, and the surface.
-**Tests:** 30 of 30 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
+**Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
 `async::execution_poll` until every worker has left its thread and clears them only then, and it
 reports on stderr while either of its waits is stalled rather than parking in silence. The race TSan
-named on CI no longer reproduces: 30 of 30 under TSan and under ASan on macOS/libc++, where the case
+named on CI no longer reproduces: 32 of 32 under TSan and under ASan on macOS/libc++, where the case
 that provokes it aborted before the fix. **That is one platform, not both** — the Linux/libstdc++
 run this plan insists on has not been made since either fix, which is why step 19 stays open.
 **Sites** are line numbers in `executor.hpp` as of `032da65`, and they move with every fix that
@@ -36,8 +39,9 @@ which is upstream's to fix.
 The pool keeps the prototype's surface, under one new name: `add_task()` — `submit()` until step
 23 — and `pending()`. No futures, no priorities, no results. Items 9, 16 and 18 are recorded against that decision rather than argued with; if the
 decision changes, they are where to start. **The task type is no longer part of it:** the pool runs
-any task type, as of `9daec8b`. That was item 19, group 7, and what it pulls along with it — what a
-non-void return gives back — is still items 5 and 18's to settle.
+any task type, as of `9daec8b`, and any task type means its arguments too, as of step 27. That was
+item 19, group 7, and what it pulls along with it — what a non-void return gives back — is still
+items 5 and 18's to settle.
 
 ## Progress
 
@@ -73,6 +77,13 @@ The plan's own updates are their own commit too, and always a later one: a commi
 own hash, so the table below is filled by the `chore: update fix plan` that follows the fix. That is
 also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` under an amend and left
 three dangling references behind it.
+
+**Step 27 is done, and it is the first step that reopened a closed one.** Group 7 had ruled task
+arguments out as unavailable, on a reading of `async.hpp` rather than on a probe; the reading was
+wrong, and the two cases in the suite now run a pool on `std::function<int(int)>` from the free-worker
+path and from the queue. What that says about method is the point of recording it: step 22's ruling
+was the one conclusion in this plan reached by reading an interface instead of compiling against it,
+and it is the one that had to be taken back. A probe costs less than the retraction does.
 
 **NEXT: step 9, and it is the last of group 3.** Group 2 is done — 5 through async's step 38
 rather than here, 6 once step 25 made its state reachable, 7 decided rather than fixed — and step 8
@@ -151,6 +162,7 @@ returns something give back — so read those two before deciding what it means 
 | 26 ✅ | 23 | construction starts the workers, and nothing else can | `:187`, `:205`, `:89-99` | CONFIRMED (tests) — `start()` added |
 | **Group 7 — the task type** |
 | 22 ✅ | 19 | `task_t` is fixed at `std::function<void(void)>` | `:45`, `:51`, `:202` | CONFIRMED (probe, tests) — fixed `9daec8b` |
+| 27 ✅ | 24 | a task type that takes arguments is refused, and step 22 ruled that unfixable | `:42`, `:265`, `:371` | CONFIRMED (tests, probe) — fixed, hash pending |
 | **Group 6 — the suite** |
 | 19 | — | the sanitizers have never been run against the suite | `.github/workflows/ci.yml` | — |
 | 20 ✅ | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp:457` | — |
@@ -1010,7 +1022,9 @@ the one who knows which. `untangle::executor pool(4)` no longer compiles; it is
 signature appears once. `task_t` is gone rather than renamed: it only ever named the template
 parameter the class did not have.
 
-**Arguments are refused, and the header decided that rather than this step.** The open question was
+**Arguments are refused, and the header decided that rather than this step.** ⚠️ **Overturned by
+step 27** — read the paragraph below as the record of a wrong conclusion, not as the surface. The
+open question was
 whether to forward `Args&&...` the way `add_action()` does. It is not available:
 `add_action(actionT, Args&&...)` is the only public way into an execution, `add_queued_action()`
 being private (`async.hpp:668`), so what the pool can hand a worker is a `taskT` and nothing else. A
@@ -1022,6 +1036,16 @@ it costs is one `static_assert` (`:51`), which turns the failure into a sentence
 error: static assertion failed due to requirement 'std::is_invocable_v<std::function<void (int)>>':
 executor: the task type must be callable with no arguments
 ```
+
+> **What step 27 found in that paragraph.** Every sentence about `async.hpp` in it is true:
+> `add_action()` is the only public door, and `add_queued_action()` is private. The conclusion does
+> not follow from them. `add_action(actionT, Args&&...)` binds its arguments on the spot and queues
+> the *bound, nullary* form (`async.hpp:496`, into `queued_action_t` at `:660`) — so arguments do
+> not survive into async's queue either, and "nowhere to keep them" describes async as much as the
+> pool. What the pool could not do, it could not do because of its own `:202` (`:265` by the time
+> step 27 reached it) — one line choosing
+> `execution<taskT>`, which is what made `add_action()` reachable only with an empty pack. The step
+> read an interface where it should have compiled against one.
 
 **`add_task()` stayed narrow**, taking `taskT`. The templated `add_task()` that would widen the door for
 a custom `taskT` is still the separate, smaller change this step described, and is not in `9daec8b`.
@@ -1045,3 +1069,72 @@ specialisation at the top, the way async's suite aliases `void_execution`.
 
 > Step 16 did not dissolve into this, as predicted: the move-only gap lives in `queued_action_t`
 > upstream, and a template parameter on the pool does not reach it.
+
+### Step 27 ✅ · item 24 — a task type that takes arguments is refused — DONE
+`executor.hpp:42` (the assert), `:265` (`worker_execution`), `:371` (`pending_`) · CONFIRMED by two
+cases and a compile probe · raised 2026-09-22, after step 22 had been closed for a day
+
+`executor<std::function<int(int)>>` did not compile. `static_assert(std::is_invocable_v<taskT>)` at
+`:42` refused any task type with an argument list, and step 22 had recorded that refusal as
+permanent — see the ⚠️ above, which is where this step came from.
+
+**What the probe showed.** Deleting the assert and compiling moves the error one level down, to
+`async.hpp:496`: `no viable conversion from '__bind<std::function<int (int)>>' to 'queued_action_t'`.
+That is `add_action()` doing `std::bind(action)` with an empty pack — a bind expression that calls
+its target with no arguments, against a target needing one. The requirement was never async's
+contract. It was manufactured by `:265`, `using worker_execution = async::execution<taskT>`, which
+made the caller's task type and the worker's action type the same type and so left `add_action()`'s
+own `Args&&...` unreachable. A second probe confirmed the way out from the other side: an
+`execution<std::function<int(void)>>` accepts `std::bind(task, 21)` through the public door, with a
+`std::function<int(int)>` as the task. `add_queued_action()` being private costs nothing once the
+worker's action type is already nullary.
+
+**The fix separates the two types that `:265` had made one.** `taskT` stays the caller's signature,
+arguments and result both. What the pool queues and hands a worker is new — `task_call`, a task with
+its arguments already bound — and `worker_execution` is `execution<task_call>`. `pending_` holds
+`task_call`, `add_task()` is `template <typename... Args> bool add_task(taskT, Args&&...)`, and the
+binding happens at the door where the caller still holds the arguments. This is async's own shape,
+one level up: `actionT` public, `queued_action_t` internal. The "second type in the class" step 22
+warned against is exactly that, and it was never the smell the step took it for.
+
+**Four decisions inside the fix, each of which could have gone the other way:**
+
+- **`task_call` is a struct, not `using task_call = std::function<result_type(void)>`.** The alias is
+  shorter, but then async reads `result_type` off a `std::function` — the typedef C++20 removed and
+  both implementations still supply by grace. Step 22 went out of its way to keep the functor pool
+  clear of it, and the alias would have quietly surrendered that for *every* pool, functor ones
+  included. The struct names its own `result_type` from `taskT::result_type`, so nothing changes.
+- **Binding is a capture pack, not `std::bind`.** async uses both — `add_action()` binds (`:496`),
+  `bind_action_and_method()` captures a pack (`:336`) — and the pack avoids `std::bind`'s
+  placeholder and nested-bind quirks. The lambda is `mutable`, which is what preserves calling the
+  task as a non-const lvalue; a non-mutable capture would have broken a functor whose `operator()`
+  is not `const`.
+- **`bind_task()` short-circuits on an empty pack.** Without it every existing zero-argument pool
+  would pay for a lambda layer it has no arguments to put in.
+- **The assert is per call, and asks about the call that happens.**
+  `is_invocable_v<taskT, std::decay_t<Args>&...>`, not `Args...`: the task runs later, from the
+  pool's copies, as lvalues. Checking `Args...` would admit `add_task(f, std::move(x))` against a
+  task taking `int&&` and then fail inside the binder with a worse message than the assert gives.
+
+**What it costs.** A queued task now crosses two `std::function` layers rather than one: `task_call`
+holds the bound callable, and `add_action()` wraps it again on the way in. The second wrap is the
+one async always did; the first is new, and unavoidable while `add_queued_action()` is private.
+Zero-argument pools do not pay it, by the short-circuit above. Not measured — if it ever matters the
+lever is upstream, not here.
+
+**Tested, not just asserted.** `executor_tests.a_pool_runs_a_task_type_that_takes_arguments_and_returns_a_value`
+runs 50 tasks on a pool of 4 with every worker free, so each goes straight to one;
+`executor_tests.an_argument_survives_the_queue` holds the single worker at the gate so all 50 wait in
+`pending_` with their arguments and run from there, in order. The second is the one aimed at step
+22's sentence about having "nowhere to keep them". Both were written first and reviewed red — the
+red being a build failure rather than a failing assertion, since the defect was a refusal to compile.
+
+**Verified:** 27 of 27 in `executor_tests` and 5 of 5 in `executor_smoke_test`, on `debug`, `asan`
+and `tsan`; clang-format clean; `doc/refman.pdf` rebuilt with `tools/make_doc.sh`, 25 pages. Every
+pre-existing case is unchanged and none needed touching: an `add_task()` call with no arguments
+deduces an empty pack and takes the short-circuit.
+
+> **The method note this step is really about.** Step 22's ruling is the only conclusion in this plan
+> that was reached by reading an interface rather than compiling against one, and it is the only one
+> that has had to be taken back. Everything else closed here carries a probe, a test, or a sanitizer
+> run. `9daec8b` was not wrong about what it did; it was wrong about what it said could not be done.

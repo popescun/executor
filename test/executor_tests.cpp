@@ -697,6 +697,103 @@ TEST(executor_tests, a_pool_runs_a_task_type_that_is_not_a_std_function) {
   EXPECT_EQ(ran.load(), tasks);
 }
 
+// --- step 27, item 24 ----------------------------------------------------------------------------
+// The two cases below do not compile: executor.hpp:42 refuses a task type that takes arguments, so
+// the whole binary fails to build and the 25 cases above it cannot be run until the fix lands. They
+// are left live deliberately - the refusal is the finding, and a guarded case would hide it.
+
+/**
+ * @brief A pool runs a task type that takes arguments and returns a value.
+ *
+ * The signature async::execution already accepts at its own door - add_action() takes an action and
+ * the arguments to bind to it - asked of the pool, which today takes the task alone. Nothing about
+ * the return is new: a continuous worker collects nothing, so what the task returns is run and
+ * dropped, exactly as in a_pool_runs_tasks_that_return_a_value. It is here because a task type is
+ * one signature, and the pool has to carry both halves of it or neither.
+ *
+ * @remark Every worker is free as this adds, so each task goes straight to one rather than through
+ * the queue. Which argument reaches which task is the claim; the order they arrive in is not, so
+ * the expectations are set per value rather than in sequence.
+ */
+TEST(executor_tests, a_pool_runs_a_task_type_that_takes_arguments_and_returns_a_value) {
+  using numbered_executor = untangle::executor<std::function<int(int)>>;
+
+  constexpr int task_count = 50;
+  mock_work work;
+
+  for (int i = 0; i < task_count; ++i) {
+    EXPECT_CALL(work, run_numbered(i));
+  }
+
+  {
+    numbered_executor pool(4);
+    pool.start();
+
+    for (int i = 0; i < task_count; ++i) {
+      // The return is dropped by the pool, so the mock call is what says the task body ran through.
+      EXPECT_TRUE(pool.add_task(
+          [&work](int n) {
+            work.run_numbered(n);
+            return n * 2;
+          },
+          i));
+    }
+  }
+}
+
+/**
+ * @brief An argument survives the wait for a worker, and arrives with the task it was given to.
+ *
+ * This is the half the group 7 ruling turned on - that a pool binding arguments would have "nowhere
+ * to keep them until a worker frees up". The single worker is held at the gate, so every task below
+ * it waits in pending_ with its argument and is run from there.
+ */
+TEST(executor_tests, an_argument_survives_the_queue) {
+  using numbered_executor = untangle::executor<std::function<int(int)>>;
+
+  constexpr int task_count = 50;
+  mock_work work;
+
+  {
+    // One worker runs the queue in order, so the arguments must arrive in the order they were
+    // added; a pair the other way round is an argument that went to the wrong task.
+    InSequence ordered;
+    for (int i = 0; i < task_count; ++i) {
+      EXPECT_CALL(work, run_numbered(i));
+    }
+  }
+
+  gate blocker;
+
+  {
+    numbered_executor pool(1);
+    pool.start();
+
+    // The only worker stops here, so nothing added after this can be handed to one.
+    EXPECT_TRUE(pool.add_task(
+        [&blocker](int n) {
+          blocker();
+          return n;
+        },
+        0));
+    ASSERT_TRUE(wait_for([&blocker] { return blocker.arrived() == 1; }, 2s))
+        << "the worker never reached the gate, so the tasks below were not queued";
+
+    for (int i = 0; i < task_count; ++i) {
+      EXPECT_TRUE(pool.add_task(
+          [&work](int n) {
+            work.run_numbered(n);
+            return n * 2;
+          },
+          i));
+    }
+
+    EXPECT_EQ(pool.pending(), task_count) << "the tasks did not wait in the queue";
+
+    blocker.open();
+  }
+}
+
 /**
  * @brief Destroying a pool while its workers are still turning over does not race them.
  *

@@ -67,9 +67,23 @@ struct my_task {
 untangle::executor<my_task> pool(4);
 ```
 
-A task type that takes arguments is refused, with a `static_assert` rather than an error inside
-`std::bind`: the pool queues tasks, and has nowhere to keep arguments for them until a worker frees
-up.
+A task type may take arguments, and `add_task()` binds them the way `execution::add_action()` does —
+at the door, where the caller still holds them:
+
+```c++
+untangle::executor<std::function<int(int)>> pool(4);
+pool.start();
+pool.add_task([](int n) { return n * 2; }, 21);
+```
+
+What waits for a worker is one callable carrying its own arguments, so nothing about a task changes
+between the queue and the worker that runs it. The arguments are **copied** at `add_task()` and
+handed to the task as the pool's own lvalues when it runs: a task is called later, possibly much
+later, and what the caller passed may be gone by then. A task taking `int&` therefore mutates the
+pool's copy, which the caller never sees.
+
+A task that cannot be called with the arguments given is refused by a `static_assert` in
+`add_task()`, rather than by an error from inside the binding.
 
 ## how work is placed
 
