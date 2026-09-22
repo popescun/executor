@@ -81,6 +81,11 @@ class executor {
    *
    * Both waits are unbounded, and both report on stderr while they last, naming the workers they
    * are waiting on.
+   *
+   * @attention A task still running here is refused if it adds more work, even though this is
+   * waiting for that very task. It is deliberate: a shutdown that took new work could be kept from
+   * ever ending by a task that re-adds itself. \ref add_task() answers false, so the task can see
+   * it.
    */
   ~executor() {
     // Whether the pool was still running when it was destroyed. A stopped one cannot empty its
@@ -145,7 +150,8 @@ class executor {
    * @brief Queues a task, or hands it to a worker that has nothing to do.
    *
    * @return true - the task was accepted. false - it was refused, by a pool that has not been
-   * started or has stopped accepting, or by a worker that has stopped. Either way it will not run.
+   * started, has been stopped, or is being destroyed, or by a worker that has stopped. Either way
+   * it will not run. A task calling this from a worker thread is answered like any other caller.
    */
   bool add_task(taskT task) {
     if (!running_) {
@@ -196,8 +202,9 @@ class executor {
   /**
    * @brief Stops every worker. What they are already running, they finish.
    *
-   * Queued tasks stay unrun and a task added afterwards is refused by the worker it is offered
-   * to. \ref start() gives the workers a new working life. Calling it twice is harmless.
+   * Queued tasks stay unrun and a task added afterwards is refused. That holds whoever is asking,
+   * a task already running on a worker included - a pool that is not running takes no work.
+   * \ref start() gives the workers a new working life. Calling it twice is harmless.
    *
    * @attention It does not wait for the workers to leave their threads. Only the destructor does
    * that, and that wait is what makes destroying the pool safe.

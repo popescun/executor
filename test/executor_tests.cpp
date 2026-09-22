@@ -465,6 +465,37 @@ TEST(executor_tests, add_task_is_refused_once_the_pool_is_shutting_down) {
 }
 
 /**
+ * @brief A task running when the pool stops cannot add more work either.
+ *
+ * One rule for both ways a pool stops taking work, and it does not care who is asking: a task on a
+ * worker thread is refused like any other caller. Letting in-flight work spawn more is what could
+ * keep a shutdown from ever ending.
+ */
+TEST(executor_tests, a_running_task_cannot_add_work_once_the_pool_stops) {
+  gate hold;
+  std::atomic_bool refused = {false};
+  std::atomic_bool spawned = {false};
+
+  {
+    executor pool(1);
+    pool.start();
+
+    pool.add_task([&pool, &hold, &refused, &spawned] {
+      hold();  // released once the pool has been stopped
+      refused = !pool.add_task([&spawned] { spawned = true; });
+    });
+
+    ASSERT_TRUE(wait_for([&hold] { return hold.arrived() == 1; }, 5s));
+
+    pool.stop();
+    hold.open();
+  }  // ~executor() waits for the task above, so refused is set by the time it returns
+
+  EXPECT_TRUE(refused.load()) << "a stopped pool took work from a task it was still running";
+  EXPECT_FALSE(spawned.load()) << "a refused task cannot have run";
+}
+
+/**
  * @brief pending() is the queue's depth, not the pool's occupancy.
  */
 TEST(executor_tests, pending_counts_only_what_is_waiting) {

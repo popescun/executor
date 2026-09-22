@@ -9,12 +9,12 @@ and are steps 23 to 26 — a rename, an open question about reaching the workers
 read as a way the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed;
 step 3 was probed and does not reproduce, so it is closed as not a defect rather than fixed. What is
 left is group 2 onwards — what the caller is told, placement, and the surface.
-**Tests:** 29 of 29 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
+**Tests:** 30 of 30 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
 `async::execution_poll` until every worker has left its thread and clears them only then, and it
 reports on stderr while either of its waits is stalled rather than parking in silence. The race TSan
-named on CI no longer reproduces: 29 of 29 under TSan and under ASan on macOS/libc++, where the case
+named on CI no longer reproduces: 30 of 30 under TSan and under ASan on macOS/libc++, where the case
 that provokes it aborted before the fix. **That is one platform, not both** — the Linux/libstdc++
 run this plan insists on has not been made since either fix, which is why step 19 stays open.
 **Sites** are line numbers in `executor.hpp` as of `032da65`, and they move with every fix that
@@ -74,11 +74,10 @@ own hash, so the table below is filled by the `chore: update fix plan` that foll
 also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` under an amend and left
 three dangling references behind it.
 
-**NEXT: step 7, the rest of group 2.** Steps 5 and 6 are done — 5 through async's step 38 rather
-than here, and 6 only after step 25 made its state reachable. Step 26 has since moved the ground
-step 7 stands on: `running_` is now cleared by `stop()` as well as by the destructor, so "work
-spawned by an in-flight task is refused once shutdown starts" is one case of a wider rule, and the
-decision it asks for should be made about both. Groups 1 and 7 are done, and step 22
+**NEXT: group 3 — steps 8 and 9, placement.** Group 2 is done: 5 through async's step 38 rather
+than here, 6 once step 25 made its state reachable, and 7 decided rather than fixed. Step 8 is the
+free-worker scan always starting at worker 0, confirmed by a probe; step 9 is the unbounded queue,
+recorded against the API decision. Groups 1 and 7 are done, and step 22
 sharpened what group 2 has to answer: a pool can now be built on `std::function<int(void)>`, and
 what it does with the `int` is nothing. That is steps 5 and 18's question arriving by a third door,
 which is what this plan predicted. The couplings below say to settle 5 and 6 together rather than in
@@ -130,7 +129,7 @@ returns something give back — so read those two before deciding what it means 
 | **Group 2 — what the caller is told** |
 | 5 ✅ | 5 | a task that throws is reported to stderr and to nobody else | `:90-92`, `:233`, `:243` | CONFIRMED (test) — fixed via async `on_error` |
 | 6 ✅ | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:163`, `:260`, `:278` | CONFIRMED (test) — fixed |
-| 7 | 7 | work spawned by an in-flight task is refused once shutdown starts | `:82`, `:101-121` | CONFIRMED (test) |
+| 7 ✅ | 7 | work spawned by an in-flight task is refused once shutdown starts | `:85`, `:156`, `:205` | decided, documented, tested |
 | **Group 3 — placement** |
 | 8 | 8 | the free-worker scan always starts at worker 0 | `:110-117` | CONFIRMED (20 tasks, 1 of 4; probe) |
 | 9 | 9 | the queue is unbounded and nothing pushes back | `:119` | read-only, API decision |
@@ -521,21 +520,39 @@ clang-format clean; `doc/refman.pdf` at 25 pages. README now says both refusal r
 > not hear about a refused action. Recorded here rather than fixed: it is async's warning, and
 > whether refusal belongs on the same seam as a throw is that repo's question.
 
-### Step 7 · item 7 — work spawned by an in-flight task is refused once shutdown starts — OPEN
-`executor.hpp:67`, `:101-121` · CONFIRMED by test, which had to be written around it
+### Step 7 ✅ · item 7 — work spawned by an in-flight task is refused once shutdown starts — DONE
+`executor.hpp:85` (the destructor), `:205` (`stop()`), `:156` (`add_task()`) · decided, documented
+and tested; no behaviour changed
 
-`~executor()` sets `accepting_ = false` before it waits for the drain. A task already running when
-that happens is still running — the destructor is waiting for it — but the work it submits is
-refused. The pool is waiting for a task and rejecting what that task asks for at the same time.
+**The refusal stands, and is now chosen rather than incidental.** A task still running while the
+pool shuts down is refused if it adds more work, even though the destructor is waiting for that very
+task. The alternative — letting in-flight work through, with the finish ending once the queue is
+empty and stays empty — was rejected: a task that re-adds itself would keep a shutdown from ever
+ending, and telling a worker-thread caller from an external one needs thread identity the pool does
+not track.
 
-The test `a_task_can_submit_more_work` has to wait for the inner submission before leaving the
-scope, and without that wait it fails with the inner task never running. That wait is the finding.
+**One rule, and step 26 is why it is one.** `running_` is a single flag, cleared by `stop()` and by
+the destructor alike, so "a pool that is not running takes no work" holds whoever is asking. The
+rejected answer would have had to reintroduce a special case for who is calling, right after step 26
+removed the last one.
 
-> Two answers, and the choice is a design decision rather than a bug fix. Either the refusal stands
-> and the destructor documents it - a shutdown that accepts new work may never end, which is a real
-> argument - or `accepting_` is about *external* callers and a task on a worker thread may still
-> submit, with the drain ending when the queue is empty and stays empty. Decide it here and write
-> whichever into the destructor's documentation; today the behaviour is neither stated nor chosen.
+**One argument for the refusal has got weaker, and is recorded as such.** This step said a shutdown
+that accepted new work "may never end", as though silently. Since step 4 it does not: a stalled
+finish reports itself on stderr every second and names the queue depth. The unbounded hazard remains;
+the silence does not.
+
+**What changed is documentation.** The destructor carries an `@attention` saying the refusal is
+deliberate and why, `stop()` says it holds for a running task too, `add_task()`'s `@return` lists all
+four ways it answers false, and the README says the same in a paragraph of its own. The code is
+untouched.
+
+**Cases.** `add_task_is_refused_once_the_pool_is_shutting_down` already covered the destructor.
+`a_running_task_cannot_add_work_once_the_pool_stops` is new and covers `stop()`, which step 26 made a
+second way to reach this: a gated task is released after the pool is stopped, and its `add_task()`
+answers false. It passed on its first run, which is the shape of this step — nothing was broken, it
+had simply never been stated.
+
+**Verified:** 30 of 30 on `debug`, `asan` and `tsan`; clang-format clean.
 
 ## Group 3 — placement
 

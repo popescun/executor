@@ -113,9 +113,14 @@ worker takes from it, so the destructor does not wait for it. Whatever is left i
 stderr and dropped.
 
 **`add_task()` says whether the task was taken.** It returns false before `start()`, after `stop()`,
-and once the destructor has begun — which a task adding more work from inside the pool can see. It
-returns false again if the worker it was offered to has stopped. A refused task is destroyed rather
-than queued, so a false answer means it will not run.
+and once the destructor has begun. It returns false again if the worker it was offered to has
+stopped. A refused task is destroyed rather than queued, so a false answer means it will not run.
+
+**A task that is still running is refused too**, and that is chosen rather than incidental. A pool
+shutting down is waiting for exactly that task, so it is tempting to let the work it spawns through
+— but then a task that re-adds itself could keep the shutdown from ever ending. One rule instead: a
+pool that is not running takes no work, whoever is asking. `add_task()` answers false inside the
+task, so it can tell.
 
 **A task that throws does not take the worker with it**, and what it threw is not lost. The worker
 catches it and carries on with the next task; `on_task_error` is where the throw goes:
