@@ -9,12 +9,12 @@ and are steps 23 to 26 — a rename, an open question about reaching the workers
 read as a way the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed;
 step 3 was probed and does not reproduce, so it is closed as not a defect rather than fixed. What is
 left is group 2 onwards — what the caller is told, placement, and the surface.
-**Tests:** 25 of 25 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
+**Tests:** 29 of 29 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
 `async::execution_poll` until every worker has left its thread and clears them only then, and it
 reports on stderr while either of its waits is stalled rather than parking in silence. The race TSan
-named on CI no longer reproduces: 25 of 25 under TSan and under ASan on macOS/libc++, where the case
+named on CI no longer reproduces: 29 of 29 under TSan and under ASan on macOS/libc++, where the case
 that provokes it aborted before the fix. **That is one platform, not both** — the Linux/libstdc++
 run this plan insists on has not been made since either fix, which is why step 19 stays open.
 **Sites** are line numbers in `executor.hpp` as of `032da65`, and they move with every fix that
@@ -75,7 +75,10 @@ also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` 
 three dangling references behind it.
 
 **NEXT: step 7, the rest of group 2.** Steps 5 and 6 are done — 5 through async's step 38 rather
-than here, and 6 only after step 25 made its state reachable. Groups 1 and 7 are done, and step 22
+than here, and 6 only after step 25 made its state reachable. Step 26 has since moved the ground
+step 7 stands on: `running_` is now cleared by `stop()` as well as by the destructor, so "work
+spawned by an in-flight task is refused once shutdown starts" is one case of a wider rule, and the
+decision it asks for should be made about both. Groups 1 and 7 are done, and step 22
 sharpened what group 2 has to answer: a pool can now be built on `std::function<int(void)>`, and
 what it does with the `int` is nothing. That is steps 5 and 18's question arriving by a third door,
 which is what this plan predicted. The couplings below say to settle 5 and 6 together rather than in
@@ -126,7 +129,7 @@ returns something give back — so read those two before deciding what it means 
 | 4 ✅ | 4 | the destructor waits forever on a task that never returns | `:112-129`, `:144-160` | CONFIRMED (test) — fixed `032da65` |
 | **Group 2 — what the caller is told** |
 | 5 ✅ | 5 | a task that throws is reported to stderr and to nobody else | `:90-92`, `:233`, `:243` | CONFIRMED (test) — fixed via async `on_error` |
-| 6 ✅ | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:199`, `:301`, `:325` | CONFIRMED (test) — fixed |
+| 6 ✅ | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:163`, `:260`, `:278` | CONFIRMED (test) — fixed |
 | 7 | 7 | work spawned by an in-flight task is refused once shutdown starts | `:82`, `:101-121` | CONFIRMED (test) |
 | **Group 3 — placement** |
 | 8 | 8 | the free-worker scan always starts at worker 0 | `:110-117` | CONFIRMED (20 tasks, 1 of 4; probe) |
@@ -145,7 +148,7 @@ returns something give back — so read those two before deciding what it means 
 | 23 ✅ | 20 | `submit()` does not match `execution::add_action()` | `:171` | naming decision — renamed `add_task()` |
 | 24 | 21 | the workers are unreachable, and so is every seam on them | `:375` | read-only, surface decision |
 | 25 ✅ | 22 | a pool cannot be stopped without destroying it | `:226` | surface addition — `stop()` |
-| 26 | 23 | construction starts the workers, and nothing else can | `:68-105` | read-only, surface decision |
+| 26 ✅ | 23 | construction starts the workers, and nothing else can | `:187`, `:205`, `:89-99` | CONFIRMED (tests) — `start()` added |
 | **Group 7 — the task type** |
 | 22 ✅ | 19 | `task_t` is fixed at `std::function<void(void)>` | `:45`, `:51`, `:202` | CONFIRMED (probe, tests) — fixed `9daec8b` |
 | **Group 6 — the suite** |
@@ -801,23 +804,70 @@ destroying it.
 > read as though it made the pool safe to destroy, which it does not. Whether a caller wants a
 > waiting form is step 18's question, not this one's.
 
-### Step 26 · item 23 — construction starts the workers, and nothing else can — OPEN
-`executor.hpp:68-105` (the constructor) · read-only · raised 2026-09-22, with step 25
+### Step 26 ✅ · item 23 — construction starts the workers, and nothing else can — DONE
+`executor.hpp:187` (`start()`), `:205` (`stop()`), `:89-99` (the destructor) · CONFIRMED by four
+cases
 
-The constructor builds the workers and starts them, so a pool is running from the moment it exists
-and there is no way to make one that is not. With `stop()` public (step 25) that asymmetry is now
-visible from outside: a pool can be stopped and cannot be started again.
+`start()` is public and the constructor no longer starts anything: it builds and wires the workers,
+`start()` runs them. `stop()` has an opposite, a stopped pool can be restarted, and a caller has a
+moment — before `start()` — in which to assign `on_task_error` with nothing running to race.
 
-> Add `start()`, and move the starting half of the constructor into it. The constructor would then
-> build and wire the workers, and `start()` would run them — so `stop()` has an opposite, a stopped
-> pool can be restarted, and a caller who wants to assign `on_task_error` before anything can run
-> has a moment to do it in. That last part is worth noting: today the doc comment asks callers to
-> assign the handler before the first `add_task()`, which is a convention nothing enforces;
-> `start()` would make it a state.
->
-> **What it costs is that a pool can now be used wrong.** `add_task()` before `start()`, or after
-> `stop()`, and the destructor's wait against a pool that was never started — each needs an answer
-> rather than falling out. Take it as its own step, with its own cases.
+**A pool refuses work until it is started.** The alternative was allowed by the layer below —
+`execution` documents that actions may be queued before `start()` — but it does not survive the
+destructor here: `is_busy()` is true for a worker holding a queued action, so tasks sitting on
+unstarted workers make `nothing_running()` false forever and the finish wait never returns. Refusing
+keeps that state unreachable, and it is step 1's rule again: a pool that cannot run a task must not
+take it.
+
+**Two things the cases caught that the instruction did not foresee.**
+
+*`stop()` has to stop the pool accepting, not just the workers.* The restart case found
+`add_task()` answering **true** after `stop()`: the worker was still finishing, so no free worker was
+found, and the task fell through to `pending_` — then was lost when a worker refused it. A pool that
+can run nothing must accept nothing, so `stop()` clears `running_` first and stops the workers
+after.
+
+*The destructor cannot wait for a queue that no longer drains.* With the above in place, `stop()`
+with work still queued **hung**: `pending_` only shrinks through `take_next_task()`, which only
+`on_finished` calls, which a stopped worker no longer raises. So the wait is conditional on whether
+the pool was still running, and what is left is reported rather than dropped in silence:
+
+```c++
+const bool was_running = running_.exchange(false);
+...
+return nothing_running() && (pending_.empty() || !was_running);
+```
+
+**The simpler predicate was tried and does not hold.** `nothing_running() && pending_.empty()` looks
+sufficient — `stop()` clears `running_` before stopping the workers, so nothing new arrives — but it
+hangs `a_queued_task_a_worker_refuses_is_reported`. Stopping prevents new tasks; it does nothing
+about the ones already queued, and `nothing_running()` becomes true while `pending_.empty()` never
+does. Measured, not reasoned: the case times out.
+
+Dropping the queue inside `stop()` would make that predicate work, and was not taken: a stopped pool
+that is started again drains what it was holding, because its workers raise `on_finished` once more.
+Keeping the queue is what makes a restart mean something.
+
+**`running_` is a `std::atomic_bool`, read without the mutex.** `start()` and `stop()` set it with no
+lock at all, and `add_task()` checks it before taking one, so a refusal costs nothing. The
+destructor reads-and-clears it in one `exchange()` rather than two steps that relied on the mutex to
+be indivisible. `mutex_` guards `pending_` and `workers_`, which is what it was for.
+
+> **A refusal can now race a `stop()`**, where the mutex used to make that impossible: `add_task()`
+> checks `running_` outside the lock, so a `stop()` landing before `give_to_worker()` leaves the task
+> with a worker that has just stopped. It is refused and `add_task()` answers false — step 6's guard
+> doing what it exists for, and the right answer either way.
+
+**Cases:** `an_unstarted_pool_refuses_work`, `an_unstarted_pool_shuts_down`,
+`a_started_pool_runs_what_it_is_given`, `a_stopped_pool_can_be_started_again`. Every other case in
+the suite gained a `start()`, as did the smoke test and the README example.
+
+**One repair.** Step 6's case passed after `stop()` stopped accepting, but vacuously: `add_task()`
+returned false without reaching the guard it was written for. It is now
+`a_queued_task_a_worker_refuses_is_reported`, which fills the queue behind a gated worker, stops the
+pool, and reads the stderr line as the queued task is refused — the path that is still reachable.
+
+**Verified:** 29 of 29 on `debug`, `asan` and `tsan`; clang-format clean.
 
 ## Group 6 — the suite
 

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <async.hpp>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -43,7 +44,7 @@ class executor {
 
  public:
   /**
-   * @brief Starts \p worker_count workers in continuous mode.
+   * @brief Builds \p worker_count workers. They do not run until \ref start().
    *
    * @param worker_count - How many workers to run. Must not be zero.
    *
@@ -72,7 +73,6 @@ class executor {
       poll_.add(*next);
 
       workers_.push_back(std::move(next));
-      workers_.back()->start();
     }
   }
 
@@ -83,16 +83,21 @@ class executor {
    * are waiting on.
    */
   ~executor() {
+    // Whether the pool was still running when it was destroyed. A stopped one cannot empty its
+    // queue - only a worker takes from it, through on_finished, and a stopped worker raises no more
+    // - so its queue is not waited for.
+    const bool was_running = running_.exchange(false);
+
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      accepting_ = false;
 
       // Waits for the queue to empty and every worker to go idle.
       auto interval = std::chrono::milliseconds(report_first_ms);
       auto waited = std::chrono::milliseconds(0);
 
-      while (!finished_cv_.wait_for(lock, interval,
-                                    [this] { return pending_.empty() && nothing_running(); })) {
+      while (!finished_cv_.wait_for(lock, interval, [this, was_running] {
+        return nothing_running() && (pending_.empty() || !was_running);
+      })) {
         waited += interval;
 
         // Under the lock, so the counts agree with the predicate that just failed.
@@ -102,6 +107,12 @@ class executor {
             name_workers(&worker_execution::is_busy));
 
         interval = std::min(interval * 2, std::chrono::milliseconds(report_max_ms));
+      }
+
+      if (!pending_.empty()) {
+        std::println(stderr,
+                     "executor: {} queued task(s) dropped, the pool was stopped before they ran",
+                     pending_.size());
       }
     }
 
@@ -133,15 +144,15 @@ class executor {
   /**
    * @brief Queues a task, or hands it to a worker that has nothing to do.
    *
-   * @return true - the task was accepted. false - it was refused, by a pool that has stopped
-   * accepting or by a worker that has stopped. Either way it will not run.
+   * @return true - the task was accepted. false - it was refused, by a pool that has not been
+   * started or has stopped accepting, or by a worker that has stopped. Either way it will not run.
    */
   bool add_task(taskT task) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (!accepting_) {
+    if (!running_) {
       return false;
     }
+
+    std::lock_guard<std::mutex> lock(mutex_);
 
     // The queue comes first: a task does not overtake one already waiting in it.
     if (pending_.empty()) {
@@ -167,15 +178,36 @@ class executor {
   }
 
   /**
+   * @brief Starts every worker, and starts the pool accepting work.
+   *
+   * A pool refuses work until this is called, and refuses it again after \ref stop() until this is
+   * called a second time - a stopped pool is restarted by it, workers and all. Calling it twice
+   * over is harmless.
+   */
+  void start() {
+    // The workers first, so anything accepted after this is handed to one that is running.
+    for (auto& one : workers_) {
+      one->start();
+    }
+
+    running_ = true;
+  }
+
+  /**
    * @brief Stops every worker. What they are already running, they finish.
    *
-   * Queued tasks stay unrun and a task added afterwards is refused. Calling it twice is harmless.
+   * Queued tasks stay unrun and a task added afterwards is refused by the worker it is offered
+   * to. \ref start() gives the workers a new working life. Calling it twice is harmless.
    *
    * @attention It does not wait for the workers to leave their threads. Only the destructor does
    * that, and that wait is what makes destroying the pool safe.
    */
   void stop() {
-    // Outside any lock: a worker waking from stop() runs on_finished, which takes mutex_.
+    // First, so that nothing is accepted for workers that are about to stop. A task already on a
+    // worker still runs; one arriving from here is refused.
+    running_ = false;
+
+    // No lock: a worker waking from stop() runs on_finished, which takes mutex_.
     for (auto& one : workers_) {
       one->stop();
     }
@@ -325,7 +357,8 @@ class executor {
 
   std::deque<taskT> pending_;  //!< Tasks waiting for a worker, in the order added.
   std::vector<std::shared_ptr<worker_execution>> workers_;
-  bool accepting_ = true;
+  //! False until start(), and false again from stop() or the destructor. Read without the mutex.
+  std::atomic_bool running_ = {false};
 };
 
 }  // namespace untangle

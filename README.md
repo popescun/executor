@@ -34,12 +34,13 @@ The headers report warnings with `std::println`, so they need a standard library
 
 int main() {
   untangle::executor<std::function<void(void)>> pool(4);
+  pool.start();
 
   for (int i = 0; i < 100; ++i) {
     pool.add_task([i] { work(i); });
   }
 
-  return 0;  // ~executor finishes what was submitted, then stops the workers
+  return 0;  // ~executor finishes what was added, then stops the workers
 }
 ```
 
@@ -87,20 +88,34 @@ what spreads the work, with no scheduling logic of its own: 400 tasks over 4 wor
 worker and what the destructor reads to decide the pool is idle. A tally kept here would be the
 pool's belief about its workers; this is the workers' own answer, and it cannot drift.
 
+## running, stopping, restarting
+
+**A pool is built stopped.** The constructor makes the workers and wires them up; `start()` runs
+them. Until it is called the pool refuses work, because a task taken then would sit unrun and the
+destructor would wait for it. It is also the moment to assign `on_task_error`, before anything can
+throw.
+
+**`stop()` stops the workers**, and stops the pool accepting. What a worker is already running it
+finishes; what is still queued stays queued. `stop()` does not wait for the workers to leave their
+threads — only the destructor does that, and that wait is what makes destroying the pool safe.
+
+**`start()` after `stop()` restarts it**, workers and all, and the queue it was holding drains as
+they pick it up again. Either call is harmless twice over.
+
 ## lifetime and failure
 
-**The destructor finishes what was submitted.** It refuses further work, waits for the queue to empty and for every
-worker to go idle, and only then stops them. A task submitted before the pool goes out of scope has
-run by the time it does.
+**The destructor finishes what was added.** It stops accepting, waits for the queue to empty and for
+every worker to go idle, and only then stops them. A task added before the pool goes out of scope
+has run by the time it does.
 
-**`add_task()` says whether the task was taken.** It returns false once the pool has stopped
-accepting — which a task adding more work from inside the pool can see — and false again if the
-worker it was offered to has stopped, which is what `stop()` leaves behind. A refused task is
-destroyed rather than queued, so a false answer means it will not run.
+A pool destroyed while stopped is the exception: its queue can never empty, because only a running
+worker takes from it, so the destructor does not wait for it. Whatever is left is reported on
+stderr and dropped.
 
-**`stop()` stops the workers.** What they are running they finish; what is still queued stays there
-unrun, and anything added afterwards is refused. It does not wait for the workers to leave their
-threads — only the destructor does that, and that wait is what makes destroying the pool safe.
+**`add_task()` says whether the task was taken.** It returns false before `start()`, after `stop()`,
+and once the destructor has begun — which a task adding more work from inside the pool can see. It
+returns false again if the worker it was offered to has stopped. A refused task is destroyed rather
+than queued, so a false answer means it will not run.
 
 **A task that throws does not take the worker with it**, and what it threw is not lost. The worker
 catches it and carries on with the next task; `on_task_error` is where the throw goes:

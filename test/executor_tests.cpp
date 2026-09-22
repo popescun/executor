@@ -120,6 +120,7 @@ TEST(executor_tests, every_submitted_task_runs_exactly_once) {
 
   {
     executor pool(4);
+    pool.start();
     for (int i = 0; i < task_count; ++i) {
       EXPECT_TRUE(pool.add_task([&work] { work.run(); }));
     }
@@ -136,6 +137,7 @@ TEST(executor_tests, the_destructor_finishes_work_in_flight) {
 
   {
     executor pool(2);
+    pool.start();
     pool.add_task([&finished] {
       std::this_thread::sleep_for(200ms);
       finished = true;
@@ -162,6 +164,7 @@ TEST(executor_tests, the_queue_preserves_submission_order) {
 
   {
     executor pool(1);
+    pool.start();
     for (int i = 0; i < task_count; ++i) {
       pool.add_task([&work, i] { work.run_numbered(i); });
     }
@@ -184,6 +187,7 @@ TEST(executor_tests, tasks_queue_while_every_worker_is_busy) {
 
   {
     executor pool(worker_count);
+    pool.start();
 
     for (std::size_t i = 0; i < worker_count; ++i) {
       pool.add_task([&busy] { busy(); });
@@ -213,6 +217,7 @@ TEST(executor_tests, a_free_worker_takes_a_task_with_an_empty_queue) {
 
   {
     executor pool(2);
+    pool.start();
 
     pool.add_task([&busy] { busy(); });
     ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
@@ -239,6 +244,7 @@ TEST(executor_tests, workers_take_the_queue_as_they_free_up) {
 
   {
     executor pool(worker_count);
+    pool.start();
 
     for (std::size_t i = 0; i < worker_count; ++i) {
       pool.add_task([&busy] { busy(); });
@@ -267,6 +273,7 @@ TEST(executor_tests, tasks_run_concurrently) {
 
   {
     executor pool(4);
+    pool.start();
     for (int i = 0; i < 4; ++i) {
       pool.add_task([] { std::this_thread::sleep_for(150ms); });
     }
@@ -288,6 +295,7 @@ TEST(executor_tests, concurrent_submission_loses_nothing) {
 
   {
     executor pool(3);
+    pool.start();
 
     std::vector<std::thread> threads;
     for (int t = 0; t < submitters; ++t) {
@@ -315,6 +323,7 @@ TEST(executor_tests, a_throwing_task_does_not_stop_the_worker) {
 
   {
     executor pool(1);  // one worker, so the task after the throw is the same worker's
+    pool.start();
 
     pool.add_task([&work] { work.run(); });
     pool.add_task([] { throw std::runtime_error("a task that throws"); });
@@ -337,6 +346,7 @@ TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
 
   {
     executor executor(1);
+    executor.start();
 
     executor.on_task_error = [&](std::exception_ptr thrown) {
       reported.fetch_add(1, std::memory_order_relaxed);
@@ -360,25 +370,45 @@ TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
 }
 
 /**
- * @brief A task a worker refuses is not reported to the caller as taken.
+ * @brief A queued task a stopped worker refuses is reported rather than passed over.
  *
- * A stopped worker refuses what it is handed and destroys it, so a task answered for with true
- * would never run and pending() would not count it either.
+ * A stopped worker refuses what it is handed and destroys it. add_task() answered true for these
+ * while the pool was still running, so the loss is named on stderr.
+ *
+ * @remark The queue is the only way to reach the refusal: stop() stops the pool accepting, so
+ * add_task() never offers a worker anything after it. These were accepted before.
  */
-TEST(executor_tests, a_task_refused_by_a_worker_is_not_reported_as_taken) {
+TEST(executor_tests, a_queued_task_a_worker_refuses_is_reported) {
+  constexpr int queued_count = 4;
+
+  gate busy;
   std::atomic_int ran = {0};
-  bool accepted = true;
+
+  testing::internal::CaptureStderr();
 
   {
     executor executor(1);
+    executor.start();
 
+    // Occupies the only worker, so everything after it waits in the queue.
+    EXPECT_TRUE(executor.add_task([&busy] { busy(); }));
+    ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
+
+    for (int i = 0; i < queued_count; ++i) {
+      EXPECT_TRUE(executor.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); }));
+    }
+    ASSERT_EQ(executor.pending(), static_cast<std::size_t>(queued_count));
+
+    // The worker is stopped with the queue still full, and takes from it as it finishes.
     executor.stop();
-
-    accepted = executor.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+    busy.open();
   }
 
-  EXPECT_FALSE(accepted) << "the worker refused the task and add_task() said it had been taken";
+  const std::string reported = testing::internal::GetCapturedStderr();
+
   EXPECT_EQ(ran.load(), 0) << "a refused task cannot have run";
+  EXPECT_THAT(reported, ::testing::HasSubstr("refused a queued task"))
+      << "the queued task was lost without a word; stderr held: " << reported;
 }
 
 /**
@@ -393,6 +423,7 @@ TEST(executor_tests, a_task_can_add_more_work) {
 
   {
     executor pool(2);
+    pool.start();
     std::atomic_bool submitted = {false};
 
     pool.add_task(
@@ -411,6 +442,7 @@ TEST(executor_tests, a_task_can_add_more_work) {
  */
 TEST(executor_tests, add_task_is_refused_once_the_pool_is_shutting_down) {
   auto pool = std::make_unique<executor>(2);
+  pool->start();
 
   // The task reads the pool through a raw pointer, not through the unique_ptr: reset() clears the
   // pointer before it runs the destructor, so a task reading the unique_ptr would find it null
@@ -440,6 +472,7 @@ TEST(executor_tests, pending_counts_only_what_is_waiting) {
 
   {
     executor pool(1);
+    pool.start();
 
     pool.add_task([&busy] { busy(); });
     ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
@@ -461,7 +494,83 @@ TEST(executor_tests, pending_counts_only_what_is_waiting) {
  */
 TEST(executor_tests, an_idle_pool_shuts_down) {
   executor pool(4);
+  pool.start();
   EXPECT_EQ(pool.pending(), 0u);
+}
+
+/**
+ * @brief A pool that has not been started refuses work.
+ *
+ * Its workers are built but not running, so a task taken now would sit unrun and the destructor
+ * would wait for it.
+ */
+TEST(executor_tests, an_unstarted_pool_refuses_work) {
+  std::atomic_int ran = {0};
+
+  {
+    executor pool(2);
+
+    EXPECT_FALSE(pool.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); }));
+    EXPECT_EQ(pool.pending(), 0u);
+  }
+
+  EXPECT_EQ(ran.load(), 0);
+}
+
+/**
+ * @brief A pool that was never started destructs without waiting for anything.
+ */
+TEST(executor_tests, an_unstarted_pool_shuts_down) {
+  const auto began = std::chrono::steady_clock::now();
+
+  {
+    executor pool(4);
+  }
+
+  EXPECT_LT(std::chrono::steady_clock::now() - began, 2s);
+}
+
+/**
+ * @brief start() runs the workers, and the pool takes work from then on.
+ */
+TEST(executor_tests, a_started_pool_runs_what_it_is_given) {
+  mock_work work;
+  EXPECT_CALL(work, run()).Times(8);
+
+  {
+    executor pool(2);
+    pool.start();
+
+    for (int i = 0; i < 8; ++i) {
+      EXPECT_TRUE(pool.add_task([&work] { work.run(); }));
+    }
+  }
+}
+
+/**
+ * @brief A stopped pool can be started again.
+ *
+ * stop() ends the workers' working life and start() gives them a new one, so the tasks refused in
+ * between are the only ones lost.
+ */
+TEST(executor_tests, a_stopped_pool_can_be_started_again) {
+  std::atomic_int ran = {0};
+  const auto task = [&ran] { ran.fetch_add(1, std::memory_order_relaxed); };
+
+  {
+    executor pool(1);
+
+    pool.start();
+    EXPECT_TRUE(pool.add_task(task));
+
+    pool.stop();
+    EXPECT_FALSE(pool.add_task(task)) << "a stopped pool took work";
+
+    pool.start();
+    EXPECT_TRUE(pool.add_task(task)) << "a restarted pool refused work";
+  }
+
+  EXPECT_EQ(ran.load(), 2);
 }
 
 /**
@@ -491,6 +600,7 @@ TEST(executor_tests, a_destructor_stuck_on_a_task_reports_why) {
   {
     std::atomic_bool started = {false};
     executor pool(1);
+    pool.start();
 
     pool.add_task([&started, stall] {
       started.store(true);
@@ -522,6 +632,7 @@ TEST(executor_tests, a_pool_runs_tasks_that_return_a_value) {
 
   {
     int_executor pool(2);
+    pool.start();
 
     for (int i = 0; i < tasks; ++i) {
       EXPECT_TRUE(pool.add_task([&ran] { return ran.fetch_add(1, std::memory_order_relaxed); }));
@@ -545,6 +656,7 @@ TEST(executor_tests, a_pool_runs_a_task_type_that_is_not_a_std_function) {
 
   {
     counting_executor pool(2);
+    pool.start();
 
     for (int i = 0; i < tasks; ++i) {
       EXPECT_TRUE(pool.add_task(counting_task{&ran}));
@@ -573,6 +685,7 @@ TEST(executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
 
   for (int round = 0; round < rounds; ++round) {
     executor pool(4);
+    pool.start();
 
     for (int i = 0; i < tasks_per_round; ++i) {
       pool.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
