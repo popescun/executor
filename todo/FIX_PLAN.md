@@ -9,12 +9,12 @@ and are steps 23 to 26 — a rename, an open question about reaching the workers
 read as a way the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed;
 step 3 was probed and does not reproduce, so it is closed as not a defect rather than fixed. What is
 left is group 2 onwards — what the caller is told, placement, and the surface.
-**Tests:** 24 of 24 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
+**Tests:** 25 of 25 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
 `async::execution_poll` until every worker has left its thread and clears them only then, and it
 reports on stderr while either of its waits is stalled rather than parking in silence. The race TSan
-named on CI no longer reproduces: 24 of 24 under TSan and under ASan on macOS/libc++, where the case
+named on CI no longer reproduces: 25 of 25 under TSan and under ASan on macOS/libc++, where the case
 that provokes it aborted before the fix. **That is one platform, not both** — the Linux/libstdc++
 run this plan insists on has not been made since either fix, which is why step 19 stays open.
 **Sites** are line numbers in `executor.hpp` as of `032da65`, and they move with every fix that
@@ -74,8 +74,8 @@ own hash, so the table below is filled by the `chore: update fix plan` that foll
 also why an amended fix needs a second look here — `bf7739b` became `4c1cba6` under an amend and left
 three dangling references behind it.
 
-**NEXT: steps 6 and 7, the rest of group 2.** Step 5 is done — through async's step 38 rather than
-here, see below. Groups 1 and 7 are done, and step 22
+**NEXT: step 7, the rest of group 2.** Steps 5 and 6 are done — 5 through async's step 38 rather
+than here, and 6 only after step 25 made its state reachable. Groups 1 and 7 are done, and step 22
 sharpened what group 2 has to answer: a pool can now be built on `std::function<int(void)>`, and
 what it does with the `int` is nothing. That is steps 5 and 18's question arriving by a third door,
 which is what this plan predicted. The couplings below say to settle 5 and 6 together rather than in
@@ -126,7 +126,7 @@ returns something give back — so read those two before deciding what it means 
 | 4 ✅ | 4 | the destructor waits forever on a task that never returns | `:112-129`, `:144-160` | CONFIRMED (test) — fixed `032da65` |
 | **Group 2 — what the caller is told** |
 | 5 ✅ | 5 | a task that throws is reported to stderr and to nobody else | `:90-92`, `:233`, `:243` | CONFIRMED (test) — fixed via async `on_error` |
-| 6 | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:140-145` | read-only |
+| 6 ✅ | 6 | `add_action()`'s answer is dropped, so a refused task vanishes | `:199`, `:301`, `:325` | CONFIRMED (test) — fixed |
 | 7 | 7 | work spawned by an in-flight task is refused once shutdown starts | `:82`, `:101-121` | CONFIRMED (test) |
 | **Group 3 — placement** |
 | 8 | 8 | the free-worker scan always starts at worker 0 | `:110-117` | CONFIRMED (20 tasks, 1 of 4; probe) |
@@ -485,34 +485,38 @@ pages. README gains the handler and the warning it replaces.
 > itself, which needs no name at all — so 13 became optional here. It still matters for the stderr
 > floor above and for step 4's stall report, both of which name a worker that two pools would share.
 
-### Step 6 · item 6 — `add_action()`'s answer is dropped — OPEN
-`executor.hpp:129-134` · read-only
+### Step 6 ✅ · item 6 — `add_action()`'s answer is dropped — DONE
+`executor.hpp:301` (the return), `:199` (`add_task()`), `:325` (`take_next_task()`) · CONFIRMED by
+test: `a_task_refused_by_a_worker_is_not_reported_as_taken`
 
-```c++
-workers_[index].exec->add_action(std::move(task));
-```
+`give_to_worker()` returns what `add_action()` answered, and both callers read it. It is
+`[[nodiscard]]`, so dropping it again is a compile error rather than a regression.
 
-`add_action()` returns `bool` — async's step 21 made it do so precisely so a refusal is not silent
-— and `give_to_worker()` ignores it. A refused task is destroyed inside `add_action()` and the pool
-goes on believing it placed it. `add_task()` has already answered true by then, or
-`take_next_task()` has already popped it off `pending_`, so the task is gone from both ends.
+**The recovery this step asked for cannot be written, and that is the finding.** "A refusal puts the
+task back at the front of `pending_`" assumes the task still exists when the answer arrives. It does
+not: `add_action(actionT action, ...)` takes it by value and moves it into `std::bind` before
+`add_queued_action()` (`async.hpp:668`) looks at `stopped_` and destroys it. By the time `false`
+comes back there is nothing left to put anywhere. So each caller does what it can:
 
-It cannot happen today: a worker refuses only after `stop()`, and `stop()` is only called by the
-destructor, after the drain. That is an invariant held in place by the order of two functions and
-written down nowhere, which is what makes an unchecked return worth this step rather than a shrug.
+- **`add_task()` answers `false`.** Not "try the next worker": a worker refuses only once stopped,
+  and a stopped worker is one `stop()` stopped, so the others are stopped too.
+- **`take_next_task()` reports.** The task is gone and its submitter was told it had been taken, so
+  the loss is named on stderr rather than passed over.
 
-> Check it. **The recovery this step asked for cannot be written, though — found while wiring step
-> 5, 2026-09-22.** "A refusal puts the task back at the front of `pending_`" assumes the task still
-> exists when the answer arrives, and it does not: `add_action(actionT action, ...)` takes it by
-> value and `std::move`s it into `std::bind` before `add_queued_action()` (`async.hpp:668`) sees
-> `stopped_` and destroys it. By the time `false` comes back there is nothing left to put anywhere.
->
-> So what is available is the check and a report, not a recovery. In `take_next_task()`, say on
-> stderr that a queued task was refused and is lost — the caller was told it had been accepted, and
-> that is now untrue. In `add_task()`, a refusal means this worker is stopped, so the pool is going
-> away: answer `false` rather than trying the next worker or queueing a task that no longer exists.
-> Neither can loop, because a refusal means the destructor is running and the finish is what ends
-> it. It is unreachable today, so say that in a comment and keep the check.
+**It stopped being unreachable while this step was open.** The plan said it could not happen today,
+and that was true: a worker refuses only once stopped, and only the destructor stopped one, after
+the queue was empty. Step 25 made `stop()` public, which is what turned an invariant held by the
+order of two functions into a state a caller can ask for. The case is the proof — before the fix,
+five tasks into a stopped one-worker pool were all accepted, `pending()` said 0, and none ran.
+
+Verified after: the same five return `false`. **25 of 25** on `debug`, `asan` and `tsan`;
+clang-format clean; `doc/refman.pdf` at 25 pages. README now says both refusal reasons.
+
+> **async warns on a refusal, and it does not come through `on_error`.**
+> `add_queued_action()` prints `warning: execution '...' is stopped, action not added` directly.
+> Step 5's handler is for throws only, so a caller that has taken over error reporting still does
+> not hear about a refused action. Recorded here rather than fixed: it is async's warning, and
+> whether refusal belongs on the same seam as a throw is that repo's question.
 
 ### Step 7 · item 7 — work spawned by an in-flight task is refused once shutdown starts — OPEN
 `executor.hpp:67`, `:101-121` · CONFIRMED by test, which had to be written around it

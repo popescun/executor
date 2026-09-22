@@ -382,6 +382,34 @@ TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
 }
 
 /**
+ * @brief A task a worker refuses is not reported to the caller as taken.
+ *
+ * give_to_worker() drops what add_action() answers. A worker refuses once it is stopped, and what
+ * it refuses it destroys, so the task is gone - while add_task() has already returned true and
+ * pending() counts nothing, the caller's two ways of asking whether the work is safe both saying
+ * yes about a task that will never run.
+ *
+ * @remark stop() is what makes this reachable. A worker refuses only once it is stopped, and until
+ * stop() was a caller's to call, the pool stopped its own only in the destructor - after the queue
+ * was empty and nothing was left to hand over.
+ */
+TEST(executor_tests, a_task_refused_by_a_worker_is_not_reported_as_taken) {
+  std::atomic_int ran = {0};
+  bool accepted = true;
+
+  {
+    executor executor(1);
+
+    executor.stop();
+
+    accepted = executor.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+  }
+
+  EXPECT_FALSE(accepted) << "the worker refused the task and add_task() said it had been taken";
+  EXPECT_EQ(ran.load(), 0) << "a refused task cannot have run";
+}
+
+/**
  * @brief A task may add more work, and it runs.
  *
  * The inner submission has to be waited for rather than assumed: leaving the scope starts the

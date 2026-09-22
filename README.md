@@ -93,8 +93,14 @@ pool's belief about its workers; this is the workers' own answer, and it cannot 
 worker to go idle, and only then stops them. A task submitted before the pool goes out of scope has
 run by the time it does.
 
-**`add_task()` says whether the task was taken.** It returns false once the pool is shutting down,
-which a task submitting more work from inside the pool can see.
+**`add_task()` says whether the task was taken.** It returns false once the pool has stopped
+accepting — which a task adding more work from inside the pool can see — and false again if the
+worker it was offered to has stopped, which is what `stop()` leaves behind. A refused task is
+destroyed rather than queued, so a false answer means it will not run.
+
+**`stop()` stops the workers.** What they are running they finish; what is still queued stays there
+unrun, and anything added afterwards is refused. It does not wait for the workers to leave their
+threads — only the destructor does that, and that wait is what makes destroying the pool safe.
 
 **A task that throws does not take the worker with it**, and what it threw is not lost. The worker
 catches it and carries on with the next task; `on_task_error` is where the throw goes:

@@ -177,7 +177,8 @@ class executor {
   /**
    * @brief Queues a task, or hands it to a worker that has nothing to do.
    *
-   * @return true - the task was accepted. false - the pool is shutting down and refused it.
+   * @return true - the task was accepted. false - it was refused, because the pool has stopped
+   * accepting or because the worker it was offered to has stopped. Either way it will not run.
    */
   bool add_task(taskT task) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -191,8 +192,11 @@ class executor {
     if (pending_.empty()) {
       for (std::size_t index = 0; index < workers_.size(); ++index) {
         if (!workers_[index]->is_busy()) {
-          give_to_worker(index, std::move(task));
-          return true;
+          // A refusal is not a reason to offer it to the next worker, and it cannot be queued
+          // instead: add_action() has already destroyed the task. It means this worker is stopped,
+          // and a stopped worker is one stop() stopped - so the rest are stopped too, and false is
+          // the answer for all of them.
+          return give_to_worker(index, std::move(task));
         }
       }
     }
@@ -286,12 +290,23 @@ class executor {
    *
    * The worker is busy from the moment add_action() returns - it says so itself - so nothing has to
    * be booked here.
+   *
+   * @return true - the worker took it. false - the worker is stopped and destroyed it, so nobody
+   * holds the task any more and it will not run.
+   *
+   * @attention \p task is gone either way. add_action() takes it by value and moves it into the
+   * binding before it looks at whether it is stopped, so a caller cannot put a refused task back:
+   * there is nothing left to put anywhere.
    */
-  void give_to_worker(std::size_t index, taskT task) {
+  [[nodiscard]] bool give_to_worker(std::size_t index, taskT task) {
     // add_action() takes the execution's own action_mutex while this holds mutex_. That is only
     // safe in one direction, and it holds: a worker calls on_finished with action_mutex released,
     // so it never takes mutex_ while holding action_mutex, and the two never form a cycle.
-    workers_[index]->add_action(std::move(task));
+    //
+    // The answer is checked rather than dropped. Until stop() was a caller's to call this could not
+    // be false - a worker refuses only once stopped, and only the destructor stopped one, after the
+    // queue was empty - so an unchecked answer cost nothing. It costs a lost task now.
+    return workers_[index]->add_action(std::move(task));
   }
 
   /**
@@ -303,7 +318,14 @@ class executor {
     if (!pending_.empty()) {
       taskT next = std::move(pending_.front());
       pending_.pop_front();
-      give_to_worker(index, std::move(next));
+
+      if (!give_to_worker(index, std::move(next))) {
+        // Not put back, because there is nothing left to put back. Reported instead: add_task()
+        // told this task's submitter it had been taken, and that has just stopped being true.
+        std::println(stderr, "executor: {} refused a queued task, which is lost",
+                     workers_[index]->name);
+      }
+
       return;
     }
 
