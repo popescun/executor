@@ -10,8 +10,9 @@ separates a task from an action rather than a restriction laid on top. The callb
 argument**, taken by position rather than recognised by type, and it is **not** forwarded to the
 task's action.
 
-**Status (2026-09-25) — nothing written, two cases written against the wrong shape, blocked on two
-repos.** This is a feature plan, not a fix plan. Claims marked **PROBED** were compiled and run on
+**Status (2026-09-25) — steps 1, 2 and 5 are done, 32 of 32 and 5 of 5 green; steps 3 and 4 were
+merged into step 2. `actuator` and `async` are both closed and bumped. Only step 6's commits are
+left.** This is a feature plan, not a fix plan. Claims marked **PROBED** were compiled and run on
 2026-09-24/25; the rest are read-only and say so.
 
 **Baseline.** `executor` at `c2bf9f0`, `async` at `985a991`, `actuator` at `a8b8b47`. Sites are line
@@ -75,8 +76,7 @@ names.
 `add_task()` require a callback, costs an argument at all 52 and leaves the pool with no
 fire-and-forget door at all.
 
-> **Recommended, not settled.** Proposed 2026-09-25 and awaiting a decision. Everything below
-> assumes it.
+> **Settled 2026-09-25 and done**, as step 1. Everything below assumes it.
 
 ## What this does not delete — a correction to an earlier draft
 
@@ -90,69 +90,127 @@ notifying door builds an `untangle::task<R>` through `untangle::bind_task()` ins
 
 | # | Step | Sites | Evidence |
 |---|---|---|---|
-| 1 | `add_task()` renamed `add_action()`, at 52 call sites | `:171`, tests | naming decision |
-| 2 | one FIFO queue, two kinds of entry | `:422`, `:323`, `:341-360` | **OPEN, see below** |
-| 3 | `add_task(task, args..., callback)` onto `execution::add_task()` | beside `:171` | read-only |
-| 4 | the two cases go green | `test/executor_tests.cpp` | **to be rewritten, see below** |
-| 5 | `on_task_error`, the callback's thread, and what a refused task does not say | `:225-236`, `README.md` | decision |
-| 6 | the `async` bump, `tools/make_doc.sh`, and `FIX_PLAN.md` step 21 | `doc/` | — |
+| 1 ✅ | `add_task()` renamed `add_action()`, at 51 call sites | `:145-179`, tests, `README.md` | CONFIRMED (27 + 5 green) — **DONE** (`e87da41`) |
+| 2 ✅ | one FIFO queue, two kinds, `add_task()`, and the cases | `:193-229`, `:326-344`, `:377-395`, `:403-414` | CONFIRMED (5 cases) — **DONE** (`e87da41`) |
+| 3 | — merged into step 2, see below | — | — |
+| 4 | — merged into step 2, see below | — | — |
+| 5 ✅ | `on_task_error`, the callback's thread, the destructor, and `README.md` | `:87-96`, `:288-308`, `README.md` | transcription — **DONE** (`e87da41`) |
+| 6 | `README.md`, `tools/make_doc.sh`, `FIX_PLAN.md` step 21, and the commits | `doc/` | — |
 
-### Step 2 · one queue, two kinds — OPEN
+### Step 1 ✅ · `add_task()` renamed `add_action()` — DONE
 
-`pending_` (`:422`) is a `std::deque<task_call>`, and the order tasks come out of it is the order
-they went in. Two kinds of entry must share that one queue, because **FIFO across both is the
-behaviour, not an implementation detail**: a caller who posts an action and then a task expects them
-to run in that order.
+`executor.hpp:145-179`, `test/executor_tests.cpp` (46), `test/executor_smoke_test.cpp` (7) and
+`README.md` (9). 27 of 27 and 5 of 5 green, clang-format clean, doxygen clean, `doc/refman.pdf` at
+25 pages.
+
+**51 call sites, not 52** — the count in the recommendation above was off by one, from a `grep -c`
+of lines rather than occurrences. Every one of them changed a single identifier and none gained an
+argument, which was the point of the rename over the alternative.
+
+**The header gained four lines beyond the rename**, saying what the name now buys:
+
+> Named for async::execution::add_action(), which it forwards to and which behaves the same way:
+> the work runs, what it returns is dropped, and nothing reports that it finished. The answer below
+> is the last the caller hears.
+
+**Two things the rename dragged with it**, both small and both worth knowing for the next two
+repos' worth of renames: clang-format rewrapped two comment lines once the identifier grew three
+characters, and a sentence in `README.md` became "binds them the way `execution::add_action()`
+does" — true, and now reading as a tautology, so it says *its namesake* instead.
+
+> **The class vocabulary is now inconsistent, and step 3 is where it gets fixed.** `add_action()`
+> takes a `taskT`; after step 3 so will `add_task()`. Async resolves this by having the template
+> parameter name the **callable type** — `execution<actionT>` — and the two doors name the two
+> **kinds of queued work**, both taking an `actionT`. The pool should match: `executor<actionT>`,
+> with `task_call`, `pending_` and the class comment following.
+>
+> **Deliberately not done here.** The rename only becomes legible once both doors exist, so doing
+> it now would land a whole-file diff ahead of the thing that motivates it. Folded into step 3,
+> where every name changes for one stated reason. Recommended 2026-09-25, not separately agreed.
+
+### Step 2 ✅ · one queue, two kinds, and the door that fills it — DONE
+
+Steps 2, 3 and 4 merged. `executor.hpp:36-43` (the class doc), `:193-229` (`add_task()`), `:326-344` (`task_call`),
+`:350-368` (`bind_action()`), `:377-395` (`queue()`), `:403-414` (`give_to_worker()`). Five cases at
+`test/executor_tests.cpp:797-959`. 32 of 32 and 5 of 5 green,
+clang-format clean, doxygen clean, `doc/refman.pdf` 25 to 27 pages.
+
+**Merged for the same reason async's steps 1 to 3 were, and with that precedent.** The pool has no
+second kind of queue entry until `add_task()` exists, so step 2 alone had nothing to carry and
+nothing to observe, step 3 had nowhere to put what it built, and step 4's cases *were* the
+observable claim. Three pieces, one review, because there is one claim: a task queued here runs and
+notifies, and the order across both kinds is the order they arrived.
+
+**Route one, as recommended.** `task_call` gained a private optional callback slot:
 
 | Route | Cost |
 |---|---|
-| **`task_call` gains an optional callback slot** — private to the pool, filled only by `add_task()` | one queue, order preserved, `give_to_worker()` picks `add_action()` or `add_task()` on whether the slot is filled; the pool holds an optional callback internally while the public rule is that a task always has one |
-| Two deques, `pending_actions_` and `pending_tasks_` | order across the two kinds is lost, and `pending()` stops having one answer |
-| `std::deque<std::variant<task_call, untangle::task<R>>>` | order preserved, but every reader of the queue grows a visit, for a distinction only `give_to_worker()` cares about |
+| **Taken:** `task_call` gains an optional callback slot | one queue, so FIFO across kinds and a single `pending()` come out for free rather than being arranged; the pool holds an optional callback internally while the public rule is that a task always has one |
+| Two deques | order across the two kinds is lost, and `pending()` stops having one answer |
+| `std::deque<std::variant<...>>` | order preserved, but every reader of the queue grows a visit for a distinction only `give_to_worker()` cares about |
 
-**The first, I think.** The optional slot is private and is exactly the shape async's queue has —
-two kinds side by side — expressed in the one container the pool needs. Not decided.
+**`queue()` is what makes the ordering free.** It was extracted from `add_action()` and both doors
+call it; **neither kind is treated differently there**, so the FIFO promise is a consequence of
+having one container rather than something the code arranges. `give_to_worker()` is the only place
+that tells them apart, and only to choose which door of the worker to use — taking the callback out
+first, so the worker is handed the callable with the callback beside it, where
+`async::execution::add_task()` expects to find one.
 
-### Step 4 · the two cases, and why they must be rewritten
+> **The two queues differ, deliberately, and this is where that is written down.** A pass in
+> `async` fires every action it holds and then every task, so within one batch the kinds do not
+> interleave in arrival order; the pool keeps strict first in, first out across both. The pool can
+> promise it because it owns one container outright, while async fires an actuator in two passes.
+> Decided 2026-09-25 rather than discovered — async's plan raised the discrepancy and this is the
+> answer to it. `the_queue_keeps_both_kinds_in_the_order_they_arrived` states the pool's half.
 
-Two cases were written on 2026-09-24, at `test/executor_tests.cpp:829-908`, and **they assert the
-shape that was then abandoned**: a pool on `std::function<int(int, callback_t)>` with the callback
-as a trailing argument the pool infers. Under decision (B) the action carries no callback parameter
-and the callback is passed to `add_task()` directly, so both cases are wrong as written — not
-failing for the right reason, but testing a design that will not be built.
+**`taskT` became `actionT`, folded in from step 1 as recommended.** The parameter names the
+callable, the two doors name the kinds of work, and both take an `actionT` — which is exactly
+`execution<actionT>`'s arrangement, so the pool and the thing it is built out of now read alike.
+The pool's private `bind_task()` became `bind_action()` in the same pass: it binds an action and
+deliberately leaves the callback slot empty, and sharing a name with `untangle::bind_task()` while
+doing something different was going to mislead someone.
 
-They are uncommitted, and this plan's appendix carries the **new** shape. Two ways forward:
+**What is enforced elsewhere, and so is not tested here:** that a callback is required (a
+`static_assert` in `untangle::bind_task()`), that an empty one is refused (`actuator::add_task()`,
+covered in that repo), and that a stopped pool refuses (`add_action()`'s existing cases cover the
+`running_` gate, which `add_task()` shares).
 
-| Route | Cost |
-|---|---|
-| **Clean the tree; add the appendix cases at step 3** | the suite stays 27 of 27 green for the whole chain; the cases live in this file, committed, until there is an API for them to compile against |
-| Rewrite them in place now | the binary stops compiling — a three-argument `add_task()` does not exist — so all 27 other cases stop running too, for the length of a three-repo chain |
+### Step 5 ✅ · what the reference has to say — DONE
 
-**The first.** The old plan's own note anticipated it: the cases are quoted in full below, so the
-tree can be cleaned without losing them. The repo's precedent for leaving non-compiling cases live
-(step 27, item 24) was a single-repo fix that landed the same day, not a chain across three.
+`executor.hpp:87-96` (the destructor), `:288-308` (`on_task_error`), and `README.md` — a
+`## tasks: work that reports back` section, plus the rename of `## the task type`. 32 of 32 and 5
+of 5 green, clang-format clean, doxygen clean, `doc/refman.pdf` 27 to 29 pages.
 
-The same pair belongs in async's suite (its step 5), because a caller using `execution` directly
-meets this with no pool in sight.
+**Most of it was already written**, because each `@attention` went into the header as step 2
+landed: the last argument being the callback, finished not meaning failed, and a refused task not
+notifying. What this step added is the two places those rules are *met* rather than declared.
 
-### Step 5 · what the reference has to say
+- **`on_task_error` now says a task's failure arrives there, and so does its callback's** — so it
+  can fire for a task that in fact **succeeded**: the work was done and only the telling failed.
+  And a second attention, that a task's callback runs on a worker's thread under the same rule,
+  several at once on different workers, with nothing escaping it.
+- **The destructor now says that queued work dropped at shutdown never notifies.** The count on
+  stderr is the whole report, and it says *how much* was lost, not *which*.
 
-- **A callback runs on a worker's thread**, inside the drain, and several workers may be in one at
-  once. The same warning `on_task_error` (`:230-236`) already carries, for the same reason.
-- **A throwing callback reaches `on_task_error`**, because it runs inside the actuator's `try` and
-  travels the path a failing task's exception does. So the handler can fire for a task whose body
-  succeeded.
-- **A task that throws does not notify. Finished does not mean failed**, decided 2026-09-25 and
-  documented as a choice, with the revisit noted. An `exception_ptr` overload is the obvious shape
-  if a use case asks; nothing here forecloses it.
-- **A refused task does not notify.** `add_task()` answering `false` is the whole report — an
-  unstarted, stopped or shutting-down pool never runs it, so nothing ever calls back. A caller
-  waiting on the callback rather than on the answer would wait forever.
-- **A queued task dropped at shutdown does not notify either.** `~executor()` reports dropped
-  queued tasks on stderr (`:117-121`); with a callback in the picture that report is now the only
-  thing a caller gets.
-- `README.md` states the pool's surface and will be wrong on all of it; `FIX_PLAN.md` step 21
-  already tracks that file drifting behind the code.
+**`README.md` gained a tasks section** — the call shape, the void form, callback-last, the shared
+queue's ordering, `pending()` counting both kinds, refusal not notifying, finished not meaning
+failed, and which thread a callback runs on. The ordering paragraph is where the difference from
+`async` is put in front of a caller:
+
+> The pool can promise that because it owns one container; `async::execution`, which the workers
+> are, fires every action in a pass before any task, so its ordering across the two kinds differs.
+> Only the pool's own order is a promise to a caller of the pool.
+
+**`## the task type` became `## the action type`**, left over from step 1's rename and found only
+by reading the file. It documents the template parameter, which is `actionT` now, and the section
+says why: both kinds of queued work *are* that one callable, which is why the parameter names it
+rather than either kind.
+
+> **`FIX_PLAN.md` step 21 is not discharged by this, and the earlier note here implied it might
+> be.** That step is about the README stating behaviour *its own* steps 4, 5, 7 and 13 change — a
+> different set of changes from this feature's. This pass rewrote the same file for tasks and the
+> rename, and did not audit it against those four. Whether the README is now correct about them is
+> **unverified**, and remains that step's to answer.
 
 ## Order
 
@@ -184,9 +242,12 @@ the chain.
 | Commit | Step |
 |---|---|
 | `1b4e2e1` | — this plan, in its pre-decision form |
-| — | nothing landed, and nothing can until `actuator` and `async` are both green and bumped |
+| `25bf0ec` | — `async` bumped to `d90b28f`, the tip whose plan is closed |
+| `e87da41` | 1, 2 and 5 — the two doors, one queue, `actionT`, 5 cases, `README.md` and the reference |
 
-**NEXT: not here.** The actuator's step 1.
+**NEXT: step 6**, and only its commits. `tools/make_doc.sh` has run at every step and `README.md`
+is current for this feature. **`FIX_PLAN.md` step 21 stays open and is not this plan's** — it asks
+a different question about the same file.
 
 ## Appendix — the three cases, in the shape decided on 2026-09-25
 

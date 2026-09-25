@@ -43,7 +43,7 @@ TEST(executor_smoke_test, tasks_run_and_spread_across_workers) {
     executor pool(4);
     pool.start();
     for (int i = 0; i < task_count; ++i) {
-      pool.add_task([&ran, &seen_mutex, &seen] {
+      pool.add_action([&ran, &seen_mutex, &seen] {
         ran.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(seen_mutex);
         seen.push_back(std::this_thread::get_id());
@@ -81,7 +81,7 @@ TEST(executor_smoke_test, submission_order_is_preserved) {
     executor pool(1);
     pool.start();
     for (int i = 0; i < 50; ++i) {
-      pool.add_task([i, &order_mutex, &order] {
+      pool.add_action([i, &order_mutex, &order] {
         std::lock_guard<std::mutex> lock(order_mutex);
         order.push_back(i);
       });
@@ -108,7 +108,7 @@ TEST(executor_smoke_test, a_slow_task_does_not_hold_up_the_others) {
     executor pool(4);
     pool.start();
     for (int i = 0; i < 4; ++i) {
-      pool.add_task([&ran] {
+      pool.add_action([&ran] {
         std::this_thread::sleep_for(150ms);
         ran.fetch_add(1, std::memory_order_relaxed);
       });
@@ -136,7 +136,7 @@ TEST(executor_smoke_test, concurrent_submission) {
     for (int t = 0; t < submitters; ++t) {
       threads.emplace_back([&pool, &ran] {
         for (int i = 0; i < per_thread; ++i) {
-          pool.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+          pool.add_action([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
         }
       });
     }
@@ -152,12 +152,12 @@ TEST(executor_smoke_test, concurrent_submission) {
 }
 
 //! A pool that is still accepting takes the task.
-TEST(executor_smoke_test, add_task_is_accepted_while_the_pool_is_up) {
+TEST(executor_smoke_test, add_action_is_accepted_while_the_pool_is_up) {
   executor pool(2);
   pool.start();
-  const bool accepted = pool.add_task([] {});
+  const bool accepted = pool.add_action([] {});
 
-  std::println("5. add_task() while accepting: {}", accepted ? "accepted" : "refused");
+  std::println("5. add_action() while accepting: {}", accepted ? "accepted" : "refused");
 
   EXPECT_TRUE(accepted);
 }

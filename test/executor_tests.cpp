@@ -122,7 +122,7 @@ TEST(executor_tests, every_submitted_task_runs_exactly_once) {
     executor pool(4);
     pool.start();
     for (int i = 0; i < task_count; ++i) {
-      EXPECT_TRUE(pool.add_task([&work] { work.run(); }));
+      EXPECT_TRUE(pool.add_action([&work] { work.run(); }));
     }
   }
 }
@@ -138,7 +138,7 @@ TEST(executor_tests, the_destructor_finishes_work_in_flight) {
   {
     executor pool(2);
     pool.start();
-    pool.add_task([&finished] {
+    pool.add_action([&finished] {
       std::this_thread::sleep_for(200ms);
       finished = true;
     });
@@ -166,7 +166,7 @@ TEST(executor_tests, the_queue_preserves_submission_order) {
     executor pool(1);
     pool.start();
     for (int i = 0; i < task_count; ++i) {
-      pool.add_task([&work, i] { work.run_numbered(i); });
+      pool.add_action([&work, i] { work.run_numbered(i); });
     }
   }
 }
@@ -190,7 +190,7 @@ TEST(executor_tests, tasks_queue_while_every_worker_is_busy) {
     pool.start();
 
     for (std::size_t i = 0; i < worker_count; ++i) {
-      pool.add_task([&busy] { busy(); });
+      pool.add_action([&busy] { busy(); });
     }
 
     // Every worker must be at the gate first: one not yet started would be handed the task.
@@ -198,7 +198,7 @@ TEST(executor_tests, tasks_queue_while_every_worker_is_busy) {
     EXPECT_EQ(pool.pending(), 0u);
 
     for (std::size_t i = 0; i < queued_count; ++i) {
-      pool.add_task([&work] { work.run(); });
+      pool.add_action([&work] { work.run(); });
       EXPECT_EQ(pool.pending(), i + 1);
     }
 
@@ -219,10 +219,10 @@ TEST(executor_tests, a_free_worker_takes_a_task_with_an_empty_queue) {
     executor pool(2);
     pool.start();
 
-    pool.add_task([&busy] { busy(); });
+    pool.add_action([&busy] { busy(); });
     ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
 
-    pool.add_task([&ran] { ran = true; });
+    pool.add_action([&ran] { ran = true; });
 
     // The second worker is free and the queue empty, so this runs with the first still held.
     EXPECT_TRUE(wait_for([&ran] { return ran.load(); }, 5s));
@@ -247,12 +247,12 @@ TEST(executor_tests, workers_take_the_queue_as_they_free_up) {
     pool.start();
 
     for (std::size_t i = 0; i < worker_count; ++i) {
-      pool.add_task([&busy] { busy(); });
+      pool.add_action([&busy] { busy(); });
     }
     ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == static_cast<int>(worker_count); }, 5s));
 
     for (std::size_t i = 0; i < queued_count; ++i) {
-      pool.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+      pool.add_action([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
     }
     ASSERT_EQ(pool.pending(), queued_count);
 
@@ -275,7 +275,7 @@ TEST(executor_tests, tasks_run_concurrently) {
     executor pool(4);
     pool.start();
     for (int i = 0; i < 4; ++i) {
-      pool.add_task([] { std::this_thread::sleep_for(150ms); });
+      pool.add_action([] { std::this_thread::sleep_for(150ms); });
     }
   }
 
@@ -301,7 +301,7 @@ TEST(executor_tests, concurrent_submission_loses_nothing) {
     for (int t = 0; t < submitters; ++t) {
       threads.emplace_back([&pool, &work] {
         for (int i = 0; i < per_thread; ++i) {
-          pool.add_task([&work] { work.run(); });
+          pool.add_action([&work] { work.run(); });
         }
       });
     }
@@ -325,11 +325,11 @@ TEST(executor_tests, a_throwing_task_does_not_stop_the_worker) {
     executor pool(1);  // one worker, so the task after the throw is the same worker's
     pool.start();
 
-    pool.add_task([&work] { work.run(); });
-    pool.add_task([] { throw std::runtime_error("a task that throws"); });
-    pool.add_task([&work] { work.run(); });
-    pool.add_task([] { throw 42; });  // not a std::exception; the catch-all arm
-    pool.add_task([&work] { work.run(); });
+    pool.add_action([&work] { work.run(); });
+    pool.add_action([] { throw std::runtime_error("a task that throws"); });
+    pool.add_action([&work] { work.run(); });
+    pool.add_action([] { throw 42; });  // not a std::exception; the catch-all arm
+    pool.add_action([&work] { work.run(); });
   }
 }
 
@@ -360,8 +360,8 @@ TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
       }
     };
 
-    executor.add_task([] { throw std::runtime_error("a task that throws"); });
-    executor.add_task([] { throw 42; });  // not a std::exception; the catch-all arm
+    executor.add_action([] { throw std::runtime_error("a task that throws"); });
+    executor.add_action([] { throw 42; });  // not a std::exception; the catch-all arm
   }
 
   EXPECT_EQ(reported.load(), 2) << "the executor swallowed what the tasks threw";
@@ -372,11 +372,11 @@ TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
 /**
  * @brief A queued task a stopped worker refuses is reported rather than passed over.
  *
- * A stopped worker refuses what it is handed and destroys it. add_task() answered true for these
+ * A stopped worker refuses what it is handed and destroys it. add_action() answered true for these
  * while the pool was still running, so the loss is named on stderr.
  *
  * @remark The queue is the only way to reach the refusal: stop() stops the pool accepting, so
- * add_task() never offers a worker anything after it. These were accepted before.
+ * add_action() never offers a worker anything after it. These were accepted before.
  */
 TEST(executor_tests, a_queued_task_a_worker_refuses_is_reported) {
   constexpr int queued_count = 4;
@@ -391,11 +391,11 @@ TEST(executor_tests, a_queued_task_a_worker_refuses_is_reported) {
     executor.start();
 
     // Occupies the only worker, so everything after it waits in the queue.
-    EXPECT_TRUE(executor.add_task([&busy] { busy(); }));
+    EXPECT_TRUE(executor.add_action([&busy] { busy(); }));
     ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
 
     for (int i = 0; i < queued_count; ++i) {
-      EXPECT_TRUE(executor.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); }));
+      EXPECT_TRUE(executor.add_action([&ran] { ran.fetch_add(1, std::memory_order_relaxed); }));
     }
     ASSERT_EQ(executor.pending(), static_cast<std::size_t>(queued_count));
 
@@ -426,8 +426,8 @@ TEST(executor_tests, a_task_can_add_more_work) {
     pool.start();
     std::atomic_bool submitted = {false};
 
-    pool.add_task(
-        [&work, &pool, &submitted] { submitted = pool.add_task([&work] { work.run(); }); });
+    pool.add_action(
+        [&work, &pool, &submitted] { submitted = pool.add_action([&work] { work.run(); }); });
 
     ASSERT_TRUE(wait_for([&submitted] { return submitted.load(); }, 5s));
   }
@@ -436,11 +436,11 @@ TEST(executor_tests, a_task_can_add_more_work) {
 /**
  * @brief A pool that is shutting down refuses the task and says so.
  *
- * The refusal is only reachable from inside the pool: add_task() answers false once the destructor
- * has stopped accepting, and the destructor is waiting for this very task to return. So the task
- * polls, and the case fails as a timeout rather than as a hang.
+ * The refusal is only reachable from inside the pool: add_action() answers false once the
+ * destructor has stopped accepting, and the destructor is waiting for this very task to return. So
+ * the task polls, and the case fails as a timeout rather than as a hang.
  */
-TEST(executor_tests, add_task_is_refused_once_the_pool_is_shutting_down) {
+TEST(executor_tests, add_action_is_refused_once_the_pool_is_shutting_down) {
   auto pool = std::make_unique<executor>(2);
   pool->start();
 
@@ -452,9 +452,9 @@ TEST(executor_tests, add_task_is_refused_once_the_pool_is_shutting_down) {
   std::atomic_bool refused = {false};
   std::atomic_bool started = {false};
 
-  running_pool->add_task([running_pool, &refused, &started] {
+  running_pool->add_action([running_pool, &refused, &started] {
     started = true;
-    refused = wait_for([running_pool] { return !running_pool->add_task([] {}); }, 10s);
+    refused = wait_for([running_pool] { return !running_pool->add_action([] {}); }, 10s);
   });
 
   ASSERT_TRUE(wait_for([&started] { return started.load(); }, 5s));
@@ -480,9 +480,9 @@ TEST(executor_tests, a_running_task_cannot_add_work_once_the_pool_stops) {
     executor pool(1);
     pool.start();
 
-    pool.add_task([&pool, &hold, &refused, &spawned] {
+    pool.add_action([&pool, &hold, &refused, &spawned] {
       hold();  // released once the pool has been stopped
-      refused = !pool.add_task([&spawned] { spawned = true; });
+      refused = !pool.add_action([&spawned] { spawned = true; });
     });
 
     ASSERT_TRUE(wait_for([&hold] { return hold.arrived() == 1; }, 5s));
@@ -505,13 +505,13 @@ TEST(executor_tests, pending_counts_only_what_is_waiting) {
     executor pool(1);
     pool.start();
 
-    pool.add_task([&busy] { busy(); });
+    pool.add_action([&busy] { busy(); });
     ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
 
     // The task at the gate is the worker's, not the queue's.
     EXPECT_EQ(pool.pending(), 0u);
 
-    pool.add_task([] {});
+    pool.add_action([] {});
     EXPECT_EQ(pool.pending(), 1u);
 
     busy.open();
@@ -541,7 +541,7 @@ TEST(executor_tests, an_unstarted_pool_refuses_work) {
   {
     executor pool(2);
 
-    EXPECT_FALSE(pool.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); }));
+    EXPECT_FALSE(pool.add_action([&ran] { ran.fetch_add(1, std::memory_order_relaxed); }));
     EXPECT_EQ(pool.pending(), 0u);
   }
 
@@ -573,7 +573,7 @@ TEST(executor_tests, a_started_pool_runs_what_it_is_given) {
     pool.start();
 
     for (int i = 0; i < 8; ++i) {
-      EXPECT_TRUE(pool.add_task([&work] { work.run(); }));
+      EXPECT_TRUE(pool.add_action([&work] { work.run(); }));
     }
   }
 }
@@ -592,13 +592,13 @@ TEST(executor_tests, a_stopped_pool_can_be_started_again) {
     executor pool(1);
 
     pool.start();
-    EXPECT_TRUE(pool.add_task(task));
+    EXPECT_TRUE(pool.add_action(task));
 
     pool.stop();
-    EXPECT_FALSE(pool.add_task(task)) << "a stopped pool took work";
+    EXPECT_FALSE(pool.add_action(task)) << "a stopped pool took work";
 
     pool.start();
-    EXPECT_TRUE(pool.add_task(task)) << "a restarted pool refused work";
+    EXPECT_TRUE(pool.add_action(task)) << "a restarted pool refused work";
   }
 
   EXPECT_EQ(ran.load(), 2);
@@ -633,7 +633,7 @@ TEST(executor_tests, a_destructor_stuck_on_a_task_reports_why) {
     executor pool(1);
     pool.start();
 
-    pool.add_task([&started, stall] {
+    pool.add_action([&started, stall] {
       started.store(true);
       std::this_thread::sleep_for(stall);
     });
@@ -666,7 +666,7 @@ TEST(executor_tests, a_pool_runs_tasks_that_return_a_value) {
     pool.start();
 
     for (int i = 0; i < tasks; ++i) {
-      EXPECT_TRUE(pool.add_task([&ran] { return ran.fetch_add(1, std::memory_order_relaxed); }));
+      EXPECT_TRUE(pool.add_action([&ran] { return ran.fetch_add(1, std::memory_order_relaxed); }));
     }
   }
 
@@ -690,7 +690,7 @@ TEST(executor_tests, a_pool_runs_a_task_type_that_is_not_a_std_function) {
     pool.start();
 
     for (int i = 0; i < tasks; ++i) {
-      EXPECT_TRUE(pool.add_task(counting_task{&ran}));
+      EXPECT_TRUE(pool.add_action(counting_task{&ran}));
     }
   }
 
@@ -731,7 +731,7 @@ TEST(executor_tests, a_pool_runs_a_task_type_that_takes_arguments_and_returns_a_
 
     for (int i = 0; i < task_count; ++i) {
       // The return is dropped by the pool, so the mock call is what says the task body ran through.
-      EXPECT_TRUE(pool.add_task(
+      EXPECT_TRUE(pool.add_action(
           [&work](int n) {
             work.run_numbered(n);
             return n * 2;
@@ -770,7 +770,7 @@ TEST(executor_tests, an_argument_survives_the_queue) {
     pool.start();
 
     // The only worker stops here, so nothing added after this can be handed to one.
-    EXPECT_TRUE(pool.add_task(
+    EXPECT_TRUE(pool.add_action(
         [&blocker](int n) {
           blocker();
           return n;
@@ -780,7 +780,7 @@ TEST(executor_tests, an_argument_survives_the_queue) {
         << "the worker never reached the gate, so the tasks below were not queued";
 
     for (int i = 0; i < task_count; ++i) {
-      EXPECT_TRUE(pool.add_task(
+      EXPECT_TRUE(pool.add_action(
           [&work](int n) {
             work.run_numbered(n);
             return n * 2;
@@ -792,6 +792,170 @@ TEST(executor_tests, an_argument_survives_the_queue) {
 
     blocker.open();
   }
+}
+
+// --- tasks on the pool ---------------------------------------------------------------------------
+// The pool has two doors. add_action() is fire and forget: the task runs, what it returns is
+// dropped, and the caller hears nothing more. add_task() carries the callback it must notify, built
+// by untangle::bind_task() with the callback as its last argument.
+//
+// Both kinds share one queue, and pending_ keeps them in the order they arrived - which is a
+// promise the pool can make and async's queue cannot, because the pool owns its container outright
+// while async fires an actuator in two passes. See todo/FEATURE_PLAN.md step 2.
+
+TEST(executor_tests, a_task_notifies_its_callback_with_the_result) {
+  // Every worker is free as this adds, so the task goes straight to one rather than through the
+  // queue - the shortest path the notification has to survive.
+  using int_executor = untangle::executor<std::function<int(int)>>;
+
+  std::atomic_int reported = {-1};
+  std::atomic_bool ran = {false};
+
+  {
+    int_executor pool(2);
+    pool.start();
+
+    EXPECT_TRUE(pool.add_task(
+        [&ran](int n) {
+          ran = true;
+          return n * 2;
+        },
+        21, [&reported](int result) { reported.store(result); }));
+  }
+
+  ASSERT_TRUE(ran.load()) << "the task itself never ran";
+  EXPECT_EQ(reported.load(), 42) << "the pool ran the task but never notified its callback";
+}
+
+TEST(executor_tests, a_callback_survives_the_queue) {
+  // The other half of an_argument_survives_the_queue: the single worker is held at the gate, so the
+  // task below it waits in pending_ with its callback and is run from there.
+  using int_executor = untangle::executor<std::function<int(int)>>;
+
+  std::atomic_int reported = {-1};
+  gate blocker;
+
+  {
+    int_executor pool(1);
+    pool.start();
+
+    // The only worker stops here, so what follows cannot be handed to one.
+    EXPECT_TRUE(pool.add_task(
+        [&blocker](int n) {
+          blocker();
+          return n;
+        },
+        0, [](int) {}));
+    ASSERT_TRUE(wait_for([&blocker] { return blocker.arrived() == 1; }, 2s))
+        << "the worker never reached the gate, so the task below was not queued";
+
+    EXPECT_TRUE(pool.add_task([](int n) { return n * 2; }, 21,
+                              [&reported](int result) { reported.store(result); }));
+
+    EXPECT_EQ(pool.pending(), 1u) << "the task did not wait in the queue";
+
+    blocker.open();
+  }
+
+  EXPECT_EQ(reported.load(), 42) << "a task run from the queue never notified its callback";
+}
+
+TEST(executor_tests, a_void_task_notifies_that_it_finished) {
+  // The half no earlier case covered, and the reason a task's callback is required rather than
+  // inferred: a task with no result still has a completion to report.
+  constexpr int task_count = 8;
+  std::atomic_int notified = {0};
+
+  {
+    executor pool(2);
+    pool.start();
+
+    for (int i = 0; i < task_count; ++i) {
+      EXPECT_TRUE(pool.add_task([] {}, [&notified] { notified.fetch_add(1); }));
+    }
+  }
+
+  EXPECT_EQ(notified.load(), task_count) << "a void task finished without saying so";
+}
+
+TEST(executor_tests, the_queue_keeps_both_kinds_in_the_order_they_arrived) {
+  // The promise this pool makes and async's queue does not: one container, so an action posted
+  // before a task runs before it. The single worker is held at the gate, so everything below it
+  // waits in pending_ and comes out in order.
+  using int_executor = untangle::executor<std::function<int(int)>>;
+
+  std::mutex order_mutex;
+  std::vector<std::string> order;
+  const auto note = [&order_mutex, &order](std::string what) {
+    std::lock_guard<std::mutex> lock(order_mutex);
+    order.push_back(std::move(what));
+  };
+
+  gate blocker;
+
+  {
+    int_executor pool(1);
+    pool.start();
+
+    EXPECT_TRUE(pool.add_action(
+        [&blocker](int n) {
+          blocker();
+          return n;
+        },
+        0));
+    ASSERT_TRUE(wait_for([&blocker] { return blocker.arrived() == 1; }, 2s))
+        << "the worker never reached the gate, so nothing below it was queued";
+
+    EXPECT_TRUE(pool.add_action(
+        [&note](int n) {
+          note("action 1");
+          return n;
+        },
+        1));
+    EXPECT_TRUE(pool.add_task(
+        [&note](int n) {
+          note("task 2");
+          return n;
+        },
+        2, [](int) {}));
+    EXPECT_TRUE(pool.add_action(
+        [&note](int n) {
+          note("action 3");
+          return n;
+        },
+        3));
+
+    EXPECT_EQ(pool.pending(), 3u) << "pending() does not count both kinds";
+
+    blocker.open();
+  }
+
+  std::lock_guard<std::mutex> lock(order_mutex);
+  EXPECT_THAT(order, testing::ElementsAre("action 1", "task 2", "action 3"))
+      << "the queue reordered the two kinds rather than keeping them as they arrived";
+}
+
+TEST(executor_tests, a_task_that_throws_does_not_notify_and_reaches_the_caller) {
+  // Finished does not mean failed, through the pool's own reporting seam: no result to hand over,
+  // so no notification, and what it threw goes to on_task_error as a failing action's does.
+  using int_executor = untangle::executor<std::function<int(int)>>;
+
+  std::atomic_bool notified = {false};
+  std::atomic_int reported_errors = {0};
+
+  {
+    int_executor pool(1);
+    pool.on_task_error = [&reported_errors](std::exception_ptr) {
+      reported_errors.fetch_add(1, std::memory_order_relaxed);
+    };
+    pool.start();
+
+    EXPECT_TRUE(pool.add_task([](int) -> int { throw std::runtime_error("task failed"); }, 1,
+                              [&notified](int) { notified = true; }));
+  }
+
+  EXPECT_EQ(reported_errors.load(), 1) << "what the task threw never reached on_task_error";
+  EXPECT_FALSE(notified.load()) << "a task that threw reported as though it had finished";
 }
 
 /**
@@ -816,7 +980,7 @@ TEST(executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
     pool.start();
 
     for (int i = 0; i < tasks_per_round; ++i) {
-      pool.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+      pool.add_action([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
     }
 
     // Deliberately no wait: a backed-up queue is what puts workers inside take_next_task().

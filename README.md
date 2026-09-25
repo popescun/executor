@@ -37,23 +37,24 @@ int main() {
   pool.start();
 
   for (int i = 0; i < 100; ++i) {
-    pool.add_task([i] { work(i); });
+    pool.add_action([i] { work(i); });
   }
 
   return 0;  // ~executor finishes what was added, then stops the workers
 }
 ```
 
-## the task type
+## the action type
 
-The pool is a template on the task it runs, the way an `execution` is a template on its action. One
-pool runs one signature, and the caller names it:
+The pool is a template on the callable it runs, the way an `execution` is — and on the same
+parameter name, because both kinds of queued work are that one callable. One pool runs one
+signature, and the caller names it:
 
 ```c++
 untangle::executor<std::function<int(void)>> pool(4);   // returns are run and dropped
 ```
 
-The task type does not have to be a `std::function`. What an `execution` requires of it is a nested
+The action type does not have to be a `std::function`. What an `execution` requires of it is a nested
 `result_type`, which it reads rather than deduces, so any callable declaring one will do — and a
 pool built on such a callable never touches `std::function::result_type`, which the standard removed
 in C++20 and both libc++ and libstdc++ still supply by grace rather than contract.
@@ -67,23 +68,54 @@ struct my_task {
 untangle::executor<my_task> pool(4);
 ```
 
-A task type may take arguments, and `add_task()` binds them the way `execution::add_action()` does —
+An action type may take arguments, and `add_action()` binds them the way its namesake `execution::add_action()` does —
 at the door, where the caller still holds them:
 
 ```c++
 untangle::executor<std::function<int(int)>> pool(4);
 pool.start();
-pool.add_task([](int n) { return n * 2; }, 21);
+pool.add_action([](int n) { return n * 2; }, 21);
 ```
 
 What waits for a worker is one callable carrying its own arguments, so nothing about a task changes
-between the queue and the worker that runs it. The arguments are **copied** at `add_task()` and
+between the queue and the worker that runs it. The arguments are **copied** at `add_action()` and
 handed to the task as the pool's own lvalues when it runs: a task is called later, possibly much
 later, and what the caller passed may be gone by then. A task taking `int&` therefore mutates the
 pool's copy, which the caller never sees.
 
 A task that cannot be called with the arguments given is refused by a `static_assert` in
-`add_task()`, rather than by an error from inside the binding.
+`add_action()`, rather than by an error from inside the binding.
+
+## tasks: work that reports back
+
+Everything above queues work through `add_action()`, which is fire and forget: it runs, what it returns is dropped, and the caller hears nothing more about it. `add_task()` carries the callback it must notify:
+
+```c++
+untangle::executor<std::function<int(int)>> pool(4);
+pool.start();
+
+// the callback comes last, after the arguments the task is bound to
+pool.add_task([](int n) { return n * 2; }, 21, [](int result) { /* result == 42 */ });
+```
+
+Work that returns `void` still reports that it finished, with a callback taking nothing — *finished* is the message and the result is optional:
+
+```c++
+untangle::executor<std::function<void(void)>> pool(4);
+pool.add_task([] { /* ... */ }, [] { /* finished */ });
+```
+
+**The callback is the last argument, and the signature cannot say so.** A parameter pack cannot be followed by a deducible parameter, so it arrives inside the arguments and `untangle::bind_task()` splits it off. It must be callable with the task's result and return nothing — or callable with nothing at all, when the task returns void. A missing or unusable one is a compile error rather than silence.
+
+**Both doors share one queue, and the order out is the order in.** An action posted before a task runs before it. The pool can promise that because it owns one container; `async::execution`, which the workers are, fires every action in a pass before any task, so its ordering across the two kinds differs. Only the pool's own order is a promise to a caller of the pool.
+
+**`pending()` counts both kinds**, as it always counted work waiting for a worker.
+
+**A refused task does not notify.** `add_task()` answers `false` under exactly the conditions `add_action()` does — before `start()`, after `stop()`, once the destructor has begun, or if the worker it was offered to has stopped — and a refused task is destroyed rather than queued. The answer is the whole report, so a caller waiting on the callback rather than on the answer would wait for ever. The same is true of work still queued when a stopped pool is destroyed: it never runs, so it never notifies, and the count on stderr is all there is.
+
+**Finished does not mean failed.** A task that throws is *not* notified: there is no result to hand over, and for a void task no completion to report either. What it threw goes to `on_task_error`, as a failing action's does. And because a callback runs inside the same `try` as the task that owns it, `on_task_error` can fire for a task that in fact succeeded — the work was done and only the telling failed.
+
+**A callback runs on a worker's thread**, inside that worker's drain, and several may be running at once on different workers. It is the same rule `on_task_error` carries, for the same reason: nothing may escape it.
 
 ## how work is placed
 
@@ -98,7 +130,7 @@ raised by `execution` the moment its list empties — it takes the front of the 
 what spreads the work, with no scheduling logic of its own: 400 tasks over 4 workers come out
 100/100/100/100.
 
-**A worker is asked, not tracked.** `execution::is_busy()` is what `add_task()` reads to find a free
+**A worker is asked, not tracked.** `execution::is_busy()` is what `add_action()` reads to find a free
 worker and what the destructor reads to decide the pool is idle. A tally kept here would be the
 pool's belief about its workers; this is the workers' own answer, and it cannot drift.
 
@@ -126,14 +158,14 @@ A pool destroyed while stopped is the exception: its queue can never empty, beca
 worker takes from it, so the destructor does not wait for it. Whatever is left is reported on
 stderr and dropped.
 
-**`add_task()` says whether the task was taken.** It returns false before `start()`, after `stop()`,
+**`add_action()` says whether the task was taken.** It returns false before `start()`, after `stop()`,
 and once the destructor has begun. It returns false again if the worker it was offered to has
 stopped. A refused task is destroyed rather than queued, so a false answer means it will not run.
 
 **A task that is still running is refused too**, and that is chosen rather than incidental. A pool
 shutting down is waiting for exactly that task, so it is tempting to let the work it spawns through
 — but then a task that re-adds itself could keep the shutdown from ever ending. One rule instead: a
-pool that is not running takes no work, whoever is asking. `add_task()` answers false inside the
+pool that is not running takes no work, whoever is asking. `add_action()` answers false inside the
 task, so it can tell.
 
 **A task that throws does not take the worker with it**, and what it threw is not lost. The worker
@@ -152,7 +184,7 @@ pool.on_task_error = [](std::exception_ptr thrown) {
 ```
 
 It carries a `std::exception_ptr` because a task may throw something that is not a `std::exception`,
-and that is the case most worth hearing about. Assign it before the first `add_task()` — a worker
+and that is the case most worth hearing about. Assign it before the first `add_action()` — a worker
 reads it — and expect it on a worker's thread, with more than one worker possibly inside it at once.
 Leave it unset and the pool warns on stderr instead, naming the worker.
 
