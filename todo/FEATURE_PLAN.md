@@ -10,9 +10,8 @@ separates a task from an action rather than a restriction laid on top. The callb
 argument**, taken by position rather than recognised by type, and it is **not** forwarded to the
 task's action.
 
-**Status (2026-09-25) — steps 1, 2 and 5 are done, 32 of 32 and 5 of 5 green; steps 3 and 4 were
-merged into step 2. `actuator` and `async` are both closed and bumped. Only step 6's commits are
-left.** This is a feature plan, not a fix plan. Claims marked **PROBED** were compiled and run on
+**Status (2026-09-25) — CLOSED. Committed as `e784324`: steps 1, 2, 5 and 6 done, 32 of 32 and 5
+of 5 green; steps 3 and 4 were merged into step 2. All three repos in the chain are closed.** This is a feature plan, not a fix plan. Claims marked **PROBED** were compiled and run on
 2026-09-24/25; the rest are read-only and say so.
 
 **Baseline.** `executor` at `c2bf9f0`, `async` at `985a991`, `actuator` at `a8b8b47`. Sites are line
@@ -90,12 +89,12 @@ notifying door builds an `untangle::task<R>` through `untangle::bind_task()` ins
 
 | # | Step | Sites | Evidence |
 |---|---|---|---|
-| 1 ✅ | `add_task()` renamed `add_action()`, at 51 call sites | `:145-179`, tests, `README.md` | CONFIRMED (27 + 5 green) — **DONE** (`e87da41`) |
-| 2 ✅ | one FIFO queue, two kinds, `add_task()`, and the cases | `:193-229`, `:326-344`, `:377-395`, `:403-414` | CONFIRMED (5 cases) — **DONE** (`e87da41`) |
+| 1 ✅ | `add_task()` renamed `add_action()`, at 51 call sites | `:145-179`, tests, `README.md` | CONFIRMED (27 + 5 green) — **DONE** (`e784324`) |
+| 2 ✅ | one FIFO queue, two kinds, `add_task()`, and the cases | `:193-229`, `:326-344`, `:377-395`, `:403-414` | CONFIRMED (5 cases) — **DONE** (`e784324`) |
 | 3 | — merged into step 2, see below | — | — |
 | 4 | — merged into step 2, see below | — | — |
-| 5 ✅ | `on_task_error`, the callback's thread, the destructor, and `README.md` | `:87-96`, `:288-308`, `README.md` | transcription — **DONE** (`e87da41`) |
-| 6 | `README.md`, `tools/make_doc.sh`, `FIX_PLAN.md` step 21, and the commits | `doc/` | — |
+| 5 ✅ | `on_task_error`, the callback's thread, the destructor, and `README.md` | `:87-96`, `:288-308`, `README.md` | transcription — **DONE** (`e784324`) |
+| 6 ✅ | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **DONE** (`e784324`) |
 
 ### Step 1 ✅ · `add_task()` renamed `add_action()` — DONE
 
@@ -212,6 +211,29 @@ rather than either kind.
 > rename, and did not audit it against those four. Whether the README is now correct about them is
 > **unverified**, and remains that step's to answer.
 
+### Step 6 ✅ · the reference and the commits — DONE
+
+**`README.md` and `doc/refman.pdf`** were done in step 5 and rebuilt at every step before it — 25
+pages when step 1 started, 29 now. **The commits** are `e784324`, carrying steps 1, 2 and 5
+together: the header, the five cases, `README.md` and the reference.
+
+**No bump.** `executor` is the top of the chain; nothing records it. The two it takes are already
+made — `25bf0ec` for `async` at `d90b28f`, and the actuator's inside that.
+
+> **`FIX_PLAN.md` step 21 is struck from this step and stays open in its own plan.** It asks
+> whether `README.md` states behaviour that *that* plan's steps 4, 5, 7 and 13 change. This feature
+> rewrote the same file for a different reason and did not audit it against those four. Listing it
+> here would have made this step wait on an answer it was never going to give — the same shape the
+> actuator's and async's step 7 had, where a bump belonging to another repo kept a step from
+> closing on its own terms.
+
+**One thing this plan got wrong four times, and it is worth the paragraph.** The hash was written
+into the plan and then swept into the commit it names — `e87da41` became `e784324` under an amend
+fixing a typo in the subject, and the citations inside that very commit were stale the moment it
+landed. The actuator's plan did it three times before that. **A plan's own update belongs in a
+later commit**, not because of bookkeeping etiquette but because it is the only shape in which the
+number can be true: a commit cannot contain its own hash, and an amend rewrites it after the fact.
+
 ## Order
 
 actuator → async → executor, each green and bumped before the next. Within this repo step 1 is a
@@ -243,11 +265,19 @@ the chain.
 |---|---|
 | `1b4e2e1` | — this plan, in its pre-decision form |
 | `25bf0ec` | — `async` bumped to `d90b28f`, the tip whose plan is closed |
-| `e87da41` | 1, 2 and 5 — the two doors, one queue, `actionT`, 5 cases, `README.md` and the reference |
+| `e784324` | 1, 2 and 5 — the two doors, one queue, `actionT`, 5 cases, `README.md` and the reference |
 
-**NEXT: step 6**, and only its commits. `tools/make_doc.sh` has run at every step and `README.md`
-is current for this feature. **`FIX_PLAN.md` step 21 stays open and is not this plan's** — it asks
-a different question about the same file.
+**CLOSED.** Every step is done or merged, and all of it is in `e784324`. 32 of 32 and 5 of 5 green,
+clang-format clean, doxygen clean, `README.md` and `doc/refman.pdf` current.
+
+**The chain is complete.** `actuator` at `ef93437` (99 of 99), `async` at `d90b28f` (62 of 62),
+`executor` at `e784324` — 53 cases across the three, and the defect that started it is gone: a
+trailing `std::function<void(R)>` silently dropped by every queueing layer. The two cases written
+on 2026-09-24 against the abandoned shape are green in the shape that was chosen — callback last,
+required, not forwarded to the action, and `void()` for work that produces nothing.
+
+**`FIX_PLAN.md` step 21 remains open**, and is not this plan's: it asks a different question about
+the same file.
 
 ## Appendix — the three cases, in the shape decided on 2026-09-25
 
