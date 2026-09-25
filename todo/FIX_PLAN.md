@@ -128,6 +128,8 @@ returns something give back — so read those two before deciding what it means 
 | `2814742` | — `async` submodule to `22c5892`, which removed `execution_poll::get()` |
 | `032da65` | 4 — both destructor waits report the workers they are still waiting on |
 | `9daec8b` | 22 — `executor` templated on its task type, `async::execution` written once |
+| `5ff377b` | 27 — a task's arguments bound at the door, so the pool runs any signature |
+| `11d6b12` | 21 — the README caught up with steps 4, 5, 7, and told about 13 |
 
 ## Step index
 
@@ -162,11 +164,11 @@ returns something give back — so read those two before deciding what it means 
 | 26 ✅ | 23 | construction starts the workers, and nothing else can | `:187`, `:205`, `:89-99` | CONFIRMED (tests) — `start()` added |
 | **Group 7 — the task type** |
 | 22 ✅ | 19 | `task_t` is fixed at `std::function<void(void)>` | `:45`, `:51`, `:202` | CONFIRMED (probe, tests) — fixed `9daec8b` |
-| 27 ✅ | 24 | a task type that takes arguments is refused, and step 22 ruled that unfixable | `:42`, `:265`, `:371` | CONFIRMED (tests, probe) — fixed, hash pending |
+| 27 ✅ | 24 | a task type that takes arguments is refused, and step 22 ruled that unfixable | `:42`, `:265`, `:371` | CONFIRMED (tests, probe) — fixed (`5ff377b`) |
 | **Group 6 — the suite** |
 | 19 | — | the sanitizers have never been run against the suite | `.github/workflows/ci.yml` | — |
 | 20 ✅ | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp:457` | — |
-| 21 ✅ | — | README and the reference state behaviour the fixes will change | `README.md` | audited and written 2026-09-25 — **DONE**, hash pending |
+| 21 ✅ | — | README and the reference state behaviour the fixes will change | `README.md` | audited and written 2026-09-25 — **DONE** (`11d6b12`) |
 
 ---
 
@@ -990,7 +992,7 @@ throws while constructing, and step 3 has since been closed as not a defect — 
 already stops and waits for every worker started before the throw, and a probe shows it. There is no
 remaining finding that repeated *construction* failure would observe.
 
-### Step 21 ✅ — README and the reference state behaviour the fixes will change — DONE
+### Step 21 ✅ — README and the reference state behaviour the fixes will change — DONE (`11d6b12`)
 `README.md` · audited 2026-09-25
 
 The README describes the pool as it is today, including the drain and the refusal. Steps 4, 5, 7
