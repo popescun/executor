@@ -158,6 +158,25 @@ A pool destroyed while stopped is the exception: its queue can never empty, beca
 worker takes from it, so the destructor does not wait for it. Whatever is left is reported on
 stderr and dropped.
 
+**Both waits are unbounded, and both say so while they last.** A task that never returns would
+otherwise leave the destructor silent for ever, so it reports instead — the first wait naming who
+is still inside a task, the second naming whose thread has not left:
+
+```
+executor: still waiting to finish after 1s - 1 queued, 2 in a task: pool_worker_0, pool_worker_1
+executor: still waiting to finish after 3s - 0 queued, 1 in a task: pool_worker_1
+executor: still waiting to stop after 1s - 1 not left its thread: pool_worker_1
+```
+
+The interval starts at a second and doubles to a ceiling of thirty, so a stuck teardown says
+something almost at once without a long one becoming a flood. The two waits are kept apart because
+they answer different questions: a worker can be idle and still be in its thread.
+
+Bounding either wait was never available. Returning early while a worker is still in a task is a
+use-after-free, and a bounded wait only moves the hang into `~execution()`, which spins on its own
+running state with no timeout. Workers are detached and `async::execution` has no cancellation, so
+a pool cannot outlive a task it cannot interrupt. What can be fixed is the silence.
+
 **`add_action()` says whether the task was taken.** It returns false before `start()`, after `stop()`,
 and once the destructor has begun. It returns false again if the worker it was offered to has
 stopped. A refused task is destroyed rather than queued, so a false answer means it will not run.
@@ -188,8 +207,15 @@ and that is the case most worth hearing about. Assign it before the first `add_a
 reads it — and expect it on a worker's thread, with more than one worker possibly inside it at once.
 Leave it unset and the pool warns on stderr instead, naming the worker.
 
-A *return value* is still not collected: a continuous worker keeps none, so a task with something to
-report carries its own channel.
+**That name is not unique between pools.** Workers are named by index — `pool_worker_0`,
+`pool_worker_1` — so two pools in one process each have a `pool_worker_0`, and every warning that
+names one is ambiguous: the failure reports above, and the destructor's waits alike. With a single
+pool the name says which worker; with two it does not. Assigning `on_task_error` sidesteps it for
+failures, since the handler is the pool's own and the warning is replaced.
+
+A *return value* is still not collected: a continuous worker keeps none. Work with something to
+report carries its own channel, which is what `add_task()` is for — see *tasks: work that reports
+back* above.
 
 ## building the tests
 

@@ -166,7 +166,7 @@ returns something give back — so read those two before deciding what it means 
 | **Group 6 — the suite** |
 | 19 | — | the sanitizers have never been run against the suite | `.github/workflows/ci.yml` | — |
 | 20 ✅ | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp:457` | — |
-| 21 | — | README and the reference state behaviour the fixes will change | `README.md` | — |
+| 21 ✅ | — | README and the reference state behaviour the fixes will change | `README.md` | audited and written 2026-09-25 — **DONE**, hash pending |
 
 ---
 
@@ -990,8 +990,8 @@ throws while constructing, and step 3 has since been closed as not a defect — 
 already stops and waits for every worker started before the throw, and a probe shows it. There is no
 remaining finding that repeated *construction* failure would observe.
 
-### Step 21 — README and the reference state behaviour the fixes will change — OPEN
-`README.md` · —
+### Step 21 ✅ — README and the reference state behaviour the fixes will change — DONE
+`README.md` · audited 2026-09-25
 
 The README describes the pool as it is today, including the drain and the refusal. Steps 4, 5, 7
 and 13 change what is true. The reference is generated, so it follows the header; the README does
@@ -999,6 +999,28 @@ not follow anything.
 
 > Last, once group 1 and group 2 have landed. Rewriting it per step is how it goes stale in the
 > middle.
+
+**Audited 2026-09-25**, against each of the four steps named above. The tasks feature rewrote the
+same file for its own reasons, which is what prompted the check — a different question about the
+same file, and not an answer to this one.
+
+| Step | README | |
+|---|---|---|
+| 5 — a task that throws reaches the caller | **current** | *lifetime and failure* carries `on_task_error` in full: the example, why it is a `std::exception_ptr`, the worker-thread warning, and the stderr fallback |
+| 7 — work spawned by an in-flight task is refused | **current** | "A task that is still running is refused too", with the reasoning rather than only the rule |
+| 4 — the destructor waits, and reports while it waits | **now current** | it was the one real gap: the README said it waits and stopped there, omitting the reports, which are step 4's actual deliverable. *lifetime and failure* now carries both, with sample output, the 1s-doubling-to-30s interval, why the two waits are kept apart, and why bounding either was never available |
+| 13 — worker names collide between pools | **unfixed, and now said so** | the README leaned on those names — "the pool warns on stderr instead, **naming the worker**" — while pointing a reader with two pools at an ambiguous identifier. *lifetime and failure* now states the collision outright, names the reports it makes ambiguous, and gives the one thing a caller can do about it today: assign `on_task_error`, which replaces the warning with a handler that is the pool's own |
+
+**Both paragraphs are written, and this step is done.** Every one of the four it named is now
+stated where a reader meets it. Step 13 is documented rather than fixed — deliberately: a caveat
+costs a paragraph and helps today, while the fix costs a constructor parameter and is that step's
+own to make. When it lands, this paragraph is what it deletes.
+
+**One stale claim was found and corrected while auditing**: "a task with something to report
+carries its own channel" was written when the pool had no such channel. It now points at
+`add_task()`. That line was missed by the tasks feature's own documentation pass, which rewrote the
+sections around it — a reminder that a file rewritten for one reason does not get audited for the
+others by accident.
 
 ---
 
