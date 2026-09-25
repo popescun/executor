@@ -6,9 +6,9 @@ to its arguments *and* to the callback it must notify — and be told when it fi
 result if it has one.
 
 **A task without a callback does not exist.** Decided 2026-09-25 in the actuator, and it is what
-separates a task from an action rather than a restriction laid on top. The callback is a named
-parameter, not a trailing argument the pool infers, and it is **not** forwarded to the task's
-action.
+separates a task from an action rather than a restriction laid on top. The callback is the **last
+argument**, taken by position rather than recognised by type, and it is **not** forwarded to the
+task's action.
 
 **Status (2026-09-25) — nothing written, two cases written against the wrong shape, blocked on two
 repos.** This is a feature plan, not a fix plan. Claims marked **PROBED** were compiled and run on
@@ -63,7 +63,7 @@ real parameter of the action's own signature or the call does not compile.
 | Door | Signature | Notifies |
 |---|---|---|
 | `add_action()` | `add_action(task, args...)` | no — fire and forget, exactly today's behaviour |
-| `add_task()` | `add_task(task, callback, args...)` | yes, always, on a normal return |
+| `add_task()` | `add_task(task, args..., callback)` | yes, always, on a normal return |
 
 So the existing method is **renamed** `add_action()` and `add_task()` becomes the new
 callback-carrying one. It restores step 23's intent rather than reversing it: the pool's
@@ -92,7 +92,7 @@ notifying door builds an `untangle::task<R>` through `untangle::bind_task()` ins
 |---|---|---|---|
 | 1 | `add_task()` renamed `add_action()`, at 52 call sites | `:171`, tests | naming decision |
 | 2 | one FIFO queue, two kinds of entry | `:422`, `:323`, `:341-360` | **OPEN, see below** |
-| 3 | `add_task(task, callback, args...)` onto `execution::add_task()` | beside `:171` | read-only |
+| 3 | `add_task(task, args..., callback)` onto `execution::add_task()` | beside `:171` | read-only |
 | 4 | the two cases go green | `test/executor_tests.cpp` | **to be rewritten, see below** |
 | 5 | `on_task_error`, the callback's thread, and what a refused task does not say | `:225-236`, `README.md` | decision |
 | 6 | the `async` bump, `tools/make_doc.sh`, and `FIX_PLAN.md` step 21 | `doc/` | — |
@@ -126,7 +126,7 @@ They are uncommitted, and this plan's appendix carries the **new** shape. Two wa
 | Route | Cost |
 |---|---|
 | **Clean the tree; add the appendix cases at step 3** | the suite stays 27 of 27 green for the whole chain; the cases live in this file, committed, until there is an API for them to compile against |
-| Rewrite them in place now | the binary stops compiling — `add_task(task, callback, args...)` does not exist — so all 27 other cases stop running too, for the length of a three-repo chain |
+| Rewrite them in place now | the binary stops compiling — a three-argument `add_task()` does not exist — so all 27 other cases stop running too, for the length of a three-repo chain |
 
 **The first.** The old plan's own note anticipated it: the cases are quoted in full below, so the
 tree can be cleaned without losing them. The repo's precedent for leaving non-compiling cases live
@@ -188,10 +188,14 @@ the chain.
 
 **NEXT: not here.** The actuator's step 1.
 
-## Appendix — the two cases, in the shape decision (B) calls for
+## Appendix — the three cases, in the shape decided on 2026-09-25
 
-Note what is no longer in them: the action signature is `std::function<int(int)>`, with no callback
-parameter, and the callback is handed to `add_task()` in its own place.
+Note what is no longer in them: the action signature is `std::function<int(int)>`, carrying no
+callback parameter of its own. The callback is `add_task()`'s **last** argument, after the task's
+own arguments — which is the call shape the abandoned convention had, for an entirely different
+reason. There it was a trailing argument recognised by its type and silently ignored when the type
+was wrong; here it is the last argument by position, required, and a `static_assert` when it cannot
+serve.
 
 ```c++
 /**
@@ -215,7 +219,7 @@ TEST(executor_tests, a_task_notifies_its_callback_with_the_result) {
           ran = true;
           return n * 2;
         },
-        [&reported](int result) { reported.store(result); }, 21));
+        21, [&reported](int result) { reported.store(result); }));
   }
 
   ASSERT_TRUE(ran.load()) << "the task itself never ran";
@@ -239,12 +243,12 @@ TEST(executor_tests, a_callback_survives_the_queue) {
     pool.start();
 
     // The only worker stops here, so what follows cannot be handed to one.
-    EXPECT_TRUE(pool.add_task([&blocker](int n) { blocker(); return n; }, [](int) {}, 0));
+    EXPECT_TRUE(pool.add_task([&blocker](int n) { blocker(); return n; }, 0, [](int) {}));
     ASSERT_TRUE(wait_for([&blocker] { return blocker.arrived() == 1; }, 2s))
         << "the worker never reached the gate, so the task below was not queued";
 
-    EXPECT_TRUE(pool.add_task([](int n) { return n * 2; },
-                              [&reported](int result) { reported.store(result); }, 21));
+    EXPECT_TRUE(pool.add_task([](int n) { return n * 2; }, 21,
+                              [&reported](int result) { reported.store(result); }));
 
     EXPECT_EQ(pool.pending(), 1u) << "the task did not wait in the queue";
 
