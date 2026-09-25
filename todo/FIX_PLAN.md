@@ -167,7 +167,7 @@ returns something give back — so read those two before deciding what it means 
 | 27 ✅ | 24 | a task type that takes arguments is refused, and step 22 ruled that unfixable | `:42`, `:265`, `:371` | CONFIRMED (tests, probe) — fixed (`5ff377b`) |
 | **Group 6 — the suite** |
 | 19 | — | the sanitizers have never been run against the suite | `.github/workflows/ci.yml` | — |
-| 20 ✅ | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp:457` | — |
+| 20 ✅ | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp:457`, `:1008` | extended 2026-09-25 for the task door |
 | 21 ✅ | — | README and the reference state behaviour the fixes will change | `README.md` | audited and written 2026-09-25 — **DONE** (`11d6b12`) |
 
 ---
@@ -964,7 +964,7 @@ aborted under `tsan` on this same toolchain before the change.
 > closed on evidence from the toolchain that never reported the race. **Then the job itself**: the
 > CI workflow still has no sanitizer build, so both passes so far have been run by hand.
 
-### Step 20 ✅ — the suite has no case that runs the pool hard — DONE (`b68cc97`)
+### Step 20 ✅ — the suite has no case that runs the pool hard — DONE (`b68cc97`, extended 2026-09-25)
 `test/executor_tests.cpp:457` · —
 
 Every case is deterministic and short, which is what makes them reportable. None of them puts the
@@ -986,6 +986,31 @@ It is bounded rather than off by default — ~2.8s under TSan, the slowest case 
 runs at 4 workers, not above the core count. A probe at 16 workers and 200 rounds was used while
 diagnosing step 2 and is not what was committed; those numbers are where to start if a later step
 needs a wider window than this case opens.
+
+**Extended 2026-09-25, for the second door.** The tasks feature gave the pool an `add_task()`
+beside `add_action()`, both feeding one queue, so this case covered half of what it used to cover
+whole. **`destroying_a_pool_with_tasks_queued_does_not_race_their_callbacks`** is the same shape
+through the other door: 50 rounds, 4 workers, 64 tasks each, scope left without waiting — and now
+every task is also notifying a callback on its own thread while the destructor runs, several at
+once.
+
+**It asserts three things, and the two extra ones are why it exists:**
+
+| Assertion | Catches |
+|---|---|
+| `ran == rounds * tasks_per_round` | what the older case catches |
+| `notified == ran` | a dropped notification — a task that ran and never called back is invisible to a count of runs |
+| `mismatched == 0` | crossed wiring: each task is bound to its index and each callback checks it got `i * 2`, so a callback paired with another task's result fails loudly |
+
+The third is the one a shared queue running several tasks at once could actually produce, and
+nothing else in the suite would see it.
+
+**TSan, macOS/libc++, 2026-09-25: 33 of 33, zero warnings, zero data races**, suite at 10.4s. That
+run is also what exposed the gap — the feature's own five cases are single- or dual-worker and none
+of them destroys a pool with tasks still queued, so the new notification path had never been under
+churn. **The gap was found after the feature plan closed**, which is the argument for running the
+sanitizer as a step rather than as an afterthought; see step 19, still open for the Linux/libstdc++
+half.
 
 **The construction half of this step is no longer owed.** It was kept partly for step 3, a pool that
 throws while constructing, and step 3 has since been closed as not a defect — member destruction

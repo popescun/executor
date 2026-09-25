@@ -988,3 +988,58 @@ TEST(executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
 
   EXPECT_EQ(ran.load(), rounds * tasks_per_round);
 }
+
+/**
+ * @brief Destroying a pool with tasks still queued does not race the callbacks they carry.
+ *
+ * The same shape as destroying_a_pool_under_load_does_not_race_its_workers, with the other door:
+ * the queue is backed up when the destructor starts, so workers are inside take_next_task() as it
+ * reaches the executions - and now each one is also notifying a callback on its own thread while
+ * that happens. Several callbacks run at once, on different workers, touching the same counter.
+ *
+ * @attention Sanitizer-sensitive, and only under -DEXECUTOR_SANITIZE=thread. A plain build cannot
+ * observe the race and ASan does not report it, so passing on either proves nothing.
+ *
+ * @remark What it states on any build is the accounting: every task added before the scope closed
+ * has run **and** notified by the time the destructor returns, and the two counts agree. A callback
+ * that was skipped shows up as the second count falling short of the first, which no count of runs
+ * alone would catch.
+ */
+TEST(executor_tests, destroying_a_pool_with_tasks_queued_does_not_race_their_callbacks) {
+  using int_executor = untangle::executor<std::function<int(int)>>;
+
+  constexpr int rounds = 50;
+  constexpr int tasks_per_round = 64;
+
+  std::atomic_int ran = {0};
+  std::atomic_int notified = {0};
+  std::atomic_int mismatched = {0};
+
+  for (int round = 0; round < rounds; ++round) {
+    int_executor pool(4);
+    pool.start();
+
+    for (int i = 0; i < tasks_per_round; ++i) {
+      pool.add_task(
+          [&ran](int n) {
+            ran.fetch_add(1, std::memory_order_relaxed);
+            return n * 2;
+          },
+          i,
+          [&notified, &mismatched, i](int result) {
+            // The callback is handed its own task's result, not another's - which a shared queue
+            // running several tasks at once is exactly where it could go wrong.
+            if (result != i * 2) {
+              mismatched.fetch_add(1, std::memory_order_relaxed);
+            }
+            notified.fetch_add(1, std::memory_order_relaxed);
+          });
+    }
+
+    // Deliberately no wait: a backed-up queue is what puts workers inside take_next_task().
+  }
+
+  EXPECT_EQ(ran.load(), rounds * tasks_per_round);
+  EXPECT_EQ(notified.load(), ran.load()) << "a task ran without notifying its callback";
+  EXPECT_EQ(mismatched.load(), 0) << "a callback was handed a result from a different task";
+}
