@@ -949,7 +949,12 @@ TEST(executor_tests, a_task_that_cannot_notify_is_refused) {
     int_executor pool(1);
     pool.start();
 
-    EXPECT_FALSE(pool.add_task([&ran](int n) { ran = true; return n * 2; }, 21, no_callback))
+    EXPECT_FALSE(pool.add_task(
+        [&ran](int n) {
+          ran = true;
+          return n * 2;
+        },
+        21, no_callback))
         << "the pool accepted a task whose callback can never be called";
   }
 
