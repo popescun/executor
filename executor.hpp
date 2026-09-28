@@ -38,10 +38,9 @@ namespace untangle {
  * as its result.
  *
  * @remark **Two kinds of work may be queued, and both are an \p actionT.** \ref add_action() is
- * fire and forget: the work runs, what it returns is dropped, and nothing reports that it finished.
- * \ref add_task() carries the callback it must notify, and reports what the work produced - or,
- * for a callable returning void, merely that it finished. The names and the split are
- * async::execution's, which this is built out of.
+ * fire and forget: what the work returns is dropped, and nothing reports that it finished.
+ * \ref add_task() carries a callback and reports what the work produced - or, for a void callable,
+ * merely that it finished. The names and the split are async::execution's.
  */
 template <typename actionT>
 class executor {
@@ -85,15 +84,13 @@ class executor {
    * Both waits are unbounded, and both report on stderr while they last, naming the workers they
    * are waiting on.
    *
-   * @attention A task still running here is refused if it adds more work, even though this is
-   * waiting for that very task. It is deliberate: a shutdown that took new work could be kept from
-   * ever ending by a task that re-adds itself. \ref add_action() and \ref add_task() answer false,
-   * so the task can see it.
+   * @attention A task still running here is refused if it adds more work, even though this waits
+   * for that very task: a shutdown that took new work could be kept from ever ending by a task
+   * that re-adds itself. \ref add_action() and \ref add_task() answer false, so it can see that.
    *
-   * @attention **Queued work dropped here never runs, so a task dropped here never notifies.** The
-   * count on stderr is the whole report, and a caller waiting on a callback rather than on the
-   * answer would wait for ever. Destroying a pool with work still queued is how that happens; the
-   * destructor says how much was lost but not which.
+   * @attention **Queued work dropped here never runs, so a task dropped here never notifies**, and
+   * a caller waiting on the callback rather than on the answer would wait for ever. The count on
+   * stderr says how much was lost, never which.
    */
   ~executor() {
     // Whether the pool was still running when it was destroyed. A stopped one cannot empty its
@@ -157,28 +154,24 @@ class executor {
   /**
    * @brief Queues a task bound to \p args, or hands it to a worker that has nothing to do.
    *
-   * @remark Named for async::execution::add_action(), which it forwards to and which behaves
-   * the same way: the work runs, what it returns is dropped, and nothing reports that it
-   * finished. The answer below is the last the caller hears.
+   * @remark Named for async::execution::add_action(), which it forwards to and behaves as: what
+   * the work returns is dropped, and nothing reports that it finished. The answer below is the
+   * last the caller hears.
    *
-   * The arguments are bound here, while the caller still holds them, and what waits for a worker is
-   * one callable carrying its own. That is the shape async::execution::add_action() offers at its
-   * door, and it is bound here for the same reason it is bound there: a queue holds callables, and
-   * a call site cannot be queued.
+   * The arguments are bound here, while the caller still holds them, so what waits for a worker is
+   * one callable carrying its own - a queue holds callables, and a call site cannot be queued.
    *
-   * @remark The first free worker takes it, counting from the start, so a pool that is not busy
-   * keeps giving work to the same one. That is the intent: the worker that just ran a task is the
-   * warm one, and a free worker is free whichever it is.
+   * @remark The first free worker takes it, counting from the start, so an idle pool keeps giving
+   * work to the same one: the worker that just ran a task is the warm one.
    *
    * @tparam Args - The argument types to bind to \p task.
    * @param task - The task to run.
-   * @param args - What to bind to it. Copied here and handed to the task as the pool's own lvalues
-   * when it runs, so a task taking a reference is given that copy rather than the caller's object,
-   * which may be gone by then.
+   * @param args - What to bind to it. Copied here and handed over as the pool's own lvalues, so a
+   * task taking a reference is given that copy rather than the caller's object, which may be gone.
    *
-   * @return true - the task was accepted. false - it was refused, by a pool that has not been
-   * started, has been stopped, or is being destroyed, or by a worker that has stopped. Either way
-   * it will not run. A task calling this from a worker thread is answered like any other caller.
+   * @return true - accepted. false - refused by a pool not started, stopped or being destroyed, or
+   * by a stopped worker; either way it will not run. A task calling this from a worker thread is
+   * answered like any other caller.
    */
   template <typename... Args>
   bool add_action(actionT task, Args&&... args) {
@@ -198,31 +191,26 @@ class executor {
   /**
    * @brief Queues work that must report, or hands it to a worker that has nothing to do.
    *
-   * The task runs exactly as one given to \ref add_action() does, and then the callback it was
-   * built with is invoked with what it returned - on the worker's thread, inside the worker's
-   * drain.
+   * The task runs exactly as one given to \ref add_action() does, and the callback it was built
+   * with is then invoked with what it returned, on the worker's thread inside the worker's drain.
    *
-   * @attention **The last argument is the callback**, and this signature cannot say so: a parameter
-   * pack cannot be followed by a deducible parameter, so it arrives inside \p args and
-   * untangle::bind_task() splits it off. It must be callable with the task's result and return
-   * nothing - or callable with nothing at all, when the task returns void, because *finished* is
-   * the message and the result is optional. A missing or unusable one is a static_assert rather
-   * than silence.
+   * @attention **The last argument is the callback**, and this signature cannot say so: a pack
+   * cannot be followed by a deducible parameter, so it arrives inside \p args and
+   * untangle::bind_task() splits it off. It must take the task's result and return nothing - or
+   * take nothing at all for a void task, because *finished* is the message. A missing or unusable
+   * one is a static_assert rather than silence.
    *
    * @attention **Finished does not mean failed.** A task that throws is not notified - there is no
    * result to hand over - and what it threw goes to \ref on_task_error, as a failing action's
    * does. A caller waiting on the callback alone would wait for ever.
    *
-   * @attention **A refused task does not notify either.** The answer below is the whole report.
+   * @attention **A refused task does not notify either**, and the answer below is the whole report.
+   * An **empty** callback is refused too, which its type cannot say: the static_assert asks whether
+   * the callback *can* be called, while a default constructed std::function answers no at run time.
+   * untangle::bind_task() builds an empty task from one, and a task that can neither run nor notify
+   * is turned away here rather than queued to throw on a worker. An empty action goes the same way.
    *
-   * @attention **An empty callback is refused, and its type cannot say so.** The static_assert
-   * above asks whether the callback *can* be called; whether it *is* callable is a run time
-   * question, and a default constructed std::function answers no. untangle::bind_task() builds an
-   * empty task from one, and a task that can neither run nor notify is turned away here rather
-   * than queued to throw on a worker. An empty action is refused for the same reason.
-   *
-   * @remark It shares one queue with \ref add_action(), and the order is the order they arrived:
-   * an action posted before a task runs before it.
+   * @remark It shares one queue with \ref add_action(), and the order is the order they arrived.
    *
    * @tparam Args - The argument types to bind, of which the last is the callback.
    * @param task - The task to run.
@@ -303,22 +291,18 @@ class executor {
    * @brief Called with whatever the work threw. Assigned by the caller.
    *
    * Nothing else reports failed work: \ref add_action() and \ref add_task() have both answered
-   * long before it runs. Left unset, the pool warns on stderr instead.
-   *
-   * @remark It receives a std::exception_ptr, because the work may throw what is not a
-   * std::exception. Rethrow it to read it.
+   * long before it runs. Left unset, the pool warns on stderr instead. It receives a
+   * std::exception_ptr, because the work may throw what is not a std::exception; rethrow it to
+   * read it.
    *
    * @remark **A task's failure arrives here as well, and so does its callback's.** A task that
-   * throws is not notified - there is no result to hand over - so this is the only report it
-   * makes. And because a callback runs inside the same try as the task that owns it, this can fire
-   * for a task that in fact **succeeded**: the work was done and only the telling failed.
+   * throws is not notified, so this is the only report it makes - and because a callback runs
+   * inside the same try as its task, this can fire for a task that in fact **succeeded**: the work
+   * was done and only the telling failed.
    *
-   * @attention It runs on a worker's thread, and several workers may be in it at once. Assign it
-   * before the first \ref add_action() or \ref add_task(), and let nothing escape it.
-   *
-   * @attention **A task's callback runs on a worker's thread too**, under the same rule and for the
-   * same reason - several tasks may be notifying at once, on different workers, and nothing may
-   * escape a callback either.
+   * @attention It runs on a worker's thread, and several workers may be in it at once - as may
+   * several callbacks, which run on a worker's thread for the same reason. Assign it before the
+   * first \ref add_action() or \ref add_task(), and let nothing escape it or a callback.
    */
   std::function<void(std::exception_ptr)> on_task_error;
 
@@ -345,11 +329,11 @@ class executor {
   }
 
   /**
-   * @brief Binds \p args into \p action, making the one callable the queue and the workers take.
+   * @brief Binds \p args into \p task, making the one callable the queue and the workers take.
    *
-   * @remark **The result is dropped here**, which is what an action is. The bound call still
-   * returns whatever \p action returns, and untangle::task_t discards it - a task keeps its result
-   * by handing it to a callback instead, inside the callable untangle::bind_task() seals.
+   * @remark **The result is dropped here**, which is what an action is: the bound call still
+   * returns whatever \p task returns and untangle::task_t discards it, while a task keeps its
+   * result by handing it to a callback inside the callable untangle::bind_task() seals.
    *
    * @remark With no arguments to bind, the action is that callable already, and wrapping it would
    * add a layer to every pool that never had an argument to give.
@@ -407,9 +391,9 @@ class executor {
    * @brief Hands one entry to a worker. Call with the mutex held.
    *
    * @remark **One door for both kinds.** A task notifies from inside the callable rather than
-   * beside it, so there is nothing left for the worker to tell apart: what it is handed runs, and
-   * whether a callback runs at the end of it is the entry's own business. The worker's task door is
-   * for a caller who still has an action and a callback in two pieces, which the pool never does.
+   * beside it, so nothing is left for the worker to tell apart: what it is handed runs, and whether
+   * a callback runs at the end is the entry's own business. The worker's task door is for a caller
+   * still holding an action and a callback in two pieces, which the pool never does.
    *
    * @return true - the worker took it, and is busy from here. false - the worker is stopped and has
    * destroyed the entry, so \p task is gone either way and cannot be put back.
