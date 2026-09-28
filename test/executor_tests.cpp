@@ -935,6 +935,27 @@ TEST(executor_tests, the_queue_keeps_both_kinds_in_the_order_they_arrived) {
       << "the queue reordered the two kinds rather than keeping them as they arrived";
 }
 
+TEST(executor_tests, a_task_that_cannot_notify_is_refused) {
+  // The callback's type is checked at compile time, its emptiness cannot be: an empty std::function
+  // is a callback of the right type that can never be called. untangle::bind_task() builds an empty
+  // task from one, and a task that can neither run nor notify is refused rather than queued - the
+  // answer is the whole report, as it is for a task added to a stopped pool.
+  using int_executor = untangle::executor<std::function<int(int)>>;
+
+  std::atomic_bool ran = {false};
+  std::function<void(int)> no_callback;
+
+  {
+    int_executor pool(1);
+    pool.start();
+
+    EXPECT_FALSE(pool.add_task([&ran](int n) { ran = true; return n * 2; }, 21, no_callback))
+        << "the pool accepted a task whose callback can never be called";
+  }
+
+  EXPECT_FALSE(ran.load()) << "a refused task ran anyway";
+}
+
 TEST(executor_tests, a_task_that_throws_does_not_notify_and_reaches_the_caller) {
   // Finished does not mean failed, through the pool's own reporting seam: no result to hand over,
   // so no notification, and what it threw goes to on_task_error as a failing action's does.

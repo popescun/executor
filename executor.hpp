@@ -215,6 +215,12 @@ class executor {
    *
    * @attention **A refused task does not notify either.** The answer below is the whole report.
    *
+   * @attention **An empty callback is refused, and its type cannot say so.** The static_assert
+   * above asks whether the callback *can* be called; whether it *is* callable is a run time
+   * question, and a default constructed std::function answers no. untangle::bind_task() builds an
+   * empty task from one, and a task that can neither run nor notify is turned away here rather
+   * than queued to throw on a worker. An empty action is refused for the same reason.
+   *
    * @remark It shares one queue with \ref add_action(), and the order is the order they arrived:
    * an action posted before a task runs before it.
    *
@@ -224,8 +230,8 @@ class executor {
    * \ref add_action() copies them, and for the same reason.
    *
    * @return true - the task was accepted, and the callback will be notified when it has run.
-   * @return false - refused, exactly as \ref add_action() is refused, and it will neither run nor
-   * notify.
+   * @return false - refused, because the pool is not running, or because the task could never do
+   * its job. It will neither run nor notify.
    */
   template <typename... Args>
   bool add_task(actionT task, Args&&... args) {
@@ -235,7 +241,17 @@ class executor {
 
     // untangle::bind_task() takes the callback off the end of the pack and checks it; what comes
     // back is one callable that runs the work and then notifies, which is what the queue holds.
-    return queue(untangle::bind_task(std::move(task), std::forward<Args>(args)...));
+    auto built = untangle::bind_task(std::move(task), std::forward<Args>(args)...);
+
+    // An empty one is what bind_task() builds from an empty action or an empty callback. Queued, it
+    // would reach a worker and throw std::bad_function_call there, reporting a failure to whoever
+    // set on_task_error rather than to the caller who could still act on it. The same refusal
+    // untangle::actuator::add_task() makes, made before the queue rather than after.
+    if (!built) {
+      return false;
+    }
+
+    return queue(std::move(built));
   }
 
   /**
@@ -345,8 +361,15 @@ class executor {
     } else {
       // Captured by value and called as lvalues, which is all a call deferred to a worker can
       // promise: whatever was passed to add_action() may be gone by the time this runs.
-      return untangle::task_t(
-          [task = std::move(task), ... args = std::forward<Args>(args)]() mutable { task(args...); });
+      //
+      // One tuple rather than an init-capture pack: a pack expanded into a lambda's init-capture
+      // inside a dependent context is an ICE in GCC 14 (tsubst_pack_expansion), and std::apply says
+      // the same thing in an ordinary expression. untangle::bind_task() was moved off the same
+      // shape for the same reason.
+      return untangle::task_t([task = std::move(task), args = std::tuple<std::decay_t<Args>...>(
+                                                           std::forward<Args>(args)...)]() mutable {
+        std::apply(task, args);
+      });
     }
   }
 
