@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -233,10 +234,8 @@ class executor {
     }
 
     // untangle::bind_task() takes the callback off the end of the pack and checks it; what comes
-    // back is the bound call and the callback, which the pool carries side by side in its queue.
-    auto built = untangle::bind_task(std::move(task), std::forward<Args>(args)...);
-
-    return queue(task_call{std::move(built.call), std::move(built.callback)});
+    // back is one callable that runs the work and then notifies, which is what the queue holds.
+    return queue(untangle::bind_task(std::move(task), std::forward<Args>(args)...));
   }
 
   /**
@@ -330,55 +329,28 @@ class executor {
   }
 
   /**
-   * @brief A task with its arguments already bound: what the pool queues, and what a worker runs.
-   *
-   * @remark It names its own result_type rather than leaving async to read one off a std::function,
-   * whose result_type C++20 removed. A pool built on a caller's own functor therefore still never
-   * touches that typedef, which is what keeps \ref actionT free to be something other than a
-   * std::function.
-   */
-  struct task_call {
-    using result_type = typename actionT::result_type;
-
-    //! What a task of this result type notifies. Empty for an action, which notifies nobody.
-    using callback_t = typename untangle::task_callback_type<result_type>::type;
-
-    result_type operator()() { return call(); }
-
-    std::function<result_type(void)> call;
-
-    /**
-     * @brief The callback to notify, or empty when this entry is an action.
-     *
-     * @remark **Optional here and nowhere else.** A task always has one - untangle::bind_task()
-     * will not build one without it - but the queue carries both kinds, and an action has none. It
-     * is what \ref give_to_worker() reads to choose which door of the worker to use.
-     */
-    callback_t callback;
-  };
-
-  /**
    * @brief Binds \p args into \p action, making the one callable the queue and the workers take.
+   *
+   * @remark **The result is dropped here**, which is what an action is. The bound call still
+   * returns whatever \p action returns, and untangle::task_t discards it - a task keeps its result
+   * by handing it to a callback instead, inside the callable untangle::bind_task() seals.
    *
    * @remark With no arguments to bind, the action is that callable already, and wrapping it would
    * add a layer to every pool that never had an argument to give.
-   *
-   * @remark It leaves task_call::callback empty, which is what makes the entry an action. A task
-   * is built by \ref add_task() through untangle::bind_task(), which fills it.
    */
   template <typename... Args>
-  static task_call bind_action(actionT task, Args&&... args) {
+  static untangle::task_t bind_action(actionT task, Args&&... args) {
     if constexpr (sizeof...(Args) == 0) {
-      return task_call{std::move(task)};
+      return untangle::task_t(std::move(task));
     } else {
       // Captured by value and called as lvalues, which is all a call deferred to a worker can
       // promise: whatever was passed to add_action() may be gone by the time this runs.
-      return task_call{[task = std::move(task), ... args = std::forward<Args>(args)]() mutable ->
-                       typename task_call::result_type { return task(args...); }};
+      return untangle::task_t(
+          [task = std::move(task), ... args = std::forward<Args>(args)]() mutable { task(args...); });
     }
   }
 
-  using worker_execution = untangle::async::execution<task_call>;
+  using worker_execution = untangle::async::execution<untangle::task_t>;
 
   /**
    * @brief Hands one entry to a free worker, or puts it at the back of the queue.
@@ -388,7 +360,7 @@ class executor {
    *
    * @return true - taken. false - a worker refused it, and it is gone.
    */
-  bool queue(task_call call) {
+  bool queue(untangle::task_t call) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // The queue comes first: an entry does not overtake one already waiting in it.
@@ -409,21 +381,19 @@ class executor {
   }
 
   /**
-   * @brief Hands one task to a worker. Call with the mutex held.
+   * @brief Hands one entry to a worker. Call with the mutex held.
+   *
+   * @remark **One door for both kinds.** A task notifies from inside the callable rather than
+   * beside it, so there is nothing left for the worker to tell apart: what it is handed runs, and
+   * whether a callback runs at the end of it is the entry's own business. The worker's task door is
+   * for a caller who still has an action and a callback in two pieces, which the pool never does.
    *
    * @return true - the worker took it, and is busy from here. false - the worker is stopped and has
-   * destroyed the task, so \p task is gone either way and cannot be put back.
+   * destroyed the entry, so \p task is gone either way and cannot be put back.
    */
-  [[nodiscard]] bool give_to_worker(std::size_t index, task_call task) {
-    // Both doors take the worker's action_mutex under mutex_. The two never cycle, because a
-    // worker calls on_finished with its action_mutex released.
-    if (task.callback) {
-      // Taken out first: what the worker is handed is the callable, and the callback beside it as
-      // the last argument, which is where async::execution::add_task() expects to find one.
-      auto callback = std::move(task.callback);
-      return workers_[index]->add_task(std::move(task), std::move(callback));
-    }
-
+  [[nodiscard]] bool give_to_worker(std::size_t index, untangle::task_t task) {
+    // The door takes the worker's action_mutex under mutex_. The two never cycle, because a worker
+    // calls on_finished with its action_mutex released.
     return workers_[index]->add_action(std::move(task));
   }
 
@@ -434,7 +404,7 @@ class executor {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!pending_.empty()) {
-      task_call next = std::move(pending_.front());
+      untangle::task_t next = std::move(pending_.front());
       pending_.pop_front();
 
       if (!give_to_worker(index, std::move(next))) {
@@ -520,7 +490,7 @@ class executor {
   async::execution_poll poll_;
 
   //! Tasks waiting for a worker, each bound to its arguments, in the order added.
-  std::deque<task_call> pending_;
+  std::deque<untangle::task_t> pending_;
   std::vector<std::shared_ptr<worker_execution>> workers_;
   //! False until start(), and false again from stop() or the destructor. Read without the mutex.
   std::atomic_bool running_ = {false};
