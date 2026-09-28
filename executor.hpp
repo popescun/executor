@@ -192,7 +192,7 @@ class executor {
     }
 
     // Bound before the lock: it copies the caller's arguments, and nothing here needs the queue.
-    return queue(bind_action(std::move(task), std::forward<Args>(args)...));
+    return queue_task(bind_action(std::move(task), std::forward<Args>(args)...));
   }
 
   /**
@@ -241,17 +241,17 @@ class executor {
 
     // untangle::bind_task() takes the callback off the end of the pack and checks it; what comes
     // back is one callable that runs the work and then notifies, which is what the queue holds.
-    auto built = untangle::bind_task(std::move(task), std::forward<Args>(args)...);
+    auto action = untangle::bind_task(std::move(task), std::forward<Args>(args)...);
 
     // An empty one is what bind_task() builds from an empty action or an empty callback. Queued, it
     // would reach a worker and throw std::bad_function_call there, reporting a failure to whoever
     // set on_task_error rather than to the caller who could still act on it. The same refusal
     // untangle::actuator::add_task() makes, made before the queue rather than after.
-    if (!built) {
+    if (!action) {
       return false;
     }
 
-    return queue(std::move(built));
+    return queue_task(std::move(action));
   }
 
   /**
@@ -383,7 +383,7 @@ class executor {
    *
    * @return true - taken. false - a worker refused it, and it is gone.
    */
-  bool queue(untangle::task_t call) {
+  bool queue_task(untangle::task_t task) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // The queue comes first: an entry does not overtake one already waiting in it.
@@ -394,12 +394,12 @@ class executor {
         if (!workers_[index]->is_busy()) {
           // A refused entry is already destroyed, and stop() stops every worker together, so there
           // is nothing to queue and no other worker to try.
-          return give_to_worker(index, std::move(call));
+          return give_to_worker(index, std::move(task));
         }
       }
     }
 
-    pending_.push_back(std::move(call));
+    pending_.push_back(std::move(task));
     return true;
   }
 
