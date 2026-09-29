@@ -3,9 +3,7 @@
 /**
  * @brief A thread pool executor built out of untangle::async::execution objects.
  *
- * N workers run in continuous mode behind a shared queue. A task goes straight to a free worker
- * only when the queue is empty; otherwise it joins the back, and a worker takes the front as it
- * frees up.
+ * N workers in continuous mode behind a shared queue. Nothing overtakes what is already queued.
  */
 #pragma once
 
@@ -34,13 +32,9 @@ namespace untangle {
 /**
  * @brief Runs actions and tasks on a fixed pool of untangle::async::execution workers.
  *
- * @tparam actionT The callable the pool runs. One pool runs one signature - its arguments as much
- * as its result.
+ * \ref add_action() drops what the work returns; \ref add_task() carries a callback and reports it.
  *
- * @remark **Two kinds of work may be queued, and both are an \p actionT.** \ref add_action() is
- * fire and forget: what the work returns is dropped, and nothing reports that it finished.
- * \ref add_task() carries a callback and reports what the work produced - or, for a void callable,
- * merely that it finished. The names and the split are async::execution's.
+ * @tparam actionT - The callable the pool runs. One pool runs one signature, arguments and result.
  */
 template <typename actionT>
 class executor {
@@ -49,9 +43,7 @@ class executor {
    * @brief Builds \p worker_count workers. They do not run until \ref start().
    *
    * @param worker_count - How many workers to run. Must not be zero.
-   *
-   * @throws std::invalid_argument - \p worker_count is zero. Such a pool would take work it could
-   * never run.
+   * @throws std::invalid_argument - \p worker_count is zero: such a pool could never run its work.
    */
   explicit executor(std::size_t worker_count) {
     if (worker_count == 0) {
@@ -78,57 +70,34 @@ class executor {
     }
   }
 
-  ~executor() { wait(); }
-
   /**
-   * @brief Finishes what has been added, then stops every worker.
+   * @brief Drains what was added, then stops the workers and destroys them.
    *
-   * Both waits are unbounded, and both report on stderr while they last, naming the workers they
-   * are waiting on.
+   * The drain is \ref wait(); the shutdown after it stops the workers, waits for each to leave its
+   * thread, and destroys them only then. Both waits are unbounded and report on stderr meanwhile.
    *
-   * @attention A task still running here is refused if it adds more work, even though this waits
-   * for that very task: a shutdown that took new work could be kept from ever ending by a task
-   * that re-adds itself. \ref add_action() and \ref add_task() answer false, so it can see that.
+   * @attention Only a pool stopped before its queue emptied leaves work behind, and work dropped
+   * here never runs, so it never notifies. The count on stderr says how much, never which.
    *
-   * @attention **Queued work dropped here never runs, so a task dropped here never notifies**, and
-   * a caller waiting on the callback rather than on the answer would wait for ever. The count on
-   * stderr says how much was lost, never which.
+   * @attention This waits for the pool, not for what its work touched: see \ref wait().
    */
-  void wait() {
-    // Whether the pool was still running when it was destroyed. A stopped one cannot empty its
-    // queue - only a worker takes from it, through on_finished, and a stopped worker raises no more
-    // - so its queue is not waited for.
-    const bool was_running = running_.exchange(false);
+  ~executor() {
+    // Nothing is stopped before this, or the queue could never empty. wait() leaves the pool
+    // accepting, so stop() follows at once: that window is the only one a shutdown would take.
+    wait();
+    stop();
 
     {
-      std::unique_lock<std::mutex> lock(mutex_);
+      std::lock_guard<std::mutex> lock(mutex_);
 
-      // Waits for the queue to empty and every worker to go idle.
-      auto interval = std::chrono::milliseconds(report_first_ms);
-      auto waited = std::chrono::milliseconds(0);
-
-      while (!finished_cv_.wait_for(lock, interval, [this, was_running] {
-        return nothing_running() && (pending_.empty() || !was_running);
-      })) {
-        waited += interval;
-
-        // Under the lock, so the counts agree with the predicate that just failed.
-        std::println(
-            stderr, "executor: still waiting to finish after {}s - {} queued, {} in a task{}",
-            waited.count() / 1000, pending_.size(), count_workers(&worker_execution::is_busy),
-            name_workers(&worker_execution::is_busy));
-
-        interval = std::min(interval * 2, std::chrono::milliseconds(report_max_ms));
-      }
-
+      // Only reachable for a pool that was already stopped. wait() drained a running one, and
+      // stop() above cannot add to the queue.
       if (!pending_.empty()) {
         std::println(stderr,
                      "executor: {} queued task(s) dropped, the pool was stopped before they ran",
                      pending_.size());
       }
     }
-
-    stop();
 
     // Waits for every worker to leave its thread, which is what makes destroying them safe. A
     // different question from the wait above: a worker can be idle and still be in its thread.
@@ -154,26 +123,62 @@ class executor {
   }
 
   /**
+   * @brief Drains everything added so far, then leaves the pool as it was found.
+   *
+   * A barrier, not a shutdown: the workers keep their threads and work added afterwards runs as
+   * before. Reusable. The wait is unbounded and reports on stderr while it lasts.
+   *
+   * @attention New work is refused meanwhile, then accepting is restored, so a task that re-adds
+   * itself cannot keep the drain from ending. Only work accepted before it began counts.
+   *
+   * @attention A pool that is not running is not waited for: only a worker takes from the queue, so
+   * this returns at once and what is queued keeps for the next \ref start().
+   *
+   * @attention It waits for the work, not for what the work touched. Held as a member, ~executor()
+   * runs once the owner's derived parts and later members are gone: call this before that.
+   */
+  void wait() {
+    // Put back exactly as found below: a wait must not leave a stopped pool accepting, and such a
+    // pool cannot empty its queue anyway - only a running worker takes from it.
+    const bool was_running = running_.exchange(false);
+
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+
+      // Waits for the queue to empty and every worker to go idle.
+      auto interval = std::chrono::milliseconds(report_first_ms);
+      auto waited = std::chrono::milliseconds(0);
+
+      while (!finished_cv_.wait_for(lock, interval, [this, was_running] {
+        return nothing_running() && (pending_.empty() || !was_running);
+      })) {
+        waited += interval;
+
+        // Under the lock, so the counts agree with the predicate that just failed.
+        std::println(
+            stderr, "executor: still waiting to drain after {}s - {} queued, {} in a task{}",
+            waited.count() / 1000, pending_.size(), count_workers(&worker_execution::is_busy),
+            name_workers(&worker_execution::is_busy));
+
+        interval = std::min(interval * 2, std::chrono::milliseconds(report_max_ms));
+      }
+    }
+
+    running_ = was_running;
+  }
+
+  /**
    * @brief Queues a task bound to \p args, or hands it to a worker that has nothing to do.
    *
-   * @remark Named for async::execution::add_action(), which it forwards to and behaves as: what
-   * the work returns is dropped, and nothing reports that it finished. The answer below is the
-   * last the caller hears.
-   *
-   * The arguments are bound here, while the caller still holds them, so what waits for a worker is
-   * one callable carrying its own - a queue holds callables, and a call site cannot be queued.
-   *
-   * @remark The first free worker takes it, counting from the start, so an idle pool keeps giving
-   * work to the same one: the worker that just ran a task is the warm one.
+   * Forwards to async::execution::add_action() and behaves as it does: the result is dropped, and
+   * the answer below is the last the caller hears. The first free worker takes it, the warmest one.
    *
    * @tparam Args - The argument types to bind to \p task.
    * @param task - The task to run.
-   * @param args - What to bind to it. Copied here and handed over as the pool's own lvalues, so a
-   * task taking a reference is given that copy rather than the caller's object, which may be gone.
+   * @param args - What to bind. Copied here, so a task taking a reference gets the pool's copy.
    *
-   * @return true - accepted. false - refused by a pool not started, stopped or being destroyed, or
-   * by a stopped worker; either way it will not run. A task calling this from a worker thread is
-   * answered like any other caller.
+   * @return true - accepted. false - refused by a pool not started, stopped, draining or being
+   * destroyed, or by a stopped worker; either way it will not run.
    */
   template <typename... Args>
   bool add_action(actionT task, Args&&... args) {
@@ -193,35 +198,24 @@ class executor {
   /**
    * @brief Queues work that must report, or hands it to a worker that has nothing to do.
    *
-   * The task runs exactly as one given to \ref add_action() does, and the callback it was built
-   * with is then invoked with what it returned, on the worker's thread inside the worker's drain.
+   * The task runs as one given to \ref add_action() does, then its callback is invoked with the
+   * result, on the worker's thread. One queue for both, in the order they arrived.
    *
-   * @attention **The last argument is the callback**, and this signature cannot say so: a pack
-   * cannot be followed by a deducible parameter, so it arrives inside \p args and
-   * untangle::bind_task() splits it off. It must take the task's result and return nothing - or
-   * take nothing at all for a void task, because *finished* is the message. A missing or unusable
-   * one is a static_assert rather than silence.
+   * @attention The last argument is the callback, which the signature cannot say: it arrives in
+   * \p args and untangle::bind_task() splits it off. A missing or unusable one is a static_assert.
    *
-   * @attention **Finished does not mean failed.** A task that throws is not notified - there is no
-   * result to hand over - and what it threw goes to \ref on_task_error, as a failing action's
-   * does. A caller waiting on the callback alone would wait for ever.
+   * @attention A task that throws is not notified - what it threw goes to \ref on_task_error - and
+   * a refused one does not notify either, so a caller waiting on the callback alone waits for ever.
    *
-   * @attention **A refused task does not notify either**, and the answer below is the whole report.
-   * An **empty** callback is refused too, which its type cannot say: the static_assert asks whether
-   * the callback *can* be called, while a default constructed std::function answers no at run time.
-   * untangle::bind_task() builds an empty task from one, and a task that can neither run nor notify
-   * is turned away here rather than queued to throw on a worker. An empty action goes the same way.
-   *
-   * @remark It shares one queue with \ref add_action(), and the order is the order they arrived.
+   * @attention An empty callback or action is refused here too. Only a run time check can see it,
+   * and a task that can neither run nor notify is turned away rather than queued to throw.
    *
    * @tparam Args - The argument types to bind, of which the last is the callback.
    * @param task - The task to run.
-   * @param args - What to bind to it, followed by the callback to notify. Copied here, as
-   * \ref add_action() copies them, and for the same reason.
+   * @param args - What to bind, followed by the callback. Copied as \ref add_action() copies them.
    *
-   * @return true - the task was accepted, and the callback will be notified when it has run.
-   * @return false - refused, because the pool is not running, or because the task could never do
-   * its job. It will neither run nor notify.
+   * @return true - accepted, and the callback will be notified once it has run.
+   * @return false - refused: not running, or the task could never do its job. It will not notify.
    */
   template <typename... Args>
   bool add_task(actionT task, Args&&... args) {
@@ -233,10 +227,8 @@ class executor {
     // back is one callable that runs the work and then notifies, which is what the queue holds.
     auto action = untangle::bind_task(std::move(task), std::forward<Args>(args)...);
 
-    // An empty one is what bind_task() builds from an empty action or an empty callback. Queued, it
-    // would reach a worker and throw std::bad_function_call there, reporting a failure to whoever
-    // set on_task_error rather than to the caller who could still act on it. The same refusal
-    // untangle::actuator::add_task() makes, made before the queue rather than after.
+    // bind_task() builds an empty one from an empty action or callback. Queued, it would throw on a
+    // worker and report to on_task_error rather than to the caller, who could still act on it.
     if (!action) {
       return false;
     }
@@ -255,9 +247,8 @@ class executor {
   /**
    * @brief Starts every worker, and starts the pool accepting work.
    *
-   * A pool refuses work until this is called, and refuses it again after \ref stop() until this is
-   * called a second time - a stopped pool is restarted by it, workers and all. Calling it twice
-   * over is harmless.
+   * A pool refuses work until this is called, and again after \ref stop() until it is called anew,
+   * which revives the workers too. Harmless twice over. \ref wait() needs nothing from here.
    */
   void start() {
     // The workers first, so anything accepted after this is handed to one that is running.
@@ -271,12 +262,11 @@ class executor {
   /**
    * @brief Stops every worker. What they are already running, they finish.
    *
-   * Queued tasks stay unrun and a task added afterwards is refused. That holds whoever is asking,
-   * a task already running on a worker included - a pool that is not running takes no work.
-   * \ref start() gives the workers a new working life. Calling it twice is harmless.
+   * Queued tasks stay unrun and anything added afterwards is refused, a running task included.
+   * \ref start() revives the workers; harmless twice over.
    *
-   * @attention It does not wait for the workers to leave their threads. Only the destructor does
-   * that, and that wait is what makes destroying the pool safe.
+   * @attention It does not wait for the workers to leave their threads - only the destructor does,
+   * and that wait is what makes destroying the pool safe.
    */
   void stop() {
     // First, so that nothing is accepted for workers that are about to stop. A task already on a
@@ -292,19 +282,14 @@ class executor {
   /**
    * @brief Called with whatever the work threw. Assigned by the caller.
    *
-   * Nothing else reports failed work: \ref add_action() and \ref add_task() have both answered
-   * long before it runs. Left unset, the pool warns on stderr instead. It receives a
-   * std::exception_ptr, because the work may throw what is not a std::exception; rethrow it to
-   * read it.
+   * The only report of failed work, since \ref add_action() and \ref add_task() answered long
+   * before it ran. Left unset, the pool warns on stderr. Rethrow the exception_ptr to read it.
    *
-   * @remark **A task's failure arrives here as well, and so does its callback's.** A task that
-   * throws is not notified, so this is the only report it makes - and because a callback runs
-   * inside the same try as its task, this can fire for a task that in fact **succeeded**: the work
-   * was done and only the telling failed.
+   * @remark A task's failure arrives here, and so does its callback's - so this can fire for a task
+   * that succeeded, when only the telling failed.
    *
-   * @attention It runs on a worker's thread, and several workers may be in it at once - as may
-   * several callbacks, which run on a worker's thread for the same reason. Assign it before the
-   * first \ref add_action() or \ref add_task(), and let nothing escape it or a callback.
+   * @attention It runs on a worker's thread, several at once. Assign it before the first
+   * \ref add_action() or \ref add_task(), and let nothing escape it or a callback.
    */
   std::function<void(std::exception_ptr)> on_task_error;
 
@@ -333,25 +318,18 @@ class executor {
   /**
    * @brief Binds \p args into \p task, making the one callable the queue and the workers take.
    *
-   * @remark **The result is dropped here**, which is what an action is: the bound call still
-   * returns whatever \p task returns and untangle::task_t discards it, while a task keeps its
-   * result by handing it to a callback inside the callable untangle::bind_task() seals.
-   *
-   * @remark With no arguments to bind, the action is that callable already, and wrapping it would
-   * add a layer to every pool that never had an argument to give.
+   * @remark The result is dropped here, which is what an action is. With nothing to bind, \p task
+   * is that callable already, so no wrapper is added.
    */
   template <typename... Args>
   static untangle::task_t bind_action(actionT task, Args&&... args) {
     if constexpr (sizeof...(Args) == 0) {
       return untangle::task_t(std::move(task));
     } else {
-      // Captured by value and called as lvalues, which is all a call deferred to a worker can
-      // promise: whatever was passed to add_action() may be gone by the time this runs.
+      // By value and called as lvalues: whatever add_action() was passed may be gone by now.
       //
-      // One tuple rather than an init-capture pack: a pack expanded into a lambda's init-capture
-      // inside a dependent context is an ICE in GCC 14 (tsubst_pack_expansion), and std::apply says
-      // the same thing in an ordinary expression. untangle::bind_task() was moved off the same
-      // shape for the same reason.
+      // One tuple rather than an init-capture pack, which is an ICE in GCC 14 inside a dependent
+      // context (tsubst_pack_expansion). untangle::bind_task() was moved off that shape too.
       return untangle::task_t([task = std::move(task), args = std::tuple<std::decay_t<Args>...>(
                                                            std::forward<Args>(args)...)]() mutable {
         std::apply(task, args);
@@ -364,8 +342,7 @@ class executor {
   /**
    * @brief Hands one entry to a free worker, or puts it at the back of the queue.
    *
-   * What \ref add_action() and \ref add_task() both do once they have bound one. Neither kind is
-   * treated differently here: they share the queue, and the order out is the order in.
+   * What \ref add_action() and \ref add_task() both do once bound: one queue, order out as in.
    *
    * @return true - taken. false - a worker refused it, and it is gone.
    */
@@ -392,13 +369,11 @@ class executor {
   /**
    * @brief Hands one entry to a worker. Call with the mutex held.
    *
-   * @remark **One door for both kinds.** A task notifies from inside the callable rather than
-   * beside it, so nothing is left for the worker to tell apart: what it is handed runs, and whether
-   * a callback runs at the end is the entry's own business. The worker's task door is for a caller
-   * still holding an action and a callback in two pieces, which the pool never does.
+   * @remark One door for both kinds: a task notifies from inside the callable, so the worker has
+   * nothing to tell apart.
    *
-   * @return true - the worker took it, and is busy from here. false - the worker is stopped and has
-   * destroyed the entry, so \p task is gone either way and cannot be put back.
+   * @return true - the worker took it. false - it is stopped and has destroyed the entry, which
+   * cannot be put back either way.
    */
   [[nodiscard]] bool give_to_worker(std::size_t index, untangle::task_t task) {
     // The door takes the worker's action_mutex under mutex_. The two never cycle, because a worker
@@ -465,8 +440,8 @@ class executor {
   /**
    * @brief The names of those same workers, for a report that has to say which one.
    *
-   * @return The matching names behind a ": " separator, empty when none match, so it appends to a
-   * message cleanly either way.
+   * @return The matching names behind a ": " separator, or empty when none match, so either way
+   * it appends to a message cleanly.
    */
   std::string name_workers(bool (worker_execution::*state)() const) const {
     std::string names;
@@ -491,17 +466,15 @@ class executor {
   mutable std::mutex mutex_;
   std::condition_variable finished_cv_;
 
-  /**
-   * @brief Stands in for joining the workers, which are detached and cannot be joined.
-   *
-   * Holds this pool's workers and nothing else, so the destructor waits for those and no others.
-   */
+  //! Stands in for joining the workers, which are detached and cannot be joined. Holds this pool's
+  //! workers and nothing else, so the destructor waits for those and no others.
   async::execution_poll poll_;
 
   //! Tasks waiting for a worker, each bound to its arguments, in the order added.
   std::deque<untangle::task_t> pending_;
   std::vector<std::shared_ptr<worker_execution>> workers_;
-  //! False until start(), and false again from stop() or the destructor. Read without the mutex.
+  //! Whether the pool accepts work. False until start(), false from stop(), and false for as long
+  //! as wait() is draining, which puts back whatever it found.
   std::atomic_bool running_ = {false};
 };
 

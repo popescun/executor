@@ -111,7 +111,7 @@ pool.add_task([] { /* ... */ }, [] { /* finished */ });
 
 **`pending()` counts both kinds**, as it always counted work waiting for a worker.
 
-**A refused task does not notify.** `add_task()` answers `false` under exactly the conditions `add_action()` does — before `start()`, after `stop()`, once the destructor has begun, or if the worker it was offered to has stopped — and a refused task is destroyed rather than queued. The answer is the whole report, so a caller waiting on the callback rather than on the answer would wait for ever. The same is true of work still queued when a stopped pool is destroyed: it never runs, so it never notifies, and the count on stderr is all there is.
+**A refused task does not notify.** `add_task()` answers `false` under exactly the conditions `add_action()` does — before `start()`, after `stop()`, while a `wait()` is draining, once the destructor has begun, or if the worker it was offered to has stopped — and a refused task is destroyed rather than queued. The answer is the whole report, so a caller waiting on the callback rather than on the answer would wait for ever. The same is true of work still queued when a stopped pool is destroyed: it never runs, so it never notifies, and the count on stderr is all there is.
 
 **Finished does not mean failed.** A task that throws is *not* notified: there is no result to hand over, and for a void task no completion to report either. What it threw goes to `on_task_error`, as a failing action's does. And because a callback runs inside the same `try` as the task that owns it, `on_task_error` can fire for a task that in fact succeeded — the work was done and only the telling failed.
 
@@ -148,11 +148,56 @@ threads — only the destructor does that, and that wait is what makes destroyin
 **`start()` after `stop()` restarts it**, workers and all, and the queue it was holding drains as
 they pick it up again. Either call is harmless twice over.
 
+**`wait()` is a barrier, not a shutdown.** It returns once everything added has run and no worker is
+busy, and it leaves the pool exactly as it found it — workers still in their threads, nothing
+destroyed, accepting again. Work added after it runs as it did before, and calling it repeatedly is
+how you step through work in phases:
+
+```c++
+pool.add_action([] { first(); });
+pool.wait();                        // first() has run, the pool is still alive
+pool.add_action([] { second(); });
+pool.wait();                        // and so has second()
+```
+
+**It refuses new work while it waits**, then restores accepting to whatever it was. A task that
+re-adds itself would otherwise keep the drain from ever ending, so `add_action()` and `add_task()`
+answer `false` for the duration — and because the previous state is restored rather than assumed,
+`wait()` on a stopped pool does not leave it accepting.
+
+So only work accepted *before* the wait began is what the wait covers. Work offered during it was
+never queued, and work added after it returns is simply the next batch, for the next `wait()`. This
+is a stop-the-world drain, not a transparent one: a producer on another thread sees `add_action()`
+answer `false` while a `wait()` is in progress, and has to offer the work again afterwards.
+
+**A pool that is not running is not waited for.** Only a worker takes from the queue, so a stopped
+pool can never empty it, and a wait insisting otherwise would never return. `wait()` returns at once
+instead, leaving what is queued for the next `start()`.
+
 ## lifetime and failure
 
-**The destructor finishes what was added.** It stops accepting, waits for the queue to empty and for
-every worker to go idle, and only then stops them. A task added before the pool goes out of scope
-has run by the time it does.
+**The destructor finishes what was added.** Its drain *is* `wait()`, so a task added before the pool
+goes out of scope has run by the time it does. What the destructor adds is the shutdown `wait()`
+deliberately leaves out, in the order that makes it safe: stop the workers, wait for every one of
+them to leave its thread, and only then destroy them.
+
+**The destructor waits for the pool, not for what the pool's work touched.** That distinction is the
+whole reason `wait()` is public. The drain guarantees no worker is still running when the pool is
+destroyed, which is a statement about the *pool's own* members — a destructor body runs before
+them, so they are all still alive for it. It says nothing about the lifetime of what a task
+captured.
+
+For a pool that is a local variable outliving what its work touches, the destructor is enough and
+nothing else is needed. For a pool held as a **member of another class**, it is already too late:
+`~executor()` runs during its owner's member destruction, so by then the owner's derived subobject
+is gone, and so is every member declared after the pool. A callback reaching into either of those
+runs against destroyed storage however faithfully the pool drains — and on the stack that is not
+even a fault a sanitizer can name, because the memory is still addressable.
+
+So an owner whose callbacks reach back into itself calls `wait()` where the whole object graph is
+still standing — in its own destructor body, ahead of its members, or better still at a point the
+owner of *its* peers controls — and the destructor's drain goes back to being a backstop rather
+than the thing relied upon.
 
 A pool destroyed while stopped is the exception: its queue can never empty, because only a running
 worker takes from it, so the destructor does not wait for it. Whatever is left is reported on
@@ -160,11 +205,13 @@ stderr and dropped.
 
 **Both waits are unbounded, and both say so while they last.** A task that never returns would
 otherwise leave the destructor silent for ever, so it reports instead — the first wait naming who
-is still inside a task, the second naming whose thread has not left:
+is still inside a task, the second naming whose thread has not left. The first line below is the
+drain's, so a plain `wait()` prints it exactly as a destructor does; the second is the destructor's
+alone:
 
 ```
-executor: still waiting to finish after 1s - 1 queued, 2 in a task: pool_worker_0, pool_worker_1
-executor: still waiting to finish after 3s - 0 queued, 1 in a task: pool_worker_1
+executor: still waiting to drain after 1s - 1 queued, 2 in a task: pool_worker_0, pool_worker_1
+executor: still waiting to drain after 3s - 0 queued, 1 in a task: pool_worker_1
 executor: still waiting to stop after 1s - 1 not left its thread: pool_worker_1
 ```
 
@@ -177,15 +224,16 @@ use-after-free, and a bounded wait only moves the hang into `~execution()`, whic
 running state with no timeout. Workers are detached and `async::execution` has no cancellation, so
 a pool cannot outlive a task it cannot interrupt. What can be fixed is the silence.
 
-**`add_action()` says whether the task was taken.** It returns false before `start()`, after `stop()`,
-and once the destructor has begun. It returns false again if the worker it was offered to has
-stopped. A refused task is destroyed rather than queued, so a false answer means it will not run.
+**`add_action()` says whether the task was taken.** It returns false before `start()`, after
+`stop()`, while a `wait()` is draining, and once the destructor has begun. It returns false again if
+the worker it was offered to has stopped. A refused task is destroyed rather than queued, so a false
+answer means it will not run.
 
 **A task that is still running is refused too**, and that is chosen rather than incidental. A pool
-shutting down is waiting for exactly that task, so it is tempting to let the work it spawns through
-— but then a task that re-adds itself could keep the shutdown from ever ending. One rule instead: a
-pool that is not running takes no work, whoever is asking. `add_action()` answers false inside the
-task, so it can tell.
+draining is waiting for exactly that task, so it is tempting to let the work it spawns through — but
+then a task that re-adds itself could keep the drain from ever ending, and that holds for a `wait()`
+just as for a destructor. One rule instead: a pool that is not running takes no work, whoever is
+asking. `add_action()` answers false inside the task, so it can tell.
 
 **A task that throws does not take the worker with it**, and what it threw is not lost. The worker
 catches it and carries on with the next task; `on_task_error` is where the throw goes:

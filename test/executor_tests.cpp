@@ -1069,3 +1069,133 @@ TEST(executor_tests, destroying_a_pool_with_tasks_queued_does_not_race_their_cal
   EXPECT_EQ(notified.load(), ran.load()) << "a task ran without notifying its callback";
   EXPECT_EQ(mismatched.load(), 0) << "a callback was handed a result from a different task";
 }
+
+/**
+ * @brief wait() is a barrier, so a pool goes on running and takes more work after one.
+ *
+ * The case the old wait() failed: it destroyed the workers, so a later task was accepted and then
+ * never ran. The pool is destroyed already waited on, which drains it a second time.
+ */
+TEST(executor_tests, wait_is_reusable_and_the_pool_runs_what_comes_after) {
+  constexpr int rounds = 3;
+  std::atomic_int ran = {0};
+
+  executor pool(2);
+  pool.start();
+
+  for (int round = 1; round <= rounds; ++round) {
+    EXPECT_TRUE(pool.add_action([&ran] { ran.fetch_add(1); }))
+        << "round " << round << " was refused, so wait() did not leave the pool accepting";
+
+    pool.wait();  // deliberately no start() in between
+
+    EXPECT_EQ(ran.load(), round) << "round " << round << " had not run when wait() returned";
+  }
+}
+
+/**
+ * @brief wait() restores whatever it found, so it never leaves a pool that was not running.
+ *
+ * The only case that fails if the restore is written as an unconditional resumption.
+ */
+TEST(executor_tests, wait_leaves_a_pool_that_is_not_running_alone) {
+  executor pool(1);
+
+  pool.wait();  // never started, so there is nothing to drain and nothing to resume
+  EXPECT_FALSE(pool.add_action([] {})) << "wait() left an unstarted pool accepting";
+
+  pool.start();
+  pool.stop();
+
+  pool.wait();
+  EXPECT_FALSE(pool.add_action([] {})) << "wait() left a stopped pool accepting";
+}
+
+/**
+ * @brief wait() returns once the queue is empty and every callback has run.
+ *
+ * More tasks than workers, so most of this waits in pending_ rather than in flight. A callback runs
+ * inside the worker's drain, which is what makes it part of the drain rather than after it.
+ */
+TEST(executor_tests, wait_drains_the_queue_and_every_callback_with_it) {
+  constexpr int task_count = 32;
+  std::atomic_int notified = {0};
+
+  executor pool(2);
+  pool.start();
+
+  for (int i = 0; i < task_count; ++i) {
+    ASSERT_TRUE(pool.add_task([] {}, [&notified] { notified.fetch_add(1); }));
+  }
+
+  pool.wait();
+
+  EXPECT_EQ(notified.load(), task_count) << "wait() returned before every callback had run";
+  EXPECT_EQ(pool.pending(), 0u) << "wait() returned with work still queued";
+}
+
+/**
+ * @brief A pool takes no work while a wait() drains it, and takes work again once that returns.
+ *
+ * Refusing is what lets the drain end at all - work arriving during it, from a task re-adding
+ * itself as much as from another thread, would otherwise keep the queue from ever emptying.
+ */
+TEST(executor_tests, wait_refuses_new_work_until_it_returns) {
+  gate busy;
+  std::atomic_bool returned = {false};
+
+  executor pool(1);
+  pool.start();
+
+  pool.add_action([&busy] { busy(); });
+  ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
+
+  // On its own thread, because it blocks until the gate opens below.
+  std::thread waiter([&pool, &returned] {
+    pool.wait();
+    returned = true;
+  });
+
+  EXPECT_TRUE(wait_for([&pool] { return !pool.add_action([] {}); }, 5s))
+      << "the pool kept accepting work while a wait() was draining it";
+
+  busy.open();
+
+  EXPECT_TRUE(wait_for([&returned] { return returned.load(); }, 10s)) << "wait() never returned";
+  waiter.join();
+
+  EXPECT_TRUE(pool.add_action([] {})) << "wait() did not put accepting back";
+}
+
+/**
+ * @brief The destructor reports what a stopped pool left queued, which wait() cannot drain.
+ *
+ * The worker takes one on its way out, through take_next_task(), and loses it to a stopped door -
+ * a_queued_task_a_worker_refuses_is_reported covers that. The rest never move, and are this count.
+ */
+TEST(executor_tests, the_destructor_reports_work_a_stopped_pool_could_not_drain) {
+  constexpr std::size_t queued_count = 3;
+
+  testing::internal::CaptureStderr();
+
+  {
+    gate busy;
+    executor pool(1);
+    pool.start();
+
+    pool.add_action([&busy] { busy(); });
+    ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
+
+    for (std::size_t i = 0; i < queued_count; ++i) {
+      ASSERT_TRUE(pool.add_action([] {}));
+    }
+    ASSERT_EQ(pool.pending(), queued_count);
+
+    pool.stop();  // nothing queued can reach a worker from here
+    busy.open();
+  }
+
+  const std::string reported = testing::internal::GetCapturedStderr();
+  EXPECT_THAT(reported, ::testing::HasSubstr("dropped"))
+      << "the queue the destructor abandoned went unreported; stderr held: " << reported;
+}
