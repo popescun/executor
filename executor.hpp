@@ -125,8 +125,13 @@ class executor {
   /**
    * @brief Drains everything added so far, then leaves the pool as it was found.
    *
+   * Drained means the queue is empty and no worker is busy, so every task accepted before this has
+   * run, and so has the callback of one - a callback runs inside the worker's drain, not after it.
+   *
    * A barrier, not a shutdown: the workers keep their threads and work added afterwards runs as
-   * before. Reusable. The wait is unbounded and reports on stderr while it lasts.
+   * before. Reusable, and one at a time - a second caller drains once the first has returned.
+   *
+   * The wait is unbounded and reports on stderr while it lasts.
    *
    * @attention New work is refused meanwhile, then accepting is restored, so a task that re-adds
    * itself cannot keep the drain from ending. Only work accepted before it began counts.
@@ -138,6 +143,10 @@ class executor {
    * runs once the owner's derived parts and later members are gone: call this before that.
    */
   void wait() {
+    // One drain at a time: two threads between the exchange below and the restore at the end would
+    // read each other's cleared flag, and the last one out could leave the pool refusing work.
+    std::lock_guard<std::mutex> drain(wait_mutex_);
+
     // Put back exactly as found below: a wait must not leave a stopped pool accepting, and such a
     // pool cannot empty its queue anyway - only a running worker takes from it.
     const bool was_running = running_.exchange(false);
@@ -465,6 +474,9 @@ class executor {
 
   mutable std::mutex mutex_;
   std::condition_variable finished_cv_;
+
+  //! Serialises wait(). Not mutex_, which finished_cv_ has to own while it waits.
+  std::mutex wait_mutex_;
 
   //! Stands in for joining the workers, which are detached and cannot be joined. Holds this pool's
   //! workers and nothing else, so the destructor waits for those and no others.

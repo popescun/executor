@@ -1199,3 +1199,53 @@ TEST(executor_tests, the_destructor_reports_work_a_stopped_pool_could_not_drain)
   EXPECT_THAT(reported, ::testing::HasSubstr("dropped"))
       << "the queue the destructor abandoned went unreported; stderr held: " << reported;
 }
+
+/**
+ * @brief Two threads draining one pool leave it accepting, and neither returns early.
+ *
+ * Overlapping waits used to read each other's cleared flag: the last one out restored the value it
+ * had found already false, and the pool refused work from then on with nothing to explain it.
+ */
+TEST(executor_tests, concurrent_waits_leave_the_pool_accepting) {
+  // The interleaving is a race, so one round is not a reliable probe: unserialised, this reproduced
+  // in roughly one run in three.
+  constexpr int rounds = 20;
+  constexpr int queued_count = 8;
+
+  for (int round = 1; round <= rounds; ++round) {
+    gate busy;
+    std::atomic_int ran = {0};
+
+    executor pool(1);
+    pool.start();
+
+    pool.add_action([&busy] { busy(); });
+    ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s)) << "round " << round;
+
+    // Behind the held worker, so both waits have a queue to drain rather than nothing to do.
+    for (int i = 0; i < queued_count; ++i) {
+      ASSERT_TRUE(pool.add_action([&ran] { ran.fetch_add(1); })) << "round " << round;
+    }
+
+    std::thread first([&pool] { pool.wait(); });
+    std::thread second([&pool] { pool.wait(); });
+
+    // A refusal is the only observable sign that a wait is under way, and it queues nothing.
+    ASSERT_TRUE(wait_for([&pool] { return !pool.add_action([] {}); }, 5s)) << "round " << round;
+
+    busy.open();
+    first.join();
+    second.join();
+
+    // Before adding anything more, or the new task could have run by the time this reads it.
+    ASSERT_EQ(ran.load(), queued_count)
+        << "round " << round << ": a wait returned with work queued";
+
+    ASSERT_TRUE(pool.add_action([&ran] { ran.fetch_add(1); }))
+        << "round " << round << ": two overlapping waits left the pool refusing work";
+
+    pool.wait();
+    ASSERT_EQ(ran.load(), queued_count + 1)
+        << "round " << round << ": the pool did not run what it accepted afterwards";
+  }
+}
