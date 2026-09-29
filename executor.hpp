@@ -78,6 +78,8 @@ class executor {
     }
   }
 
+  ~executor() { wait(); }
+
   /**
    * @brief Finishes what has been added, then stops every worker.
    *
@@ -92,7 +94,7 @@ class executor {
    * a caller waiting on the callback rather than on the answer would wait for ever. The count on
    * stderr says how much was lost, never which.
    */
-  ~executor() {
+  void wait() {
     // Whether the pool was still running when it was destroyed. A stopped one cannot empty its
     // queue - only a worker takes from it, through on_finished, and a stopped worker raises no more
     // - so its queue is not waited for.
