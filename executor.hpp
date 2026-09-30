@@ -30,9 +30,9 @@
 namespace untangle {
 
 /**
- * @brief Runs actions and tasks on a fixed pool of untangle::async::execution workers.
+ * @brief Runs tasks on a fixed pool of untangle::async::execution workers.
  *
- * \ref add_action() drops what the work returns; \ref add_task() carries a callback and reports it.
+ * \ref add_task() is the one door: it carries a callback and reports the result to it.
  *
  * @tparam actionT - The callable the pool runs. One pool runs one signature, arguments and result.
  */
@@ -177,41 +177,15 @@ class executor {
   }
 
   /**
-   * @brief Queues a task bound to \p args, or hands it to a worker that has nothing to do.
-   *
-   * Forwards to async::execution::add_action() and behaves as it does: the result is dropped, and
-   * the answer below is the last the caller hears. The first free worker takes it, the warmest one.
-   *
-   * @tparam Args - The argument types to bind to \p task.
-   * @param task - The task to run.
-   * @param args - What to bind. Copied here, so a task taking a reference gets the pool's copy.
-   *
-   * @return true - accepted. false - refused by a pool not started, stopped, draining or being
-   * destroyed, or by a stopped worker; either way it will not run.
-   */
-  template <typename... Args>
-  bool add_action(actionT task, Args&&... args) {
-    // The call the pool will make, which is not quite the one written at the call site: what
-    // reaches the task is the copies bound below, so that is the call that has to compile.
-    static_assert(std::is_invocable_v<actionT, std::decay_t<Args>&...>,
-                  "executor: the task cannot be called with the arguments given to add_action()");
-
-    if (!running_) {
-      return false;
-    }
-
-    // Bound before the lock: it copies the caller's arguments, and nothing here needs the queue.
-    return queue_task(bind_action(std::move(task), std::forward<Args>(args)...));
-  }
-
-  /**
    * @brief Queues work that must report, or hands it to a worker that has nothing to do.
    *
-   * The task runs as one given to \ref add_action() does, then its callback is invoked with the
-   * result, on the worker's thread. One queue for both, in the order they arrived.
+   * The first free worker takes it, the warmest one; otherwise it waits in the queue, which keeps
+   * the order work arrived in. Once the task has run, its callback is invoked with the result, on
+   * the worker's thread.
    *
    * @attention The last argument is the callback, which the signature cannot say: it arrives in
-   * \p args and untangle::bind_task() splits it off. A missing or unusable one is a static_assert.
+   * \p args and untangle::bind_task() splits it off. A missing or unusable one is a static_assert,
+   * and so is a task that cannot be called with the arguments before it.
    *
    * @attention A task that throws is not notified - what it threw goes to \ref on_task_error - and
    * a refused one does not notify either, so a caller waiting on the callback alone waits for ever.
@@ -221,28 +195,37 @@ class executor {
    *
    * @tparam Args - The argument types to bind, of which the last is the callback.
    * @param task - The task to run.
-   * @param args - What to bind, followed by the callback. Copied as \ref add_action() copies them.
+   * @param args - What to bind, followed by the callback. Copied here, so a task taking a reference
+   * gets the pool's copy.
    *
    * @return true - accepted, and the callback will be notified once it has run.
-   * @return false - refused: not running, or the task could never do its job. It will not notify.
+   * @return false - refused by a pool not started, stopped, draining or being destroyed, by a
+   * stopped worker, or because the task could never do its job. It will not run or notify.
    */
   template <typename... Args>
   bool add_task(actionT task, Args&&... args) {
+    // The call the pool will make, which is not quite the one written at the call site: what
+    // reaches the task is the copies bound below, so that is the call that has to compile. Without
+    // this the mismatch surfaces deep inside bind_task()'s std::apply.
+    static_assert(invocable_with_bound<Args...>(),
+                  "executor: the task cannot be called with the arguments given to add_task() "
+                  "before its callback");
+
     if (!running_) {
       return false;
     }
 
     // untangle::bind_task() takes the callback off the end of the pack and checks it; what comes
     // back is one callable that runs the work and then notifies, which is what the queue holds.
-    auto action = untangle::bind_task(std::move(task), std::forward<Args>(args)...);
+    auto tsk = untangle::bind_task(std::move(task), std::forward<Args>(args)...);
 
     // bind_task() builds an empty one from an empty action or callback. Queued, it would throw on a
     // worker and report to on_task_error rather than to the caller, who could still act on it.
-    if (!action) {
+    if (!tsk) {
       return false;
     }
 
-    return queue_task(std::move(action));
+    return queue_task(std::move(tsk));
   }
 
   /**
@@ -291,14 +274,14 @@ class executor {
   /**
    * @brief Called with whatever the work threw. Assigned by the caller.
    *
-   * The only report of failed work, since \ref add_action() and \ref add_task() answered long
+   * The only report of failed work, since \ref add_task() answered long
    * before it ran. Left unset, the pool warns on stderr. Rethrow the exception_ptr to read it.
    *
    * @remark A task's failure arrives here, and so does its callback's - so this can fire for a task
    * that succeeded, when only the telling failed.
    *
    * @attention It runs on a worker's thread, several at once. Assign it before the first
-   * \ref add_action() or \ref add_task(), and let nothing escape it or a callback.
+   * \ref add_task(), and let nothing escape it or a callback.
    */
   std::function<void(std::exception_ptr)> on_task_error;
 
@@ -325,25 +308,28 @@ class executor {
   }
 
   /**
-   * @brief Binds \p args into \p task, making the one callable the queue and the workers take.
+   * @brief Can a task be called with the copies bound from every one of \p Args but the last?
    *
-   * @remark The result is dropped here, which is what an action is. With nothing to bind, \p task
-   * is that callable already, so no wrapper is added.
+   * The last is the callback, which untangle::bind_task() checks itself, and the rest reach the
+   * task as the pool's own lvalues - so that, not the caller's argument types, is what is asked.
+   *
+   * @remark With no arguments at all there is no callback either, and bind_task() says so; this
+   * answers true rather than adding a second, misleading error to its.
    */
   template <typename... Args>
-  static untangle::task_t bind_action(actionT task, Args&&... args) {
+  static consteval bool invocable_with_bound() {
     if constexpr (sizeof...(Args) == 0) {
-      return untangle::task_t(std::move(task));
+      return true;
     } else {
-      // By value and called as lvalues: whatever add_action() was passed may be gone by now.
-      //
-      // One tuple rather than an init-capture pack, which is an ICE in GCC 14 inside a dependent
-      // context (tsubst_pack_expansion). untangle::bind_task() was moved off that shape too.
-      return untangle::task_t([task = std::move(task), args = std::tuple<std::decay_t<Args>...>(
-                                                           std::forward<Args>(args)...)]() mutable {
-        std::apply(task, args);
-      });
+      return invocable_with<std::tuple<std::decay_t<Args>...>>(
+          std::make_index_sequence<sizeof...(Args) - 1>{});
     }
+  }
+
+  //! The half of invocable_with_bound() that needs the indices of what is bound.
+  template <typename tupleT, std::size_t... index>
+  static consteval bool invocable_with(std::index_sequence<index...>) {
+    return std::is_invocable_v<actionT, std::tuple_element_t<index, tupleT>&...>;
   }
 
   using worker_execution = untangle::async::execution<untangle::task_t>;
@@ -351,7 +337,7 @@ class executor {
   /**
    * @brief Hands one entry to a free worker, or puts it at the back of the queue.
    *
-   * What \ref add_action() and \ref add_task() both do once bound: one queue, order out as in.
+   * What \ref add_task() does once bound: one queue, order out as in.
    *
    * @return true - taken. false - a worker refused it, and it is gone.
    */
@@ -377,9 +363,6 @@ class executor {
 
   /**
    * @brief Hands one entry to a worker. Call with the mutex held.
-   *
-   * @remark One door for both kinds: a task notifies from inside the callable, so the worker has
-   * nothing to tell apart.
    *
    * @return true - the worker took it. false - it is stopped and has destroyed the entry, which
    * cannot be put back either way.
