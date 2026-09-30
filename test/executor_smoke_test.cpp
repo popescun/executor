@@ -1,13 +1,12 @@
 // Copyright (c) 2026 Nicolae Popescu. MIT License.
 
 /**
- * @brief Walks untangle::executor through the scenarios the prototype was written to answer, and
- * reports what it observed.
+ * @brief Walks untangle::executor through its main scenarios, and reports what it observed.
  *
- * Imported from the async repo's prototypes/executor_demo.cpp. Unlike executor_tests.cpp, which
- * states an expectation for every behaviour, these cases print what happened and assert only what
- * does not depend on how the machine schedules: a timing observation is recorded here and left for
- * a reader, because a threshold on it would fail on a loaded runner rather than on a defect.
+ * Unlike executor_tests.cpp, which states an expectation for every behaviour, these cases print
+ * what happened and assert only what does not depend on how the machine schedules: a timing
+ * observation is recorded here and left for a reader, because a threshold on it would fail on a
+ * loaded runner rather than on a defect.
  *
  * Meant to be run under ThreadSanitizer as well as plain.
  */

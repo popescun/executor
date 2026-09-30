@@ -4,13 +4,9 @@
 
 *c++ thread pool executor based on async execution*
 
-The interface is one header that exposes a pool of workers, each one an
+A header-only library: `executor.hpp` exposes a pool of workers, each one an
 [async](https://github.com/popescun/async) `execution` in continuous mode, fed by a shared queue of
 tasks.
-
-**This is the prototype, imported.** It was written in `async/prototypes/` to answer whether
-`execution` is a usable building block for a pool — it is — and it is being hardened here. The
-behaviour below is what the tests state today, not a settled interface.
 
 ## requirements
 
@@ -89,11 +85,21 @@ about a task changes between the queue and the worker that runs it. The argument
 possibly much later, and what the caller passed may be gone by then. A task taking `int&` therefore
 mutates the pool's copy, which the caller never sees.
 
+A task that cannot be called with the arguments given is refused by a `static_assert` in
+`add_task()`, which names the mismatch before the errors from inside the binding follow it.
+
 Work that returns `void` still reports that it finished, with a callback taking nothing — *finished* is the message and the result is optional:
 
 ```c++
 untangle::executor<std::function<void(void)>> pool(4);
 pool.add_task([] { /* ... */ }, [] { /* finished */ });
+```
+
+A task with nothing to bind passes the callback alone, whatever it returns:
+
+```c++
+untangle::executor<std::function<int(void)>> pool(4);
+pool.add_task([] { return 42; }, [](int result) { /* result == 42 */ });
 ```
 
 **The callback is the last argument, and the signature cannot say so.** A parameter pack cannot be followed by a deducible parameter, so it arrives inside the arguments and `untangle::bind_task()` splits it off. It must be callable with the task's result and return nothing — or callable with nothing at all, when the task returns void. A missing or unusable one is a compile error rather than silence.
