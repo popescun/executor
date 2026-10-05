@@ -149,8 +149,8 @@ returns something give back — so read those two before deciding what it means 
 | 9 | 9 | the queue is unbounded and nothing pushes back | `:119` | read-only, API decision |
 | **Group 4 — what async.hpp imposes** |
 | 10 | 10 | the lock order rests on an async.hpp detail that is not its contract | `:140-145`, `:171-179` | read-only |
-| 11 | 11 | every worker prints to stdout on shutdown | `async.hpp:757` | CONFIRMED (14 lines of 38) |
-| 12 | 12 | the 10ms tick, once per worker | `async.hpp:744-747` | measured, not a defect |
+| 11 ✅ | 11 | every worker prints to stdout on shutdown | `async.hpp:757` | CONFIRMED (14 lines of 38) — fixed upstream, async `2a06497` |
+| 12 ✅ | 12 | the 10ms tick, once per worker | `async.hpp:744-747` | measured, not a defect — gone anyway, async `502650b` |
 | **Group 5 — surface and hygiene** |
 | 13 | 13 | worker names collide between pools | `:65` | read-only |
 | 14 ✅ | 14 | `struct worker` is a one-field wrapper the prototype outgrew | `:119-121` | read-only |
@@ -650,7 +650,7 @@ predict.
 > execution's own lock released, because that is what makes it usable from a caller that holds a
 > lock of its own. The second half is a note to carry to the async plan.
 
-### Step 11 · item 11 — every worker prints to stdout on shutdown — OPEN (upstream)
+### Step 11 ✅ · item 11 — every worker prints to stdout on shutdown — DONE upstream (async `2a06497`)
 `async.hpp:757` · CONFIRMED: 14 lines of 38 in one smoke-test run
 
 `loop()` ends with an unconditional `std::println("execution '{}' thread finished", name)`. One
@@ -662,6 +662,9 @@ multiplies it by the worker count.
 
 > Not this repo's to fix: `async.hpp` should not print at all on a clean shutdown, and the async
 > plan is where that belongs. Carry it there. Nothing changes in `executor.hpp`.
+>
+> Done upstream 2026-10-05: async `2a06497` deletes both per-thread prints, so a worker's thread
+> ends silently; warnings about dropped work stay on stderr. Reached here through the async pin.
 
 ### Step 12 · item 12 — the 10ms tick, once per worker — no action
 `async.hpp:744-747` · measured
@@ -672,6 +675,10 @@ over a second of wall clock.
 
 Recorded so it is not rediscovered as a suspicion. It is not a defect and there is nothing here to
 do; if a pool is ever wanted at a hundred workers, remeasure before assuming it still holds.
+
+> Gone anyway, 2026-10-05: async `502650b` (fluxcpp plan step 6) blocks an idle worker that has
+> nothing attached instead of polling, so an idle pool no longer wakes at all. The 10 ms bound now
+> applies only while an execution has something attached.
 
 ## Group 5 — surface and hygiene
 
