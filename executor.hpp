@@ -5,7 +5,8 @@
  *
  * N workers in continuous mode behind a shared queue. Nothing overtakes what is already queued.
  */
-#pragma once
+#ifndef UNTANGLE_EXECUTOR_EXECUTOR_HPP
+#define UNTANGLE_EXECUTOR_EXECUTOR_HPP
 
 #include <algorithm>
 #include <async.hpp>
@@ -474,3 +475,5 @@ class executor {
 };
 
 }  // namespace untangle
+
+#endif  // UNTANGLE_EXECUTOR_EXECUTOR_HPP
