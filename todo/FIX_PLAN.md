@@ -18,11 +18,11 @@ before it blocks. Submitting 1000 empty tasks takes 40-60% less time on the main
 green on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
 **2026-10-09 — step 29 opened (group 8): destroying a pool always takes 50 ms.** Found while
 checking the benchmark for sleeps, confirmed by a probe; nothing fixed yet.
-**2026-10-09 — step 30 superseded, step 31 opened (group 8): per-worker queues.** Step 30's
-batching was measured and passed its tests but was never committed: it kept the shared queue and
-needed `async`'s `add_queued_task()` public (async step 50, withdrawn). Step 31 drops `pending_`: the
-pool picks a worker at submission and calls `execution::add_task()`, so a task is sealed once and
-async's API stays as it is. Prototyped and measured; needs async's step 51; nothing fixed yet.
+**2026-10-09 — step 30 superseded, step 31 (group 8) done: per-worker queues.** Step 30's batching
+was never committed; step 31 drops `pending_`: the pool picks a worker at submission and calls
+`execution::add_task()`, so a task is sealed once and async's API stays as it is (async's steps 51 and
+52, `11aa5a8`). On empty batches the executor now submits and delivers ahead of `QThreadPool`; 44 of
+44 (and 5 smoke) on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -184,7 +184,7 @@ returns something give back — so read those two before deciding what it means 
 | 28 ✅ | 25 | `add_task()` keeps the submitter waiting on the pool's lock | `:345-364`, `:380-399`, `:459` | CONFIRMED (profile, `bench/qt_pool_vs_this`) — fixed `e9ef8ea` |
 | 29 | 26 | destroying a pool always takes 50 ms | `:159-161`, `:504` | CONFIRMED (probe) |
 | 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) — SUPERSEDED by step 31, never committed |
-| 31 | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) |
+| 31 ✅ | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) — fixed (uncommitted) |
 
 ---
 
@@ -1405,7 +1405,7 @@ and handing it to a worker, and that queue is what the user wants gone. Step 31 
 working-tree changes are discarded with it, including the two share tests. The analysis above - one
 task per trip, a second wrapper per task - stays the reason for step 31.
 
-### Step 31 · item 28 — the pool keeps a queue of its own between the door and the workers — OPEN
+### Step 31 ✅ · item 28 — the pool keeps a queue of its own between the door and the workers — DONE
 `executor.hpp:197-237` (`wait`), `:258-284` (`add_task`), `:286-289` (`pending`), `:387` (the worker
 type), `:396-465` (`queue_task`, `give_to_worker`, `take_next_task`, `nothing_running`), `:521`
 (`pending_`) · CONFIRMED by a prototype on scratchpad copies, 2026-10-09; sites at `33e2e2c`
@@ -1474,3 +1474,39 @@ wakes it.
 **Order:** async step 51 first (and step 50's revert), then the executor's async pin, then this.
 **Done when:** Debug, ASan and TSan are green in both repos, and `bench/qt_pool_vs_this` shows the
 executor at or below the prototype's numbers.
+
+**Tests written 2026-10-09.** `a_queued_task_a_worker_refuses_is_reported` and
+`the_destructor_reports_work_a_stopped_pool_could_not_drain` became one case,
+`stop_runs_what_was_already_submitted` (1 worker held, 4 queued, `stop()`: all 4 run, nothing
+"refused" or "dropped" on stderr) - failing, `ran` 0. New: `a_task_waits_for_the_worker_it_was_given`
+(2 workers held at gates, 4 tasks, one gate opened: 2 run) - failing, `ran` 4;
+`a_burst_is_spread_over_idle_workers` (two gate tasks back to back reach both workers) - a guard,
+passing. Both gate cases hold an `open_on_exit` declared after the pool, so a failed check cannot
+leave a worker held and the destructor waiting. The `pending()` cases are unchanged: with (a) their
+meaning stays. The rest: 42 of 44 green.
+
+**Landed 2026-10-09 (uncommitted).** As decided: workers are `async::execution<actionT>`;
+`add_task()` picks with `pick_worker()` (first idle from worker 0, else the fewest in `given_`, per
+worker atomics read unlocked) and forwards to the worker's `add_task()`; `on_finished` ->
+`worker_drained()` stores 0 and takes `mutex_` only to notify while `waiting_` counts a `wait()`;
+`wait()` waits for `nothing_running()` (the workers' `is_busy()`), a stopped pool included, since its
+workers drain what they were given; `pending()` sums `execution::pending()`. Gone: `pending_`,
+`queue_task()`, `give_to_worker()`, `take_next_task()`, the destructor's "dropped" report, `<deque>`.
+44 of 44 and 5 of 5 smoke on Debug, ASan and TSan; docs clean, 31 pages.
+
+`bench/qt_pool_vs_this`, two runs, median µs, 1000 tasks unless one:
+
+| | executor `e9ef8ea` | executor step 31 | QThreadPool (same runs) |
+|---|---|---|---|
+| empty, 1 worker, `submitted` | 59-86 | 50-72 | 74-137 |
+| empty, 1 worker, `delivered` | 351-543 | 245-363 | 315-502 |
+| empty, 4 workers, `submitted` | 149-206 | 42 | 82-83 |
+| empty, 4 workers, `delivered` | 435-487 | 365-405 | 410-450 |
+| 10 µs, 1 worker, `delivered` (ms) | 10.79-12.54 | 10.84-10.86 | 10.87 |
+| 10 µs, 4 workers, `delivered` (ms) | 3.13-3.19 | 3.13-3.15 | 3.13-3.20 |
+| one 10 µs task, 1 worker, `delivered` | 18.1-18.2 | 20.2 | 18.1 |
+
+The executor now submits faster than `QThreadPool` and delivers empty batches sooner at 1 and 4
+workers; with real work they are equal. **One small cost:** a single task with work arrives ~2 µs
+later than with `QThreadPool` (20.2 against 18.1 µs, `processed` 16.5 against 15.4) - the worker's
+spin-before-park and lock path from async's step 51, paid once per wake-up.

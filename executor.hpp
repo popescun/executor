@@ -14,7 +14,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
-#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -86,6 +85,9 @@ class adaptive_mutex {
  *
  * \ref add_task() is the one door: it carries a callback and reports the result to it.
  *
+ * Each worker keeps its own queue. A task goes to a worker when it is submitted - the first idle
+ * one, else the one given the fewest since it last drained - and waits there for that worker.
+ *
  * @tparam actionT - The callable the pool runs. One pool runs one signature, arguments and result.
  */
 template <typename actionT>
@@ -103,12 +105,13 @@ class executor {
     }
 
     workers_.reserve(worker_count);
+    given_ = std::make_unique<std::atomic<std::size_t>[]>(worker_count);
 
     for (std::size_t index = 0; index < worker_count; ++index) {
       auto next = worker_execution::create_instance("pool_worker_" + std::to_string(index));
 
-      // Tells the pool the moment this worker has room for more.
-      next->on_finished = [this, index] { take_next_task(index); };
+      // Tells the pool this worker has run everything it was given.
+      next->on_finished = [this, index] { worker_drained(index); };
 
       // Carries what a task throws to the caller. Assigned here because a worker thread reads it.
       next->on_error = [this, name = next->name](std::exception_ptr thrown) {
@@ -128,8 +131,8 @@ class executor {
    * The drain is \ref wait(); the shutdown after it stops the workers, waits for each to leave its
    * thread, and destroys them only then. Both waits are unbounded and report on stderr meanwhile.
    *
-   * @attention Only a pool stopped before its queue emptied leaves work behind, and work dropped
-   * here never runs, so it never notifies. The count on stderr says how much, never which.
+   * @remark Nothing is dropped: a worker runs what it was given before it leaves its thread, a pool
+   * stopped earlier included.
    *
    * @attention This waits for the pool, not for what its work touched: see \ref wait().
    */
@@ -138,18 +141,6 @@ class executor {
     // accepting, so stop() follows at once: that window is the only one a shutdown would take.
     wait();
     stop();
-
-    {
-      std::lock_guard<adaptive_mutex> lock(mutex_);
-
-      // Only reachable for a pool that was already stopped. wait() drained a running one, and
-      // stop() above cannot add to the queue.
-      if (!pending_.empty()) {
-        std::println(stderr,
-                     "executor: {} queued task(s) dropped, the pool was stopped before they ran",
-                     pending_.size());
-      }
-    }
 
     // Waits for every worker to leave its thread, which is what makes destroying them safe. A
     // different question from the wait above: a worker can be idle and still be in its thread.
@@ -177,7 +168,7 @@ class executor {
   /**
    * @brief Drains everything added so far, then leaves the pool as it was found.
    *
-   * Drained means the queue is empty and no worker is busy, so every task accepted before this has
+   * Drained means no worker has anything queued or running, so every task accepted before this has
    * run, and so has the callback of one - a callback runs inside the worker's drain, not after it.
    *
    * A barrier, not a shutdown: the workers keep their threads and work added afterwards runs as
@@ -188,8 +179,8 @@ class executor {
    * @attention New work is refused meanwhile, then accepting is restored, so a task that re-adds
    * itself cannot keep the drain from ending. Only work accepted before it began counts.
    *
-   * @attention A pool that is not running is not waited for: only a worker takes from the queue, so
-   * this returns at once and what is queued keeps for the next \ref start().
+   * @remark A stopped pool is waited for too: its workers run what they were given before they
+   * leave, so the wait ends.
    *
    * @attention It waits for the work, not for what the work touched. Held as a member, ~executor()
    * runs once the owner's derived parts and later members are gone: call this before that.
@@ -199,41 +190,43 @@ class executor {
     // read each other's cleared flag, and the last one out could leave the pool refusing work.
     std::lock_guard<std::mutex> drain(wait_mutex_);
 
-    // Put back exactly as found below: a wait must not leave a stopped pool accepting, and such a
-    // pool cannot empty its queue anyway - only a running worker takes from it.
+    // Put back exactly as found below: a wait must not leave a stopped pool accepting.
     const bool was_running = running_.exchange(false);
 
     {
       std::unique_lock<adaptive_mutex> lock(mutex_);
 
-      // Waits for the queue to empty and every worker to go idle.
+      // Counted under the lock, before the first check: a worker that drains after this sees it and
+      // notifies, and one that drained before it is seen by that first check.
+      ++waiting_;
+
+      // Waits for every worker to go idle.
       auto interval = std::chrono::milliseconds(report_first_ms);
       auto waited = std::chrono::milliseconds(0);
 
-      while (!finished_cv_.wait_for(lock, interval, [this, was_running] {
-        return nothing_running() && (pending_.empty() || !was_running);
-      })) {
+      while (!finished_cv_.wait_for(lock, interval, [this] { return nothing_running(); })) {
         waited += interval;
 
-        // Under the lock, so the counts agree with the predicate that just failed.
         std::println(
             stderr, "executor: still waiting to drain after {}s - {} queued, {} in a task{}",
-            waited.count() / 1000, pending_.size(), count_workers(&worker_execution::is_busy),
+            waited.count() / 1000, total_pending(), count_workers(&worker_execution::is_busy),
             name_workers(&worker_execution::is_busy));
 
         interval = std::min(interval * 2, std::chrono::milliseconds(report_max_ms));
       }
+
+      --waiting_;
     }
 
     running_ = was_running;
   }
 
   /**
-   * @brief Queues work that must report, or hands it to a worker that has nothing to do.
+   * @brief Gives work that must report to a worker, which queues it.
    *
-   * The first free worker takes it, the warmest one; otherwise it waits in the queue, which keeps
-   * the order work arrived in. Once the task has run, its callback is invoked with the result, on
-   * the worker's thread.
+   * The first idle worker takes it, the warmest one; otherwise the worker given the fewest since it
+   * last drained, and the task waits behind that worker's queue - in the order it arrived there.
+   * Once the task has run, its callback is invoked with the result, on the worker's thread.
    *
    * @attention The last argument is the callback, which the signature cannot say: it arrives in
    * \p args and untangle::bind_task() splits it off. A missing or unusable one is a static_assert,
@@ -247,8 +240,8 @@ class executor {
    *
    * @tparam Args - The argument types to bind, of which the last is the callback.
    * @param task - The task to run.
-   * @param args - What to bind, followed by the callback. Copied here, so a task taking a reference
-   * gets the pool's copy.
+   * @param args - What to bind, followed by the callback. Copied by the worker's queue, so a task
+   * taking a reference gets the pool's copy.
    *
    * @return true - accepted, and the callback will be notified once it has run.
    * @return false - refused by a pool not started, stopped, draining or being destroyed, by a
@@ -267,26 +260,21 @@ class executor {
       return false;
     }
 
-    // untangle::bind_task() takes the callback off the end of the pack and checks it; what comes
-    // back is one callable that runs the work and then notifies, which is what the queue holds.
-    auto tsk = untangle::bind_task(std::move(task), std::forward<Args>(args)...);
+    // No lock: the counts only steer the choice, so a stale one costs balance, not correctness.
+    const std::size_t index = pick_worker();
+    given_[index].fetch_add(1, std::memory_order_relaxed);
 
-    // bind_task() builds an empty one from an empty action or callback. Queued, it would throw on a
-    // worker and report to on_task_error rather than to the caller, who could still act on it.
-    if (!tsk) {
-      return false;
-    }
-
-    return queue_task(std::move(tsk));
+    // The worker binds and checks it, as for any caller of execution::add_task(); an empty action
+    // or callback is refused there.
+    return workers_[index]->add_task(std::move(task), std::forward<Args>(args)...);
   }
 
   /**
-   * @brief How many tasks are waiting for a worker.
+   * @brief How many tasks are waiting in the workers' queues, not yet taken to run.
+   *
+   * @remark Advisory: true the moment it is read.
    */
-  std::size_t pending() const {
-    std::lock_guard<adaptive_mutex> lock(mutex_);
-    return pending_.size();
-  }
+  std::size_t pending() const { return total_pending(); }
 
   /**
    * @brief Starts every worker, and starts the pool accepting work.
@@ -306,7 +294,8 @@ class executor {
   /**
    * @brief Stops every worker. What they are already running, they finish.
    *
-   * Queued tasks stay unrun and anything added afterwards is refused, a running task included.
+   * What the workers were given they still run, then leave; anything added afterwards is refused, a
+   * running task included.
    * \ref start() revives the workers; harmless twice over.
    *
    * @attention It does not wait for the workers to leave their threads - only the destructor does,
@@ -317,7 +306,7 @@ class executor {
     // worker still runs; one arriving from here is refused.
     running_ = false;
 
-    // No lock: a worker waking from stop() runs on_finished, which takes mutex_.
+    // No lock: a worker draining after stop() runs on_finished, which may take mutex_.
     for (auto& one : workers_) {
       one->stop();
     }
@@ -384,73 +373,55 @@ class executor {
     return std::is_invocable_v<actionT, std::tuple_element_t<index, tupleT>&...>;
   }
 
-  using worker_execution = untangle::async::execution<untangle::task_t>;
+  using worker_execution = untangle::async::execution<actionT>;
 
   /**
-   * @brief Hands one entry to a free worker, or puts it at the back of the queue.
+   * @brief The first idle worker, the warmest; else the one given the fewest since it last drained.
    *
-   * What \ref add_task() does once bound: one queue, order out as in.
-   *
-   * @return true - taken. false - a worker refused it, and it is gone.
+   * Read without a lock, so two submitters may pick alike: the counts steer balance only.
    */
-  bool queue_task(untangle::task_t task) {
-    std::lock_guard<adaptive_mutex> lock(mutex_);
+  std::size_t pick_worker() const {
+    std::size_t best = 0;
+    std::size_t best_count = given_[0].load(std::memory_order_relaxed);
 
-    // The queue comes first: an entry does not overtake one already waiting in it.
-    if (pending_.empty()) {
-      // Always from the start, so a free pool reuses its warmest worker rather than waking a cold
-      // one. Under load the workers are busy and the queue below is what spreads the work.
-      for (std::size_t index = 0; index < workers_.size(); ++index) {
-        if (!workers_[index]->is_busy()) {
-          // A refused entry is already destroyed, and stop() stops every worker together, so there
-          // is nothing to queue and no other worker to try.
-          return give_to_worker(index, std::move(task));
-        }
+    for (std::size_t index = 0; index < workers_.size(); ++index) {
+      const std::size_t count = given_[index].load(std::memory_order_relaxed);
+      if (count == 0) {
+        return index;
+      }
+      if (count < best_count) {
+        best = index;
+        best_count = count;
       }
     }
 
-    pending_.push_back(std::move(task));
-    return true;
+    return best;
   }
 
   /**
-   * @brief Hands one entry to a worker. Call with the mutex held.
-   *
-   * @return true - the worker took it. false - it is stopped and has destroyed the entry, which
-   * cannot be put back either way.
+   * @brief Called on the worker's own thread once it has run everything it was given.
    */
-  [[nodiscard]] bool give_to_worker(std::size_t index, untangle::task_t task) {
-    // The door takes the worker's action_mutex under mutex_. The two never cycle, because a worker
-    // calls on_finished with its action_mutex released.
-    return workers_[index]->add_action(std::move(task));
-  }
+  void worker_drained(std::size_t index) {
+    given_[index].store(0, std::memory_order_relaxed);
 
-  /**
-   * @brief Called on the worker's own thread once it has finished its queue.
-   */
-  void take_next_task(std::size_t index) {
-    std::lock_guard<adaptive_mutex> lock(mutex_);
-
-    if (!pending_.empty()) {
-      untangle::task_t next = std::move(pending_.front());
-      pending_.pop_front();
-
-      if (!give_to_worker(index, std::move(next))) {
-        // The task is already destroyed, so it is reported rather than put back.
-        std::println(stderr, "executor: {} refused a queued task, which is lost",
-                     workers_[index]->name);
-      }
-
-      return;
-    }
-
-    if (nothing_running()) {
+    // The lock only for a wait(), which counts itself under it before its first check.
+    if (waiting_.load() > 0) {
+      std::lock_guard<adaptive_mutex> lock(mutex_);
       finished_cv_.notify_all();
     }
   }
 
+  //! What the workers hold queued, summed.
+  std::size_t total_pending() const {
+    std::size_t total = 0;
+    for (const auto& one : workers_) {
+      total += one->pending();
+    }
+    return total;
+  }
+
   /**
-   * @brief Is every worker idle? Call with the mutex held.
+   * @brief Is every worker idle?
    *
    * Asked of the workers rather than tallied here, so it cannot drift from what they are doing.
    */
@@ -517,9 +488,13 @@ class executor {
   //! workers and nothing else, so the destructor waits for those and no others.
   async::execution_poll poll_;
 
-  //! Tasks waiting for a worker, each bound to its arguments, in the order added.
-  std::deque<untangle::task_t> pending_;
   std::vector<std::shared_ptr<worker_execution>> workers_;
+
+  //! Per worker: tasks given since it last drained. Steers pick_worker() only, so read unlocked.
+  std::unique_ptr<std::atomic<std::size_t>[]> given_;
+
+  //! How many wait() calls are waiting. A drained worker takes mutex_ to notify only then.
+  std::atomic<std::size_t> waiting_ = {0};
   //! Whether the pool accepts work. False until start(), false from stop(), and false for as long
   //! as wait() is draining, which puts back whatever it found.
   std::atomic_bool running_ = {false};

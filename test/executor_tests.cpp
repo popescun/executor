@@ -376,15 +376,12 @@ TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
 }
 
 /**
- * @brief A queued task a stopped worker refuses is reported rather than passed over.
+ * @brief stop() runs what was already submitted: a stopped worker drains its own queue.
  *
- * A stopped worker refuses what it is handed and destroys it. add_task() answered true for these
- * while the pool was still running, so the loss is named on stderr.
- *
- * @remark The queue is the only way to reach the refusal: stop() stops the pool accepting, so
- * add_task() never offers a worker anything after it. These were accepted before.
+ * Each worker keeps its own queue, so work a worker was given before stop() is its to run. Nothing
+ * is refused or dropped, so stderr says nothing about it.
  */
-TEST(executor_tests, a_queued_task_a_worker_refuses_is_reported) {
+TEST(executor_tests, stop_runs_what_was_already_submitted) {
   constexpr int queued_count = 4;
 
   gate busy;
@@ -396,7 +393,7 @@ TEST(executor_tests, a_queued_task_a_worker_refuses_is_reported) {
     executor executor(1);
     executor.start();
 
-    // Occupies the only worker, so everything after it waits in the queue.
+    // Occupies the only worker, so everything after it waits in its queue.
     EXPECT_TRUE(executor.add_task([&busy] { busy(); }, ignore_result));
     ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
 
@@ -404,20 +401,20 @@ TEST(executor_tests, a_queued_task_a_worker_refuses_is_reported) {
       EXPECT_TRUE(executor.add_task([&ran] { ran.fetch_add(1, std::memory_order_relaxed); },
                                     ignore_result));
     }
-    ASSERT_EQ(executor.pending(), static_cast<std::size_t>(queued_count));
+    EXPECT_EQ(executor.pending(), static_cast<std::size_t>(queued_count));
 
-    // The worker is stopped with the queue still full, and takes from it as it finishes.
     executor.stop();
     busy.open();
   }
 
   const std::string reported = testing::internal::GetCapturedStderr();
 
-  EXPECT_EQ(ran.load(), 0) << "a refused task cannot have run";
-  EXPECT_THAT(reported, ::testing::HasSubstr("refused a queued task"))
-      << "the queued task was lost without a word; stderr held: " << reported;
+  EXPECT_EQ(ran.load(), queued_count) << "work submitted before stop() did not run";
+  EXPECT_THAT(reported, ::testing::Not(::testing::HasSubstr("refused")))
+      << "stderr held: " << reported;
+  EXPECT_THAT(reported, ::testing::Not(::testing::HasSubstr("dropped")))
+      << "stderr held: " << reported;
 }
-
 /**
  * @brief A task may add more work, and it runs.
  *
@@ -1125,39 +1122,6 @@ TEST(executor_tests, wait_refuses_new_work_until_it_returns) {
 }
 
 /**
- * @brief The destructor reports what a stopped pool left queued, which wait() cannot drain.
- *
- * The worker takes one on its way out, through take_next_task(), and loses it to a stopped door -
- * a_queued_task_a_worker_refuses_is_reported covers that. The rest never move, and are this count.
- */
-TEST(executor_tests, the_destructor_reports_work_a_stopped_pool_could_not_drain) {
-  constexpr std::size_t queued_count = 3;
-
-  testing::internal::CaptureStderr();
-
-  {
-    gate busy;
-    executor pool(1);
-    pool.start();
-
-    pool.add_task([&busy] { busy(); }, ignore_result);
-    ASSERT_TRUE(wait_for([&busy] { return busy.arrived() == 1; }, 5s));
-
-    for (std::size_t i = 0; i < queued_count; ++i) {
-      ASSERT_TRUE(pool.add_task([] {}, ignore_result));
-    }
-    ASSERT_EQ(pool.pending(), queued_count);
-
-    pool.stop();  // nothing queued can reach a worker from here
-    busy.open();
-  }
-
-  const std::string reported = testing::internal::GetCapturedStderr();
-  EXPECT_THAT(reported, ::testing::HasSubstr("dropped"))
-      << "the queue the destructor abandoned went unreported; stderr held: " << reported;
-}
-
-/**
  * @brief Two threads draining one pool leave it accepting, and neither returns early.
  *
  * Overlapping waits used to read each other's cleared flag: the last one out restored the value it
@@ -1206,6 +1170,71 @@ TEST(executor_tests, concurrent_waits_leave_the_pool_accepting) {
     ASSERT_EQ(ran.load(), queued_count + 1)
         << "round " << round << ": the pool did not run what it accepted afterwards";
   }
+}
+
+/**
+ * @brief Opens two gates when it goes out of scope, so a failed check cannot leave a worker held.
+ *
+ * Declared after the pool, it is destroyed first: the pool's destructor waits for its workers.
+ */
+struct open_on_exit {
+  gate& first;
+  gate& second;
+  ~open_on_exit() {
+    first.open();
+    second.open();
+  }
+};
+
+/**
+ * @brief A task given to a busy worker waits for that worker, even when another goes idle.
+ *
+ * Each worker keeps its own queue, filled at submission: the pool balances by count, not by how
+ * long the work takes.
+ */
+TEST(executor_tests, a_task_waits_for_the_worker_it_was_given) {
+  gate busy_a;
+  gate busy_b;
+  std::atomic_int ran = {0};
+  executor pool(2);
+  open_on_exit opener{busy_a, busy_b};
+  pool.start();
+
+  // Worker 0 is tried first, so each gate lands on its own worker.
+  ASSERT_TRUE(pool.add_task([&busy_a] { busy_a(); }, ignore_result));
+  ASSERT_TRUE(wait_for([&busy_a] { return busy_a.arrived() == 1; }, 2s));
+  ASSERT_TRUE(pool.add_task([&busy_b] { busy_b(); }, ignore_result));
+  ASSERT_TRUE(wait_for([&busy_b] { return busy_b.arrived() == 1; }, 2s));
+
+  // Both workers hold one each, so these alternate: two per worker.
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(pool.add_task([&ran] { ran.fetch_add(1); }, ignore_result));
+  }
+
+  busy_a.open();
+  std::this_thread::sleep_for(100ms);
+  EXPECT_EQ(ran.load(), 2) << "the freed worker ran tasks given to the other";
+
+  busy_b.open();
+  EXPECT_TRUE(wait_for([&ran] { return ran.load() == 4; }, 2s));
+}
+
+/**
+ * @brief Tasks submitted back to back to an idle pool go to different workers.
+ */
+TEST(executor_tests, a_burst_is_spread_over_idle_workers) {
+  gate busy_a;
+  gate busy_b;
+  executor pool(2);
+  open_on_exit opener{busy_a, busy_b};
+  pool.start();
+
+  // Without waiting in between: the second must not queue behind the first.
+  ASSERT_TRUE(pool.add_task([&busy_a] { busy_a(); }, ignore_result));
+  ASSERT_TRUE(pool.add_task([&busy_b] { busy_b(); }, ignore_result));
+
+  EXPECT_TRUE(wait_for([&] { return busy_a.arrived() == 1 && busy_b.arrived() == 1; }, 2s))
+      << "both tasks went to one worker";
 }
 
 // ---------------------------------------------------------------------------
