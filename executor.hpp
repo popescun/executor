@@ -144,17 +144,21 @@ class executor {
 
     // Waits for every worker to leave its thread, which is what makes destroying them safe. A
     // different question from the wait above: a worker can be idle and still be in its thread.
+    // A worker leaves within microseconds of stop(), so the first tick is short and doubles up to
+    // the ceiling: a fixed tick made every destruction sleep it once.
     auto interval = std::chrono::milliseconds(report_first_ms);
-    auto waited = std::chrono::milliseconds(0);
+    auto waited = std::chrono::microseconds(0);
+    auto tick = std::chrono::microseconds(poll_first_us);
 
     while (poll_.is_running()) {  // time of check
-      const auto tick = std::chrono::milliseconds(poll_interval_ms);
       std::this_thread::sleep_for(tick);
       waited += tick;
+      tick = std::min(tick * 2, std::chrono::microseconds(poll_max_ms * 1000));
 
       if (waited >= interval) {
         std::println(stderr, "executor: still waiting to stop after {}s - {} not left its thread{}",
-                     waited.count() / 1000, count_workers(&worker_execution::is_running),
+                     std::chrono::duration_cast<std::chrono::seconds>(waited).count(),
+                     count_workers(&worker_execution::is_running),
                      name_workers(&worker_execution::is_running));
 
         interval = std::min(interval * 2, std::chrono::milliseconds(report_max_ms));
@@ -524,8 +528,10 @@ class executor {
     return names;
   }
 
-  //! How often the destructor asks the poll whether the workers have left.
-  static constexpr int poll_interval_ms = 50;
+  //! How long the destructor first sleeps before it asks again whether the workers have left, and
+  //! the ceiling that sleep doubles to.
+  static constexpr int poll_first_us = 100;
+  static constexpr int poll_max_ms = 50;
 
   //! How long a wait may be silent before it reports, and the ceiling its interval doubles to.
   static constexpr int report_first_ms = 1000;

@@ -13,6 +13,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -1279,6 +1280,28 @@ TEST(executor_tests, a_refused_task_leaves_its_worker_free) {
   pool.wait();
 
   EXPECT_EQ(second, first) << "the refused task left the warmest worker looking busy";
+}
+
+/**
+ * @brief Destroying a pool does not sleep a fixed tick: its workers leave within microseconds.
+ *
+ * The fastest of five destructions, so a slow machine or a sanitizer build does not trip it.
+ */
+TEST(executor_tests, destroying_a_pool_does_not_wait_a_whole_tick) {
+  auto fastest = std::chrono::steady_clock::duration::max();
+
+  for (int round = 0; round < 5; ++round) {
+    auto pool = std::make_unique<executor>(1);
+    pool->start();
+
+    const auto start = std::chrono::steady_clock::now();
+    pool.reset();
+    fastest = std::min(fastest, std::chrono::steady_clock::now() - start);
+  }
+
+  EXPECT_LT(fastest, 20ms) << "destroying an idle pool took "
+                           << std::chrono::duration_cast<std::chrono::microseconds>(fastest).count()
+                           << " us";
 }
 
 // ---------------------------------------------------------------------------
