@@ -235,8 +235,9 @@ class executor {
    * @attention A task that throws is not notified - what it threw goes to \ref on_task_error - and
    * a refused one does not notify either, so a caller waiting on the callback alone waits for ever.
    *
-   * @attention An empty callback or action is refused here too. Only a run time check can see it,
-   * and a task that can neither run nor notify is turned away rather than queued to throw.
+   * @attention An empty callback or action is refused here too, silently: the answer is the report.
+   * Only a run time check can see it, and a task that can neither run nor notify is turned away
+   * before any worker is asked.
    *
    * @tparam Args - The argument types to bind, of which the last is the callback.
    * @param task - The task to run.
@@ -256,7 +257,7 @@ class executor {
                   "executor: the task cannot be called with the arguments given to add_task() "
                   "before its callback");
 
-    if (!running_) {
+    if (!running_ || task_is_empty(task, args...)) {
       return false;
     }
 
@@ -264,9 +265,16 @@ class executor {
     const std::size_t index = pick_worker();
     given_[index].fetch_add(1, std::memory_order_relaxed);
 
-    // The worker binds and checks it, as for any caller of execution::add_task(); an empty action
-    // or callback is refused there.
-    return workers_[index]->add_task(std::move(task), std::forward<Args>(args)...);
+    // The worker binds it, as for any caller of execution::add_task(): the arguments are forwarded
+    // once, from here.
+    if (workers_[index]->add_task(std::move(task), std::forward<Args>(args)...)) {
+      return true;
+    }
+
+    // Only a stopped worker refuses now. Not counted, or an idle worker would look busy until it is
+    // next given work and drains.
+    forget_given(index);
+    return false;
   }
 
   /**
@@ -396,6 +404,41 @@ class executor {
     }
 
     return best;
+  }
+
+  /**
+   * @brief Whether untangle::bind_task() would build an empty task from these: the action or its
+   * callback - the last argument - is empty, so it could never run or notify. Read by reference:
+   * nothing is copied or moved.
+   */
+  template <typename... Args>
+  static bool task_is_empty(const actionT& task, const Args&... args) {
+    if constexpr (testable_for_emptiness<actionT>) {
+      if (!task) {
+        return true;
+      }
+    }
+
+    if constexpr (sizeof...(Args) > 0) {
+      const auto& callback = std::get<sizeof...(Args) - 1>(std::forward_as_tuple(args...));
+      if constexpr (testable_for_emptiness<std::decay_t<decltype(callback)>>) {
+        if (!callback) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * @brief Takes back the count of a task the worker refused, unless a drain has reset it since.
+   */
+  void forget_given(std::size_t index) {
+    std::size_t count = given_[index].load(std::memory_order_relaxed);
+    while (count > 0 &&
+           !given_[index].compare_exchange_weak(count, count - 1, std::memory_order_relaxed)) {
+    }
   }
 
   /**

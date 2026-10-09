@@ -23,6 +23,9 @@ was never committed; step 31 drops `pending_`: the pool picks a worker at submis
 `execution::add_task()`, so a task is sealed once and async's API stays as it is (async's steps 51 and
 52, `11aa5a8`). On empty batches the executor now submits and delivers ahead of `QThreadPool`; 44 of
 44 (and 5 smoke) on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
+**2026-10-09 — step 32 (group 8) done: `add_task()` after step 31.** A refused task left its
+worker looking busy, and an empty task was refused with a warning on stderr. Both fixed
+(uncommitted); 46 of 46 on Debug, ASan and TSan.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -185,6 +188,7 @@ returns something give back — so read those two before deciding what it means 
 | 29 | 26 | destroying a pool always takes 50 ms | `:159-161`, `:504` | CONFIRMED (probe) |
 | 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) — SUPERSEDED by step 31, never committed |
 | 31 ✅ | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) — fixed `d1245d7` |
+| 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed (uncommitted) |
 
 ---
 
@@ -1510,3 +1514,37 @@ The executor now submits faster than `QThreadPool` and delivers empty batches so
 workers; with real work they are equal. **One small cost:** a single task with work arrives ~2 µs
 later than with `QThreadPool` (20.2 against 18.1 µs, `processed` 16.5 against 15.4) - the worker's
 spin-before-park and lock path from async's step 51, paid once per wake-up.
+
+### Step 32 ✅ · item 29 — `add_task()` counts a task its worker refuses, and an empty one now warns — DONE
+`executor.hpp`, `add_task()` as of `d1245d7` · CONFIRMED by tests, 2026-10-09
+
+Two things step 31 left in `add_task()`, found reviewing it (user: "don't we need to fix also
+add_task?"):
+
+1. **A refused task still counts.** The worker's count goes up before the worker answers. When it
+   refuses - an empty action or callback, or a worker already stopped - the count stays up, and an
+   idle worker never drains to reset it: `pick_worker()` no longer sees it idle until it is given
+   real work. `wait()` asks the workers, so it is unaffected: balance, not correctness.
+2. **An empty task now warns.** Before step 31 the pool refused an empty action or callback itself,
+   silently - `false` was the whole report. Since step 31 the worker refuses it, and async prints
+   "refused a task that cannot report" on stderr.
+
+**Proposed:**
+- Check emptiness in the pool before picking a worker: the action, and the callback - the last
+  argument - read by reference, as async's `testable_for_emptiness` does. Nothing is copied or moved:
+  the arguments are still forwarded once, from `add_task()` to `execution::add_task()` (user).
+- On a refusal by the worker - now only a stopped one - undo the count, with a compare-and-swap that
+  decrements only while it is above zero: a drain may have reset it in between.
+
+**Tests (written first, failing):** `an_empty_task_is_refused_without_a_word` (an empty action and an
+empty callback, both refused, stderr empty) - stderr holds the warning twice;
+`a_refused_task_leaves_its_worker_free` (2 workers, idle: the task after a refused one runs on the
+same thread as the one before it) - it ran on worker 1. The stopped-worker refusal is a race between
+`stop()` and `add_task()` with no deterministic test; the undo is the same code path.
+
+**Landed 2026-10-09 (uncommitted).** `task_is_empty()` applies `bind_task()`'s rule
+(`testable_for_emptiness` on the action type and on the decayed last argument) to the action and to
+the last argument read through `std::forward_as_tuple`, by reference, before any worker is picked;
+`forget_given()` takes back a refused task's count with a compare-and-swap that stops at zero. The
+arguments are still forwarded once, to `execution::add_task()`. 46 of 46 on Debug, ASan and TSan;
+docs clean.

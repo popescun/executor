@@ -1237,6 +1237,50 @@ TEST(executor_tests, a_burst_is_spread_over_idle_workers) {
       << "both tasks went to one worker";
 }
 
+/**
+ * @brief An empty action or callback is refused by the pool itself, without a word on stderr.
+ *
+ * The answer is the whole report, as before the workers kept their own queues: no worker is asked,
+ * so none warns.
+ */
+TEST(executor_tests, an_empty_task_is_refused_without_a_word) {
+  testing::internal::CaptureStderr();
+
+  {
+    executor pool(1);
+    pool.start();
+
+    EXPECT_FALSE(pool.add_task(std::function<void()>{}, ignore_result)) << "an empty action ran";
+    EXPECT_FALSE(pool.add_task([] {}, std::function<void()>{})) << "an empty callback was taken";
+  }
+
+  const std::string reported = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(reported, "") << "a refusal the caller is told about was also printed";
+}
+
+/**
+ * @brief A refused task leaves its worker free: the next task still goes to the warmest worker.
+ *
+ * A worker counts the tasks it was given until it drains; one it never took must not count, or an
+ * idle worker looks busy until it is given real work.
+ */
+TEST(executor_tests, a_refused_task_leaves_its_worker_free) {
+  executor pool(2);
+  pool.start();
+
+  std::thread::id first;
+  ASSERT_TRUE(pool.add_task([&first] { first = std::this_thread::get_id(); }, ignore_result));
+  pool.wait();
+
+  EXPECT_FALSE(pool.add_task([] {}, std::function<void()>{}));
+
+  std::thread::id second;
+  ASSERT_TRUE(pool.add_task([&second] { second = std::this_thread::get_id(); }, ignore_result));
+  pool.wait();
+
+  EXPECT_EQ(second, first) << "the refused task left the warmest worker looking busy";
+}
+
 // ---------------------------------------------------------------------------
 // adaptive_mutex - the pool's lock: spins briefly, then blocks
 // ---------------------------------------------------------------------------
