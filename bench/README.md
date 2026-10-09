@@ -100,7 +100,7 @@ Four changes closed it, each found with this benchmark:
    at a time, wrapped a second time.
 4. **Async step 53** (`be5986c`, pinned by `c3dc143`): the worker's spin before parking, from step
    51, is gone. It cost a single task with work ~2 µs - one task of 10 µs arrived in 19.5–20.5 µs
-   against `QThreadPool`'s 17.5–18.1 - and the batches here never reached it. Now 14.4–18.0 against
+   against `QThreadPool`'s 17.5–18.5 - and the batches here never reached it. Now 14.4–18.1 against
    14.5–18.2.
 
 1000 empty tasks, medians of each run, µs:
