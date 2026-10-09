@@ -12,6 +12,10 @@ disproven. **Four were called blockers**: each was
 read as a way the pool can hang or read freed memory. **None is open.** Steps 1, 2 and 4 were fixed;
 step 3 was probed and does not reproduce, so it is closed as not a defect rather than fixed. What is
 left is group 2 onwards — what the caller is told, placement, and the surface.
+**2026-10-09 — step 28 (group 8) done: `add_task()` contended on the pool's lock.** Found with
+`bench/qt_pool_vs_this` and profiled; `mutex_` is now an `untangle::adaptive_mutex`, which spins
+before it blocks. Submitting 1000 empty tasks takes 40-60% less time on the main thread; 48 of 48
+green on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -169,6 +173,8 @@ returns something give back — so read those two before deciding what it means 
 | 19 | — | the sanitizers have never been run against the suite | `.github/workflows/ci.yml` | — |
 | 20 ✅ | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp:457`, `:1008` | extended 2026-09-25 for the task door |
 | 21 ✅ | — | README and the reference state behaviour the fixes will change | `README.md` | audited and written 2026-09-25 — **DONE** (`11d6b12`) |
+| **Group 8 — cost** |
+| 28 ✅ | 25 | `add_task()` keeps the submitter waiting on the pool's lock | `:345-364`, `:380-399`, `:459` | CONFIRMED (profile, `bench/qt_pool_vs_this`) — fixed, `adaptive_mutex` (uncommitted) |
 
 ---
 
@@ -1194,3 +1200,59 @@ deduces an empty pack and takes the short-circuit.
 > that was reached by reading an interface rather than compiling against one, and it is the only one
 > that has had to be taken back. Everything else closed here carries a probe, a test, or a sanitizer
 > run. `9daec8b` was not wrong about what it did; it was wrong about what it said could not be done.
+
+## Group 8 — cost
+
+### Step 28 ✅ · item 25 — `add_task()` keeps the submitter waiting on the pool's lock — DONE
+`executor.hpp:345-364` (`queue_task`), `:380-399` (`take_next_task`), `:459` (`mutex_`) ·
+CONFIRMED by profile, 2026-10-09
+
+**Found by** `bench/qt_pool_vs_this`, against Qt's thread pool: with empty tasks the main thread spent
+1.5-5x as long submitting as with `QThreadPool`. The cost is in submitting, not running.
+
+| 1000 empty tasks, `submitted` column, median µs (two runs) | executor | QThreadPool |
+|---|---|---|
+| 1 worker | 467.9, 114.2 | 100.0, 74.0 |
+| 4 workers | 524.1, 473.3 | 90.5, 87.8 |
+
+**Reproduced without Qt** by a scratchpad harness (1000 empty tasks submitted, then waited for):
+1/2/4 workers took 118/227/386 µs, so the cost grows with the worker count.
+
+**Profile** (`sample` on that harness, 4 workers): of the submitting thread's time, 62% waits for `mutex_` in the
+kernel (`__psynch_mutexwait`), 19% releases it to a waiting worker (`__psynch_mutexdrop`), 10% wakes a
+worker (`notify_one`); the task itself is the rest. The workers wait on the same lock in
+`take_next_task()`, which every worker takes after every batch, queued work or not. `std::mutex` on
+macOS blocks at once instead of spinning first, so every meeting is a pair of syscalls.
+
+**Measured on a scratchpad copy** (4 workers, median µs): spinning ~100 tries before blocking on
+`mutex_` 388 -> 260; skipping `nothing_running()` unless `wait()` waits 388 -> 357; executor-owned busy
+flags instead of locking each worker 388 -> 345; spin + flags 236. Reaching `QThreadPool`'s ~90 needs
+a shared queue the workers pull from - a redesign, not this step.
+
+**Decided (user, 2026-10-09): spin, then block** - option 1 of four. A lock of the pool's own,
+`untangle::adaptive_mutex`, replaces `std::mutex` for `mutex_`: `lock()` tries a bounded number of
+times with a CPU pause between tries, then blocks. `finished_cv_` becomes `std::condition_variable_any`
+to wait on it. Nothing else changes: same lock order, same critical sections.
+
+**Tests (written first, fail to compile until the type exists):** `adaptive_mutex_tests` in
+`test/executor_tests.cpp` - exclusion under contention, `try_lock()` never waits, `lock()` waits out a
+holder longer than the spin, and `std::condition_variable_any` waits on it. The rest of the suite
+covers the pool with the new lock (`wait()`, the destructor, the hard-run cases of step 20).
+
+**Done when:** the suite is green on Debug, ASan and TSan, and `bench/qt_pool_vs_this`, run again,
+shows the executor's `submitted` time for empty batches down by about the drop measured above.
+
+**Landed 2026-10-09.** `untangle::adaptive_mutex` in `executor.hpp`: `lock()` tries 100 times with a
+CPU pause (`pause` on x86, `yield` on ARM) before it blocks. `mutex_` uses it and `finished_cv_` is a
+`std::condition_variable_any`; nothing else changed. 48 of 48 on Debug, ASan and TSan (44 + the 4
+new cases). `bench/qt_pool_vs_this` again, two runs, `submitted` for 1000 empty tasks, median µs:
+
+| | executor before | executor after | QThreadPool |
+|---|---|---|---|
+| 1 worker | 467.9, 114.2 | 85.5, 59.3 | 99.9, 75.7 |
+| 4 workers | 524.1, 473.3 | 205.5, 185.2 | 75.4, 78.7 |
+
+With one worker - flux's default - the executor now submits as fast as `QThreadPool` or faster;
+with four it still takes about 2.5x as long, which is what is left for a shared-queue design. The
+`delivered` times move less (4 workers: 604 -> 480-487 µs), and with real work nothing changed:
+the cost was always the submit, and the work hides it.

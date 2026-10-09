@@ -77,7 +77,9 @@ vary by up to 4x between runs. This is the second run.
   - The executor's `add_task` keeps the main thread busy 1.5–5x longer, and longest with 4 workers,
     whose `on_finished` takes the same mutex the main thread pushes under.
   - This is the one place where the executor costs the UI thread something: about 0.5 µs per task at
-    worst. It is the place to look if the executor is ever tuned.
+    worst. **Since fixed:** the pool's lock now spins before it blocks (`todo/FIX_PLAN.md`, step
+    28). Submitting 1000 empty tasks now takes 59–86 µs with 1 worker, faster than `QThreadPool`'s
+    76–100, and 185–206 µs with 4 workers, against `QThreadPool`'s 75–79.
 - **QtConcurrent is the slowest to submit by far** (0.6–1.8 ms per 1000 tasks), because it builds a
   future and a continuation per task.
 - **Four workers run 1000 × 10 µs in 3.1 ms**, 3.5x one worker's 11 ms.
