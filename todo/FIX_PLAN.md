@@ -18,7 +18,7 @@ before it blocks. Submitting 1000 empty tasks takes 40-60% less time on the main
 green on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
 **2026-10-09 — step 29 (group 8) done: destroying a pool always took 50 ms.** Found while checking
 the benchmark for sleeps, confirmed by a probe. The destructor's poll now starts at 0.1 ms and
-doubles: a destruction takes 0.13-0.19 ms. Uncommitted; 47 of 47 on Debug, ASan and TSan.
+doubles: a destruction takes 0.13-0.19 ms. Fixed in `6cc4350`; 47 of 47 on Debug, ASan and TSan.
 **2026-10-09 — step 30 superseded, step 31 (group 8) done: per-worker queues (`d1245d7`).** Step 30's batching
 was never committed; step 31 drops `pending_`: the pool picks a worker at submission and calls
 `execution::add_task()`, so a task is sealed once and async's API stays as it is (async's steps 51 and
@@ -186,7 +186,7 @@ returns something give back — so read those two before deciding what it means 
 | 21 ✅ | — | README and the reference state behaviour the fixes will change | `README.md` | audited and written 2026-09-25 — **DONE** (`11d6b12`) |
 | **Group 8 — cost** |
 | 28 ✅ | 25 | `add_task()` keeps the submitter waiting on the pool's lock | `:345-364`, `:380-399`, `:459` | CONFIRMED (profile, `bench/qt_pool_vs_this`) — fixed `e9ef8ea` |
-| 29 ✅ | 26 | destroying a pool always takes 50 ms | `:159-161`, `:504` | CONFIRMED (probe) — fixed (uncommitted) |
+| 29 ✅ | 26 | destroying a pool always takes 50 ms | `:159-161`, `:504` | CONFIRMED (probe) — fixed `6cc4350` |
 | 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) — SUPERSEDED by step 31, never committed |
 | 31 ✅ | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) — fixed `d1245d7` |
 | 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed `99ebed7` |
@@ -1314,7 +1314,7 @@ after `stop()` sleeps ~0.1 ms, doubling up to the 50 ms it uses today; the stall
 five destructions of a started, idle 1-worker pool is under 20 ms. Today: 51.0 ms. The fastest, so a
 slow machine or a sanitizer build does not trip it.
 
-**Landed 2026-10-09 (uncommitted).** `poll_interval_ms` (50) became `poll_first_us` (100) and
+**Landed in `6cc4350`.** `poll_interval_ms` (50) became `poll_first_us` (100) and
 `poll_max_ms` (50): the tick starts at 0.1 ms and doubles to 50 ms; `waited` counts microseconds and
 the report converts it to seconds. The stall reports keep their 1 s, doubling to 30 s. The probe
 again, Release, 20 destructions per case: 0.138 / 0.147 / 0.142 / 0.159 ms (1 worker idle, 1 worker
