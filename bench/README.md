@@ -38,57 +38,57 @@ It prints a markdown table and exits non-zero if any check failed.
 ## Results
 
 Apple M4 (4 performance and 6 efficiency cores), macOS 26.6.2, Apple clang 17, Qt 6.11.2, Release,
-2026-10-09, in µs, with the executor at `6cc4350`: each worker keeps its own queue (fix plan step 31),
-on async `11aa5a8`, whose workers spin briefly before they park or block. Steps 29 and 32, since
-`d1245d7`, change nothing the benchmark times. Three runs on that code agreed except for the empty
-1000-task batches, which vary by up to 1.5x between runs, `QThreadPool`'s as much as the executor's.
-This is the third.
+2026-10-09, in µs, with the executor at `c3dc143`: each worker keeps its own queue (fix plan step 31),
+on async `be5986c`, whose workers park as soon as their queue is empty (async step 53). Three runs on
+that code agreed except for the empty 1000-task batches, which vary by up to 1.4x between runs,
+`QThreadPool`'s as much as the executor's. This is the third.
 
 | workers | tasks | task µs | pool         |  submitted |  processed |  delivered | per task |
 |--------:|------:|--------:|--------------|-----------:|-----------:|-----------:|---------:|
-|       1 |     1 |     0.0 | executor     |        0.8 |        1.8 |        3.0 |     3.00 |
-|       1 |     1 |     0.0 | QThreadPool  |        0.8 |        1.9 |        4.9 |     4.88 |
-|       1 |     1 |     0.0 | QtConcurrent |        1.3 |        2.0 |        3.0 |     3.00 |
-|       1 |  1000 |     0.0 | executor     |       49.8 |      161.2 |      174.8 |     0.17 |
-|       1 |  1000 |     0.0 | QThreadPool  |       68.2 |      241.8 |      252.4 |     0.25 |
-|       1 |  1000 |     0.0 | QtConcurrent |      514.1 |      519.5 |      955.2 |     0.96 |
-|       4 |     1 |     0.0 | executor     |        0.6 |        3.3 |        7.3 |     7.33 |
-|       4 |     1 |     0.0 | QThreadPool  |        0.7 |        3.5 |        7.6 |     7.62 |
-|       4 |     1 |     0.0 | QtConcurrent |        1.2 |        4.0 |        8.8 |     8.75 |
-|       4 |  1000 |     0.0 | executor     |       39.8 |      310.0 |      335.0 |     0.34 |
-|       4 |  1000 |     0.0 | QThreadPool  |       66.2 |      355.5 |      390.8 |     0.39 |
-|       4 |  1000 |     0.0 | QtConcurrent |     1799.5 |     1800.7 |     2216.8 |     2.22 |
-|       1 |     1 |    10.0 | executor     |        0.6 |       16.6 |       20.5 |    20.50 |
-|       1 |     1 |    10.0 | QThreadPool  |        0.7 |       14.9 |       17.8 |    17.75 |
-|       1 |     1 |    10.0 | QtConcurrent |        1.0 |       16.2 |       20.1 |    20.08 |
-|       1 |  1000 |    10.0 | executor     |       27.2 |    10873.7 |    10878.8 |    10.88 |
-|       1 |  1000 |    10.0 | QThreadPool  |       20.1 |    10885.6 |    10890.9 |    10.89 |
-|       1 |  1000 |    10.0 | QtConcurrent |      248.6 |    11065.5 |    11069.3 |    11.07 |
-|       4 |     1 |    10.0 | executor     |        0.6 |       16.5 |       20.2 |    20.25 |
-|       4 |     1 |    10.0 | QThreadPool  |        0.7 |       14.9 |       17.7 |    17.67 |
-|       4 |     1 |    10.0 | QtConcurrent |        0.9 |       16.1 |       20.0 |    19.96 |
-|       4 |  1000 |    10.0 | executor     |       41.5 |     3098.8 |     3105.8 |     3.11 |
-|       4 |  1000 |    10.0 | QThreadPool  |       30.0 |     3100.0 |     3104.9 |     3.10 |
-|       4 |  1000 |    10.0 | QtConcurrent |      531.5 |     3618.6 |     3631.3 |     3.63 |
+|       1 |     1 |     0.0 | executor     |        0.8 |        1.8 |        2.8 |     2.83 |
+|       1 |     1 |     0.0 | QThreadPool  |        0.8 |        1.9 |        4.8 |     4.75 |
+|       1 |     1 |     0.0 | QtConcurrent |        1.3 |        2.0 |        3.1 |     3.08 |
+|       1 |  1000 |     0.0 | executor     |       40.2 |      152.3 |      173.5 |     0.17 |
+|       1 |  1000 |     0.0 | QThreadPool  |       71.7 |      277.1 |      291.9 |     0.29 |
+|       1 |  1000 |     0.0 | QtConcurrent |      560.3 |      562.4 |     1008.4 |     1.01 |
+|       4 |     1 |     0.0 | executor     |        0.6 |        3.3 |        7.2 |     7.25 |
+|       4 |     1 |     0.0 | QThreadPool  |        0.6 |        3.4 |        7.2 |     7.25 |
+|       4 |     1 |     0.0 | QtConcurrent |        1.1 |        3.9 |        7.5 |     7.54 |
+|       4 |  1000 |     0.0 | executor     |       41.8 |      336.1 |      362.0 |     0.36 |
+|       4 |  1000 |     0.0 | QThreadPool  |       89.7 |      450.8 |      480.1 |     0.48 |
+|       4 |  1000 |     0.0 | QtConcurrent |     1934.9 |     1945.9 |     2397.2 |     2.40 |
+|       1 |     1 |    10.0 | executor     |        0.6 |       15.1 |       18.0 |    18.00 |
+|       1 |     1 |    10.0 | QThreadPool  |        0.6 |       14.8 |       18.0 |    18.04 |
+|       1 |     1 |    10.0 | QtConcurrent |        1.2 |       14.9 |       18.8 |    18.75 |
+|       1 |  1000 |    10.0 | executor     |       36.3 |    12297.5 |    12303.7 |    12.30 |
+|       1 |  1000 |    10.0 | QThreadPool  |       20.5 |    12328.1 |    12333.8 |    12.33 |
+|       1 |  1000 |    10.0 | QtConcurrent |      321.0 |    12486.3 |    12493.0 |    12.49 |
+|       4 |     1 |    10.0 | executor     |        0.6 |       14.8 |       18.0 |    17.96 |
+|       4 |     1 |    10.0 | QThreadPool  |        0.7 |       14.6 |       17.9 |    17.92 |
+|       4 |     1 |    10.0 | QtConcurrent |        1.1 |       14.9 |       18.7 |    18.67 |
+|       4 |  1000 |    10.0 | executor     |       38.6 |     2956.6 |     2963.0 |     2.96 |
+|       4 |  1000 |    10.0 | QThreadPool  |       31.7 |     2958.0 |     2962.0 |     2.96 |
+|       4 |  1000 |    10.0 | QtConcurrent |     1205.8 |     3645.0 |     3670.2 |     3.67 |
 
-- **With real work, the executor and `QThreadPool` are equal** (within 1%). Both are bound by the
-  work. QtConcurrent is 2–17% slower, which is the cost of its futures.
-- **A single task makes the round trip in 3–9 µs on every pool:** waking a worker plus one event-loop
-  hop. With 10 µs of work it takes 18–21 µs; there the executor is ~2.5 µs behind `QThreadPool`, the
-  price of its worker spinning briefly before it parks, paid once per wake-up.
-- **On empty tasks, where only overhead counts, the executor is ahead.** It takes 0.17–0.34 µs per
-  task against `QThreadPool`'s 0.25–0.39, and keeps the main thread busy for less: 1000 tasks are
-  submitted in 50 µs against 68 with 1 worker, and in 40 against 66 with 4.
-- **QtConcurrent is the slowest to submit by far** (0.5–1.8 ms per 1000 tasks), because it builds a
+- **With real work, the executor and `QThreadPool` are equal.** Both are bound by the work.
+  QtConcurrent is 1–24% slower, which is the cost of its futures.
+- **A single task makes the round trip in 3–8 µs on every pool:** waking a worker plus one event-loop
+  hop. With 10 µs of work it takes 18 µs on both the executor and `QThreadPool`.
+- **On empty tasks, where only overhead counts, the executor is ahead.** It takes 0.17–0.36 µs per
+  task against `QThreadPool`'s 0.29–0.48, and keeps the main thread busy for less: 1000 tasks are
+  submitted in 40 µs against 72 with 1 worker, and in 42 against 90 with 4.
+- **With real work, `QThreadPool` submits faster** (21–32 µs per 1000 tasks, against the executor's
+  36–39). Delivery is unaffected.
+- **QtConcurrent is the slowest to submit by far** (0.6–1.9 ms per 1000 tasks), because it builds a
   future and a continuation per task.
-- **Four workers run 1000 × 10 µs in 3.1 ms**, 3.5x one worker's 10.9 ms.
-- **Delivery adds little:** with 1000 tasks the last result reaches the main thread 5–35 µs after the
-  last task finished, except with QtConcurrent, whose continuations add 0.4 ms.
+- **Four workers run 1000 × 10 µs in 3.0 ms**, 4.2x one worker's 12.3 ms.
+- **Delivery adds little:** with 1000 tasks the last result reaches the main thread 4–29 µs after the
+  last task finished, except with QtConcurrent, whose continuations add 0.45 ms.
 
 ### How the executor got here
 
 The first runs put the executor behind `QThreadPool` on empty batches, by up to 5x in submitting.
-Three changes closed it, each found by profiling this benchmark:
+Four changes closed it, each found with this benchmark:
 
 1. **Step 28** (`e9ef8ea`): the pool's lock spins before it blocks. The main thread and the workers
    had been handing a `std::mutex` back and forth through the kernel.
@@ -98,15 +98,19 @@ Three changes closed it, each found by profiling this benchmark:
 3. **Step 31** (`d1245d7`): no shared queue in the pool. A task goes to a worker at submission and is
    sealed once, by `execution::add_task()`, instead of waiting in the pool and being handed over one
    at a time, wrapped a second time.
+4. **Async step 53** (`be5986c`, pinned by `c3dc143`): the worker's spin before parking, from step
+   51, is gone. It cost a single task with work ~2 µs - one task of 10 µs arrived in 19.5–20.5 µs
+   against `QThreadPool`'s 17.5–18.1 - and the batches here never reached it. Now 14.4–18.0 against
+   14.5–18.2.
 
 1000 empty tasks, medians of each run, µs:
 
-| | before (`f844e17`) | step 28 (`e9ef8ea`) | step 31 (`d1245d7`, `6cc4350`) | QThreadPool, same runs |
-|---|---|---|---|---|
-| 1 worker, `submitted` | 468, 114 | 86, 59, 61 | **72, 50, 50** | 68–137 |
-| 1 worker, `delivered` | 571, 397 | 543, 406, 351 | **363, 245, 175** | 252–502 |
-| 4 workers, `submitted` | 524, 473 | 206, 185, 149 | **42, 42, 40** | 66–91 |
-| 4 workers, `delivered` | 668, 604 | 487, 480, 435 | **405, 365, 335** | 383–450 |
+| | before (`f844e17`) | step 28 (`e9ef8ea`) | step 31 (`d1245d7`, `6cc4350`) | async step 53 (`c3dc143`) | QThreadPool, same runs |
+|---|---|---|---|---|---|
+| 1 worker, `submitted` | 468, 114 | 86, 59, 61 | 72, 50, 50 | **49, 39, 40** | 63–137 |
+| 1 worker, `delivered` | 571, 397 | 543, 406, 351 | 363, 245, 175 | **174, 191, 174** | 252–502 |
+| 4 workers, `submitted` | 524, 473 | 206, 185, 149 | 42, 42, 40 | **41, 38, 42** | 66–99 |
+| 4 workers, `delivered` | 668, 604 | 487, 480, 435 | 405, 365, 335 | **494, 411, 362** | 383–614 |
 
 ### A trap found on the way
 
