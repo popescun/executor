@@ -1548,3 +1548,11 @@ the last argument read through `std::forward_as_tuple`, by reference, before any
 `forget_given()` takes back a refused task's count with a compare-and-swap that stops at zero. The
 arguments are still forwarded once, to `execution::add_task()`. 46 of 46 on Debug, ASan and TSan;
 docs clean.
+
+**Follow-up, 2026-10-09 (uncommitted).** Step 31 forwarded the arguments to `execution::add_task()`
+but inlined the call into `add_task()` and dropped `give_to_worker()` - not the structure agreed with
+the user: `add_task()` forwards its arguments to `give_to_worker()`, and that calls
+`execution::add_task()`. `give_to_worker(index, task, args...)` is back as the one place a task
+reaches a worker: it counts it, forwards to the worker's `add_task()`, and takes the count back on a
+refusal. `add_task()` keeps the static check, the refusals and the pick. No behaviour change: 46 of
+46 on Debug, ASan and TSan; docs clean.

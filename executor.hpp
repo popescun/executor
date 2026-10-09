@@ -251,8 +251,8 @@ class executor {
   template <typename... Args>
   bool add_task(actionT task, Args&&... args) {
     // The call the pool will make, which is not quite the one written at the call site: what
-    // reaches the task is the copies bound below, so that is the call that has to compile. Without
-    // this the mismatch surfaces deep inside bind_task()'s std::apply.
+    // reaches the task is the copies the worker binds, so that is the call that has to compile.
+    // Without this the mismatch surfaces deep inside bind_task()'s std::apply.
     static_assert(invocable_with_bound<Args...>(),
                   "executor: the task cannot be called with the arguments given to add_task() "
                   "before its callback");
@@ -261,20 +261,7 @@ class executor {
       return false;
     }
 
-    // No lock: the counts only steer the choice, so a stale one costs balance, not correctness.
-    const std::size_t index = pick_worker();
-    given_[index].fetch_add(1, std::memory_order_relaxed);
-
-    // The worker binds it, as for any caller of execution::add_task(): the arguments are forwarded
-    // once, from here.
-    if (workers_[index]->add_task(std::move(task), std::forward<Args>(args)...)) {
-      return true;
-    }
-
-    // Only a stopped worker refuses now. Not counted, or an idle worker would look busy until it is
-    // next given work and drains.
-    forget_given(index);
-    return false;
+    return give_to_worker(pick_worker(), std::move(task), std::forward<Args>(args)...);
   }
 
   /**
@@ -404,6 +391,29 @@ class executor {
     }
 
     return best;
+  }
+
+  /**
+   * @brief Hands a task, with its arguments and callback, to worker @p index, and counts it.
+   *
+   * The worker binds it, as for any caller of execution::add_task(): the arguments are forwarded
+   * once, from add_task() through here.
+   *
+   * @return true - the worker queued it. false - the worker is stopped and refused it.
+   */
+  template <typename... Args>
+  bool give_to_worker(std::size_t index, actionT task, Args&&... args) {
+    // No lock: the counts only steer pick_worker(), so a stale one costs balance, not correctness.
+    given_[index].fetch_add(1, std::memory_order_relaxed);
+
+    if (workers_[index]->add_task(std::move(task), std::forward<Args>(args)...)) {
+      return true;
+    }
+
+    // Only a stopped worker refuses: add_task() turned an empty task away before. Not counted, or
+    // an idle worker would look busy until it is next given work and drains.
+    forget_given(index);
+    return false;
   }
 
   /**
