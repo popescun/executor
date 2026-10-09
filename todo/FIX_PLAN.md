@@ -24,8 +24,8 @@ was never committed; step 31 drops `pending_`: the pool picks a worker at submis
 52, `11aa5a8`). On empty batches the executor now submits and delivers ahead of `QThreadPool`; 44 of
 44 (and 5 smoke) on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
 **2026-10-09 — step 32 (group 8) done: `add_task()` after step 31.** A refused task left its
-worker looking busy, and an empty task was refused with a warning on stderr. Both fixed
-(uncommitted); 46 of 46 on Debug, ASan and TSan.
+worker looking busy, and an empty task was refused with a warning on stderr. Both fixed in
+`99ebed7`; 46 of 46 on Debug, ASan and TSan.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -188,7 +188,7 @@ returns something give back — so read those two before deciding what it means 
 | 29 | 26 | destroying a pool always takes 50 ms | `:159-161`, `:504` | CONFIRMED (probe) |
 | 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) — SUPERSEDED by step 31, never committed |
 | 31 ✅ | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) — fixed `d1245d7` |
-| 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed (uncommitted) |
+| 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed `99ebed7` |
 
 ---
 
@@ -1542,7 +1542,7 @@ empty callback, both refused, stderr empty) - stderr holds the warning twice;
 same thread as the one before it) - it ran on worker 1. The stopped-worker refusal is a race between
 `stop()` and `add_task()` with no deterministic test; the undo is the same code path.
 
-**Landed 2026-10-09 (uncommitted).** `task_is_empty()` applies `bind_task()`'s rule
+**Landed in `99ebed7`.** `task_is_empty()` applies `bind_task()`'s rule
 (`testable_for_emptiness` on the action type and on the decayed last argument) to the action and to
 the last argument read through `std::forward_as_tuple`, by reference, before any worker is picked;
 `forget_given()` takes back a refused task's count with a compare-and-swap that stops at zero. The
