@@ -18,9 +18,11 @@ before it blocks. Submitting 1000 empty tasks takes 40-60% less time on the main
 green on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
 **2026-10-09 — step 29 opened (group 8): destroying a pool always takes 50 ms.** Found while
 checking the benchmark for sleeps, confirmed by a probe; nothing fixed yet.
-**2026-10-09 — step 30 opened (group 8): each task reaches its worker alone, wrapped twice.**
-Why the pool still trails `QThreadPool` on empty tasks after step 28; profiled and measured on
-scratchpad copies, nothing changed yet. Needs `async`'s `add_queued_task()` public.
+**2026-10-09 — step 30 superseded, step 31 opened (group 8): per-worker queues.** Step 30's
+batching was measured and passed its tests but was never committed: it kept the shared queue and
+needed `async`'s `add_queued_task()` public (async step 50, withdrawn). Step 31 drops `pending_`: the
+pool picks a worker at submission and calls `execution::add_task()`, so a task is sealed once and
+async's API stays as it is. Prototyped and measured; needs async's step 51; nothing fixed yet.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -181,7 +183,8 @@ returns something give back — so read those two before deciding what it means 
 | **Group 8 — cost** |
 | 28 ✅ | 25 | `add_task()` keeps the submitter waiting on the pool's lock | `:345-364`, `:380-399`, `:459` | CONFIRMED (profile, `bench/qt_pool_vs_this`) — fixed `e9ef8ea` |
 | 29 | 26 | destroying a pool always takes 50 ms | `:159-161`, `:504` | CONFIRMED (probe) |
-| 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) |
+| 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) — SUPERSEDED by step 31, never committed |
+| 31 | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) |
 
 ---
 
@@ -1298,7 +1301,7 @@ tick (1 ms, doubling to 50). The second is local to `executor.hpp`; the first re
 `async::execution_poll` and has to respect the rule that `running_` is the last thing a worker
 touches.
 
-### Step 30 · item 27 — each task reaches its worker alone, wrapped twice — OPEN
+### Step 30 · item 27 — each task reaches its worker alone, wrapped twice — SUPERSEDED by step 31
 `executor.hpp:396-414` (`queue_task`), `:422-426` (`give_to_worker`), `:431-450` (`take_next_task`),
 `:457-465` (`nothing_running`); `async.hpp:796` (`add_queued_task`, private) · CONFIRMED by profile
 and by scratchpad variants, 2026-10-09
@@ -1359,3 +1362,115 @@ redesign of the pool, not this step.
 
 **Done when:** the suite is green on Debug, ASan and TSan, and `bench/qt_pool_vs_this` shows the
 executor's `processed` time for empty 1000-task batches near the drop measured above.
+
+**Tests written 2026-10-09, failing as expected.** `executor_tests.a_freed_worker_takes_its_share_of_the_queue_in_one_trip`
+(1 worker, 3 queued, the first stops at a gate: `pending()` is 2, expected 0) and
+`executor_tests.a_freed_worker_takes_a_fair_share_of_the_queue` (2 workers, 4 queued, one worker
+freed: `pending()` is 3, expected 2). Deterministic: every worker is held at a gate when `pending()`
+is read. The async half is async's step 50, with its own two tests. Order (FIFO), draining and the
+busy-flag bookkeeping stay covered by the existing cases.
+
+**Landed 2026-10-09 (option C).** `give_to_worker()` queues the sealed task with
+`execution::add_queued_task()` (public since async's step 50); `take_next_task()` hands a freed
+worker `ceil(pending / workers)` tasks per trip; `busy_` (one flag per worker, under `mutex_`)
+replaces `is_busy()` in `queue_task()` and `nothing_running()`, and a finished worker scans only
+while `waiting_` counts a `wait()`. Two cases the scratchpad version got wrong, both caught by the
+suite: a flag is set only when the worker takes the task, and a worker that takes nothing - nothing
+queued, or stopped and refusing - is marked idle; otherwise a stopped pool's `wait()` hangs
+(`a_queued_task_a_worker_refuses_is_reported` and
+`the_destructor_reports_work_a_stopped_pool_could_not_drain` timed out). A refusal ends the share,
+so a stopped worker still loses one task, as before, not a share. 50 of 50 on Debug, ASan and TSan.
+
+`bench/qt_pool_vs_this`, two runs, median µs, 1000 tasks:
+
+| | executor before (`33e2e2c`) | executor after | QThreadPool |
+|---|---|---|---|
+| empty, 1 worker, `delivered` | 351 | 235, 253 | 387, 344 |
+| empty, 4 workers, `delivered` | 435 | 349, 322 | 409, 427 |
+| empty, 4 workers, `submitted` | 149 | 93, 83 | 59, 74 |
+| 10 µs, 1 worker, `submitted` | 19 | 38, 38 | 19, 20 |
+| 10 µs, 4 workers, `submitted` | 37 | 72, 73 | 29, 30 |
+
+The executor now finishes empty batches ahead of `QThreadPool` at 1 and 4 workers. **One cost
+moved:** with real work, submitting takes about twice as long (0.04-0.07 µs per task), because a
+freed worker now holds `mutex_` while it takes its whole share, and the submitter waits for it.
+Total time is unchanged (10.45-10.92 ms and 3.00-3.11 ms against `QThreadPool`'s 10.43-10.87 and
+3.01-3.13). Taking the share out of `pending_` under the lock and handing it over after releasing
+it would shorten that hold; not done here.
+
+**Superseded 2026-10-09, before it was committed.** Option C was implemented and measured as above,
+50 of 50 on Debug, ASan and TSan - and then reconsidered (user): the improvement needed `async`'s
+`add_queued_task()` public only because this pool keeps a queue of its own between sealing a task
+and handing it to a worker, and that queue is what the user wants gone. Step 31 replaces it; the
+working-tree changes are discarded with it, including the two share tests. The analysis above - one
+task per trip, a second wrapper per task - stays the reason for step 31.
+
+### Step 31 · item 28 — the pool keeps a queue of its own between the door and the workers — OPEN
+`executor.hpp:197-237` (`wait`), `:258-284` (`add_task`), `:286-289` (`pending`), `:387` (the worker
+type), `:396-465` (`queue_task`, `give_to_worker`, `take_next_task`, `nothing_running`), `:521`
+(`pending_`) · CONFIRMED by a prototype on scratchpad copies, 2026-10-09; sites at `33e2e2c`
+
+**The problem.** `add_task()` seals a task with `bind_task()` and keeps it in `pending_` until a
+worker is free, then hands the sealed task to the worker. The hand-off either re-wraps it (through
+`add_action()`, today) or needs a public sealed-task door in async (step 30, withdrawn). And
+`pending_` is what every worker meets on `mutex_` after every pass (steps 28 and 30).
+
+**Decided (user, 2026-10-09): per-worker queues.** The pool does not wait for a free worker: it
+picks one at submission and forwards to `execution::add_task(task, args...)`, the same call a
+standalone caller makes. A task is sealed once, inside async, and async's API stays as it is.
+- **Pick:** the first idle worker from worker 0 (the warmest, as step 8 keeps); otherwise the one
+  given the fewest tasks since it last drained. The counts are per-worker atomics, read without a
+  lock; a drain (`on_finished`) stores 0. They steer the choice only, so a stale count costs balance,
+  never correctness.
+- **`wait()`** asks the workers' `is_busy()`, as before step 30. It counts itself under `mutex_`
+  before its first check, and a drain takes the lock only to notify while a wait counts.
+- **Goes:** `pending_`, `queue_task()`, `give_to_worker()`, `take_next_task()`, the destructor's
+  "dropped" report. The workers become `async::execution<actionT>`.
+
+**Behaviour changes, accepted (user, 2026-10-09):**
+1. Balancing is by count, not duration: a task waits behind its own worker's queue even if another
+   worker goes idle. A smarter balancer (stealing) waits for a use case.
+2. Tasks start in submission order per worker, not across the pool. With one worker - flux's default
+   - nothing changes.
+3. `stop()` runs what was already submitted: a stopped execution drains its queue before it leaves.
+   A `forced_stop()` that drops queued work may come later.
+
+**Decided (user, 2026-10-09): (a).** `pending()` keeps its meaning - work waiting, not the pool's
+occupancy - and sums `execution::pending()` over the workers; async adds it as its step 52.
+**Was to decide: what `pending()` means.** Today it is the shared queue's depth, "not the pool's
+occupancy", and ten cases read it. Per-worker queues hold that depth inside the executions.
+- (a) Async exposes each execution's queue depth (`execution::pending()`, under its lock) and the
+  pool sums them: same meaning, a small async addition that is useful standalone too. **Recommended.**
+- (b) `pending()` reports the pick counts - tasks given since each worker last drained, which
+  includes finished ones: cheap, but no longer "waiting".
+- (c) `pending()` goes.
+fluxcpp does not call it.
+
+**Measured** (scratchpad prototype with async's step 51; Qt-free harness, median µs until 1000 empty
+tasks are done, two runs):
+
+| | 1 worker | 2 workers | 4 workers |
+|---|---|---|---|
+| `e9ef8ea` (step 28) | 136-139 | - | 284-299 |
+| step 30 (withdrawn) | 74-80 | 107-113 | 206-220 |
+| per-worker, async as committed | 103-105 | - | 221-242 |
+| **per-worker, async step 51, lock-free counts** | **47-49** | **113-134** | **131-134** |
+
+Run-to-run noise is about ±15%. **The 2-worker case** was 168-170 µs until the counts went
+lock-free: with two workers both keep up, so each drains after almost every task (~630 drains per
+1000 tasks, against ~0.06 with one worker and ~290 with four), and each drain took `mutex_` against
+every pick. What is left there is per-task: each submit locks its worker's queue and fairly often
+wakes it.
+
+**Tests first.**
+- Changed to the decided behaviour, failing until the fix: `a_queued_task_a_worker_refuses_is_reported`
+  and `the_destructor_reports_work_a_stopped_pool_could_not_drain` (`stop()` now runs what was
+  submitted, and nothing is reported dropped); the `pending()` cases, per the decision above.
+- New, failing until the fix: a task given to a busy worker waits for that worker even when another
+  goes idle (2 workers, each held at a gate, 4 tasks: opening one gate runs exactly its 2); an idle
+  pool spreads a burst over its idle workers.
+- Kept: order on one worker, `wait()` draining, the hard-run cases of step 20, step 28's lock tests.
+
+**Order:** async step 51 first (and step 50's revert), then the executor's async pin, then this.
+**Done when:** Debug, ASan and TSan are green in both repos, and `bench/qt_pool_vs_this` shows the
+executor at or below the prototype's numbers.
