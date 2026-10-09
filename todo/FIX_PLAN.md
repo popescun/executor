@@ -16,6 +16,8 @@ left is group 2 onwards — what the caller is told, placement, and the surface.
 `bench/qt_pool_vs_this` and profiled; `mutex_` is now an `untangle::adaptive_mutex`, which spins
 before it blocks. Submitting 1000 empty tasks takes 40-60% less time on the main thread; 48 of 48
 green on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
+**2026-10-09 — step 29 opened (group 8): destroying a pool always takes 50 ms.** Found while
+checking the benchmark for sleeps, confirmed by a probe; nothing fixed yet.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -175,6 +177,7 @@ returns something give back — so read those two before deciding what it means 
 | 21 ✅ | — | README and the reference state behaviour the fixes will change | `README.md` | audited and written 2026-09-25 — **DONE** (`11d6b12`) |
 | **Group 8 — cost** |
 | 28 ✅ | 25 | `add_task()` keeps the submitter waiting on the pool's lock | `:345-364`, `:380-399`, `:459` | CONFIRMED (profile, `bench/qt_pool_vs_this`) — fixed `e9ef8ea` |
+| 29 | 26 | destroying a pool always takes 50 ms | `:159-161`, `:504` | CONFIRMED (probe) |
 
 ---
 
@@ -1256,3 +1259,37 @@ With one worker - flux's default - the executor now submits as fast as `QThreadP
 with four it still takes about 2.5x as long, which is what is left for a shared-queue design. The
 `delivered` times move less (4 workers: 604 -> 480-487 µs), and with real work nothing changed:
 the cost was always the submit, and the work hides it.
+
+### Step 29 · item 26 — destroying a pool always takes 50 ms — OPEN
+`executor.hpp:159-161` (the poll in `~executor()`), `:504` (`poll_interval_ms`) · CONFIRMED by
+probe, 2026-10-09
+
+**Found while** checking whether `bench/qt_pool_vs_this` timed any sleep. It does not: the pools are
+built and destroyed outside the timed runs, idle workers block on a condition variable, and
+`wait()` waits on `finished_cv_`. The benchmark is unaffected.
+
+**What happens:** after `wait()` and `stop()`, `~executor()` polls `poll_.is_running()` until every
+worker has left its thread, sleeping `poll_interval_ms` (50) between checks. A worker cannot leave
+in the instant between `stop()` and the first check, so that check always fails and the destructor
+always sleeps one full tick.
+
+**Probe** (scratchpad, Release, 20 destructions per case):
+
+| workers | pool when destroyed | `~executor()`, ms |
+|---|---|---|
+| 1 | idle | 53.4 (50.1–55.0) |
+| 1 | 100 tasks just added | 53.7 (50.3–55.1) |
+| 4 | idle | 54.3 (50.1–55.0) |
+| 4 | 100 tasks just added | 53.3 (50.3–55.1) |
+
+Never under 50 ms, whatever the pool held.
+
+**Why it matters:** flux gives every store its own pool, so an app that destroys its stores one after
+another pays about 50 ms per store on exit, and so does any pool destroyed while the app runs.
+`~execution()` polls the same way at 1 ms (`async.hpp:281-284`), which is small enough not to matter.
+
+**To decide:** have the worker signal that it left - a condition variable notified as its last act,
+which `~executor()` waits on with the same report interval - or keep the poll with a short first
+tick (1 ms, doubling to 50). The second is local to `executor.hpp`; the first reaches into
+`async::execution_poll` and has to respect the rule that `running_` is the last thing a worker
+touches.
