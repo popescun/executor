@@ -18,6 +18,9 @@ before it blocks. Submitting 1000 empty tasks takes 40-60% less time on the main
 green on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
 **2026-10-09 — step 29 opened (group 8): destroying a pool always takes 50 ms.** Found while
 checking the benchmark for sleeps, confirmed by a probe; nothing fixed yet.
+**2026-10-09 — step 30 opened (group 8): each task reaches its worker alone, wrapped twice.**
+Why the pool still trails `QThreadPool` on empty tasks after step 28; profiled and measured on
+scratchpad copies, nothing changed yet. Needs `async`'s `add_queued_task()` public.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -178,6 +181,7 @@ returns something give back — so read those two before deciding what it means 
 | **Group 8 — cost** |
 | 28 ✅ | 25 | `add_task()` keeps the submitter waiting on the pool's lock | `:345-364`, `:380-399`, `:459` | CONFIRMED (profile, `bench/qt_pool_vs_this`) — fixed `e9ef8ea` |
 | 29 | 26 | destroying a pool always takes 50 ms | `:159-161`, `:504` | CONFIRMED (probe) |
+| 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) |
 
 ---
 
@@ -1293,3 +1297,65 @@ which `~executor()` waits on with the same report interval - or keep the poll wi
 tick (1 ms, doubling to 50). The second is local to `executor.hpp`; the first reaches into
 `async::execution_poll` and has to respect the rule that `running_` is the last thing a worker
 touches.
+
+### Step 30 · item 27 — each task reaches its worker alone, wrapped twice — OPEN
+`executor.hpp:396-414` (`queue_task`), `:422-426` (`give_to_worker`), `:431-450` (`take_next_task`),
+`:457-465` (`nothing_running`); `async.hpp:796` (`add_queued_task`, private) · CONFIRMED by profile
+and by scratchpad variants, 2026-10-09
+
+**Why the pool still trails `QThreadPool` after step 28.** `bench/qt_pool_vs_this` is fair - both
+pools allocate a task per submit and post each result the same way - and the gap shows only on
+batches of empty tasks, where nothing hides the pool's own overhead. Per task:
+
+1. The submitter hands it to an idle worker, or appends it to `pending_`.
+2. `give_to_worker()` adds it through `execution::add_action()`, which wraps the `task_t` in a second
+   `std::function` (`std::bind`) and stores that with two list nodes (`owned`, `actions`): three
+   allocations on top of the task's own.
+3. The worker wakes, moves its actuator into a one-task batch, runs it, and frees all four - memory
+   another thread allocated.
+4. `on_finished` -> `take_next_task()` takes `mutex_` and hands the worker **one** queued task,
+   then `nothing_running()` locks every worker's `action_mutex_`.
+
+**Profile** (`sample`, 1 worker, 1000 empty tasks in a loop): the worker spends 27% re-wrapping
+and re-adding tasks to itself, 33% destroying batches, ~12% on `mutex_`, ~10% on the rest of
+`execute_actions()` - and ~2% running the tasks. With one worker it hardly sleeps: the submitter
+outruns it, so `pending_` fills and every task takes the one-at-a-time path.
+
+**Measured** (scratchpad copies of `executor.hpp` and `async.hpp`, a Qt-free harness: 1000 empty
+tasks submitted, then waited for; median µs, submit / all done, two runs):
+
+| variant | 1 worker | 4 workers |
+|---|---|---|
+| current (`e9ef8ea`) | 76-80 / 139-141 | 258-286 / 285-324 |
+| **A** - `give_to_worker()` uses `add_queued_task()`: no bind, one list node | 97-104 / 135-138 | 228-263 / 254-296 |
+| **B** - A, and `take_next_task()` hands over `ceil(pending / workers)` tasks per trip | 71-72 / 73 | 217-222 / 228-233 |
+| **C** - B, executor-owned busy flags (under `mutex_`) replace `is_busy()` in `queue_task()` and `nothing_running()`, which runs only while a `wait()` waits | 66-68 / 71-73 | 208-211 / 216-221 |
+
+Handing everything pending to one worker (instead of a share) measured the same at 1 worker and
+slightly worse at 4.
+
+**Proposed: C.** It halves the 1-worker time to the last task (140 -> 72 µs, about as fast as the
+submitter can add them) and cuts 4 workers by about a quarter.
+- `async`: `add_queued_task()` public, or a public twin taking a sealed `task_t` - the executor
+  already holds one, from `bind_task()`. An `async` change first, then the pin bump here.
+- `executor`: `give_to_worker()` through it; `take_next_task()` hands a fair share per trip; a
+  `std::vector<char> busy_` set in `give_to_worker()` and cleared when `take_next_task()` finds
+  nothing pending; an atomic count of waiting `wait()` calls gates `nothing_running()`.
+- **Behaviour to accept:** a worker may take up to a fair share of the queue at once. Order stays
+  FIFO. With uneven tasks, an idle worker cannot take back what another already holds - the share
+  is what bounds that.
+- **Step 10, half of it:** `queue_task()` and `nothing_running()` no longer lock a worker, so the
+  `is_busy()` half of the lock-order dependency goes. `give_to_worker()` still takes a worker's
+  `action_mutex_` under `mutex_` to add the task, so step 10 stays open.
+
+**Tests first:** the suite already covers order, notification and draining; what C adds needs
+cases for a share handed to one worker running in order, `wait()` still returning with the scan
+gated, and the busy flags agreeing with the workers after a drain. ASan and TSan, as for step 28.
+
+**Not reached by C:** at 4 workers about two-thirds of the submitter's time is still spent on
+`mutex_` against the workers, and 17% on waking a worker per task (`notify_one`); `QThreadPool`
+submits the same batch in ~70-90 µs. Closing that needs a queue the workers pull from directly - a
+redesign of the pool, not this step.
+
+**Done when:** the suite is green on Debug, ASan and TSan, and `bench/qt_pool_vs_this` shows the
+executor's `processed` time for empty 1000-task batches near the drop measured above.
