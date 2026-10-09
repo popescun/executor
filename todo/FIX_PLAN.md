@@ -174,7 +174,7 @@ returns something give back — so read those two before deciding what it means 
 | 20 ✅ | — | the suite has no case that runs the pool hard | `test/executor_tests.cpp:457`, `:1008` | extended 2026-09-25 for the task door |
 | 21 ✅ | — | README and the reference state behaviour the fixes will change | `README.md` | audited and written 2026-09-25 — **DONE** (`11d6b12`) |
 | **Group 8 — cost** |
-| 28 ✅ | 25 | `add_task()` keeps the submitter waiting on the pool's lock | `:345-364`, `:380-399`, `:459` | CONFIRMED (profile, `bench/qt_pool_vs_this`) — fixed, `adaptive_mutex` (uncommitted) |
+| 28 ✅ | 25 | `add_task()` keeps the submitter waiting on the pool's lock | `:345-364`, `:380-399`, `:459` | CONFIRMED (profile, `bench/qt_pool_vs_this`) — fixed `e9ef8ea` |
 
 ---
 
