@@ -18,7 +18,7 @@ before it blocks. Submitting 1000 empty tasks takes 40-60% less time on the main
 green on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
 **2026-10-09 — step 29 opened (group 8): destroying a pool always takes 50 ms.** Found while
 checking the benchmark for sleeps, confirmed by a probe; nothing fixed yet.
-**2026-10-09 — step 30 superseded, step 31 (group 8) done: per-worker queues.** Step 30's batching
+**2026-10-09 — step 30 superseded, step 31 (group 8) done: per-worker queues (`d1245d7`).** Step 30's batching
 was never committed; step 31 drops `pending_`: the pool picks a worker at submission and calls
 `execution::add_task()`, so a task is sealed once and async's API stays as it is (async's steps 51 and
 52, `11aa5a8`). On empty batches the executor now submits and delivers ahead of `QThreadPool`; 44 of
@@ -184,7 +184,7 @@ returns something give back — so read those two before deciding what it means 
 | 28 ✅ | 25 | `add_task()` keeps the submitter waiting on the pool's lock | `:345-364`, `:380-399`, `:459` | CONFIRMED (profile, `bench/qt_pool_vs_this`) — fixed `e9ef8ea` |
 | 29 | 26 | destroying a pool always takes 50 ms | `:159-161`, `:504` | CONFIRMED (probe) |
 | 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) — SUPERSEDED by step 31, never committed |
-| 31 ✅ | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) — fixed (uncommitted) |
+| 31 ✅ | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) — fixed `d1245d7` |
 
 ---
 
@@ -1485,7 +1485,7 @@ passing. Both gate cases hold an `open_on_exit` declared after the pool, so a fa
 leave a worker held and the destructor waiting. The `pending()` cases are unchanged: with (a) their
 meaning stays. The rest: 42 of 44 green.
 
-**Landed 2026-10-09 (uncommitted).** As decided: workers are `async::execution<actionT>`;
+**Landed in `d1245d7`.** As decided: workers are `async::execution<actionT>`;
 `add_task()` picks with `pick_worker()` (first idle from worker 0, else the fewest in `given_`, per
 worker atomics read unlocked) and forwards to the worker's `add_task()`; `on_finished` ->
 `worker_drained()` stores 0 and takes `mutex_` only to notify while `waiting_` counts a `wait()`;
