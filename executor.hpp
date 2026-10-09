@@ -80,6 +80,9 @@ class adaptive_mutex {
   std::mutex mutex_;
 };
 
+//! Numbers the pools that are not given a name, across every task type, so no two are alike.
+inline std::atomic<std::size_t> unnamed_pools = {0};
+
 /**
  * @brief Runs tasks on a fixed pool of untangle::async::execution workers.
  *
@@ -97,25 +100,31 @@ class executor {
    * @brief Builds \p worker_count workers. They do not run until \ref start().
    *
    * @param worker_count - How many workers to run. Must not be zero.
+   * @param name - What its workers are named after, `<name>_worker_<i>`, in every warning they
+   * print. Left empty, it is `pool_<n>`, numbered across the process, so two pools are never alike.
    * @throws std::invalid_argument - \p worker_count is zero: such a pool could never run its work.
    */
-  explicit executor(std::size_t worker_count) {
+  explicit executor(std::size_t worker_count, std::string name = {}) {
     if (worker_count == 0) {
       throw std::invalid_argument("executor: worker_count must not be zero");
+    }
+
+    if (name.empty()) {
+      name = "pool_" + std::to_string(unnamed_pools.fetch_add(1) + 1);
     }
 
     workers_.reserve(worker_count);
     given_ = std::make_unique<std::atomic<std::size_t>[]>(worker_count);
 
     for (std::size_t index = 0; index < worker_count; ++index) {
-      auto next = worker_execution::create_instance("pool_worker_" + std::to_string(index));
+      auto next = worker_execution::create_instance(name + "_worker_" + std::to_string(index));
 
       // Tells the pool this worker has run everything it was given.
       next->on_finished = [this, index] { worker_drained(index); };
 
       // Carries what a task throws to the caller. Assigned here because a worker thread reads it.
-      next->on_error = [this, name = next->name](std::exception_ptr thrown) {
-        report_task_error(name, thrown);
+      next->on_error = [this, worker = next->name](std::exception_ptr thrown) {
+        report_task_error(worker, thrown);
       };
 
       // Adds the worker to the poll the destructor waits on.
@@ -124,6 +133,12 @@ class executor {
       workers_.push_back(std::move(next));
     }
   }
+
+  //! Not copied or moved: every worker's callbacks hold this pool's `this`.
+  executor(const executor&) = delete;
+  executor& operator=(const executor&) = delete;
+  executor(executor&&) = delete;
+  executor& operator=(executor&&) = delete;
 
   /**
    * @brief Drains what was added, then stops the workers and destroys them.

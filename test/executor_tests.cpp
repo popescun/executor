@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -1302,6 +1303,64 @@ TEST(executor_tests, destroying_a_pool_does_not_wait_a_whole_tick) {
   EXPECT_LT(fastest, 20ms) << "destroying an idle pool took "
                            << std::chrono::duration_cast<std::chrono::microseconds>(fastest).count()
                            << " us";
+}
+
+/**
+ * @brief The worker a pool's warning names, read from what it printed for a task that threw.
+ */
+std::string worker_named_in(const std::string& reported) {
+  const std::string marker = "executor task on '";
+  const auto start = reported.find(marker);
+  if (start == std::string::npos) {
+    return {};
+  }
+  const auto first = start + marker.size();
+  return reported.substr(first, reported.find('\'', first) - first);
+}
+
+/**
+ * @brief Two pools name their workers apart, so a warning says which pool it came from.
+ */
+TEST(executor_tests, two_pools_name_their_workers_apart) {
+  std::string named[2];
+
+  for (auto& name : named) {
+    testing::internal::CaptureStderr();
+    {
+      executor pool(1);
+      pool.start();
+      ASSERT_TRUE(pool.add_task([] { throw std::runtime_error("expected"); }, ignore_result));
+      pool.wait();
+    }
+    name = worker_named_in(testing::internal::GetCapturedStderr());
+  }
+
+  ASSERT_FALSE(named[0].empty()) << "no warning named a worker";
+  EXPECT_NE(named[0], named[1]) << "both pools named their worker " << named[0];
+}
+
+/**
+ * @brief A pool given a name prefixes its workers with it.
+ */
+TEST(executor_tests, a_named_pool_prefixes_its_workers) {
+  testing::internal::CaptureStderr();
+  {
+    executor pool(1, "store_a");
+    pool.start();
+    ASSERT_TRUE(pool.add_task([] { throw std::runtime_error("expected"); }, ignore_result));
+    pool.wait();
+  }
+
+  const std::string worker = worker_named_in(testing::internal::GetCapturedStderr());
+  EXPECT_TRUE(worker.starts_with("store_a")) << "the worker was named " << worker;
+}
+
+//! The workers hold the pool's this, so a pool is neither copied nor moved.
+TEST(executor_tests, a_pool_is_neither_copied_nor_moved) {
+  static_assert(!std::is_copy_constructible_v<executor>);
+  static_assert(!std::is_copy_assignable_v<executor>);
+  static_assert(!std::is_move_constructible_v<executor>);
+  static_assert(!std::is_move_assignable_v<executor>);
 }
 
 // ---------------------------------------------------------------------------

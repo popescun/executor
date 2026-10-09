@@ -210,9 +210,9 @@ drain's, so a plain `wait()` prints it exactly as a destructor does; the second 
 alone:
 
 ```
-executor: still waiting to drain after 1s - 1 queued, 2 in a task: pool_worker_0, pool_worker_1
-executor: still waiting to drain after 3s - 0 queued, 1 in a task: pool_worker_1
-executor: still waiting to stop after 1s - 1 not left its thread: pool_worker_1
+executor: still waiting to drain after 1s - 1 queued, 2 in a task: pool_1_worker_0, pool_1_worker_1
+executor: still waiting to drain after 3s - 0 queued, 1 in a task: pool_1_worker_1
+executor: still waiting to stop after 1s - 1 not left its thread: pool_1_worker_1
 ```
 
 The interval starts at a second and doubles to a ceiling of thirty, so a stuck teardown says
@@ -255,11 +255,10 @@ and that is the case most worth hearing about. Assign it before the first `add_t
 reads it — and expect it on a worker's thread, with more than one worker possibly inside it at once.
 Leave it unset and the pool warns on stderr instead, naming the worker.
 
-**That name is not unique between pools.** Workers are named by index — `pool_worker_0`,
-`pool_worker_1` — so two pools in one process each have a `pool_worker_0`, and every warning that
-names one is ambiguous: the failure reports above, and the destructor's waits alike. With a single
-pool the name says which worker; with two it does not. Assigning `on_task_error` sidesteps it for
-failures, since the handler is the pool's own and the warning is replaced.
+**The name says which pool too.** Workers are named `<pool>_worker_<i>`, after the name the pool was
+given - `executor pool(2, "store_a")` has `store_a_worker_0` and `store_a_worker_1` - or, without one,
+`pool_<n>`, numbered across the process: two pools never share a worker name, so every warning - the
+failure reports above and the destructor's waits alike - says where it came from.
 
 A *return value* is not collected by the pool: a continuous worker keeps none. It goes to the
 task's own callback — see *tasks: work that reports back* above.

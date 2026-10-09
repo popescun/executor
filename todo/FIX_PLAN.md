@@ -27,6 +27,9 @@ was never committed; step 31 drops `pending_`: the pool picks a worker at submis
 **2026-10-09 — step 32 (group 8) done: `add_task()` after step 31.** A refused task left its
 worker looking busy, and an empty task was refused with a warning on stderr. Both fixed in
 `99ebed7`; 46 of 46 on Debug, ASan and TSan.
+**2026-10-09 — housekeeping:** steps 17 and 18 closed (done in `d1245d7` and `2f4d8ce`, the rows
+never updated); steps 13 (pools name their workers) and 15 (copy and move deleted) done
+(uncommitted); 50 of 50 on Debug, 55 of 55 on ASan and TSan.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -167,12 +170,12 @@ returns something give back — so read those two before deciding what it means 
 | 11 ✅ | 11 | every worker prints to stdout on shutdown | `async.hpp:757` | CONFIRMED (14 lines of 38) — fixed upstream, async `2a06497` |
 | 12 ✅ | 12 | the 10ms tick, once per worker | `async.hpp:744-747` | measured, not a defect — gone anyway, async `502650b` |
 | **Group 5 — surface and hygiene** |
-| 13 | 13 | worker names collide between pools | `:65` | read-only |
+| 13 ✅ | 13 | worker names collide between pools | `:65` | CONFIRMED (test) — fixed (uncommitted) |
 | 14 ✅ | 14 | `struct worker` is a one-field wrapper the prototype outgrew | `:119-121` | read-only |
-| 15 | 15 | copy and move are suppressed by accident, not by statement | `:181` | read-only |
+| 15 ✅ | 15 | copy and move are suppressed by accident, not by statement | `:181` | read-only — fixed (uncommitted) |
 | 16 | 16 | a move-only task does not compile | `:41` | CONFIRMED (compile probe) |
-| 17 | 17 | `pending()` is advisory and does not say so | `:126-129` | read-only |
-| 18 | 18 | no way to wait for the pool to drain short of destroying it | `:79-94` | read-only, API decision |
+| 17 ✅ | 17 | `pending()` is advisory and does not say so | `:126-129` | documented in `d1245d7` |
+| 18 ✅ | 18 | no way to wait for the pool to drain short of destroying it | `:79-94` | `wait()`, `2f4d8ce` |
 | 23 ✅ | 20 | `submit()` does not match `execution::add_action()` | `:171` | naming decision — renamed `add_task()` |
 | 24 | 21 | the workers are unreachable, and so is every seam on them | `:375` | read-only, surface decision |
 | 25 ✅ | 22 | a pool cannot be stopped without destroying it | `:226` | surface addition — `stop()` |
@@ -703,7 +706,7 @@ do; if a pool is ever wanted at a hundred workers, remeasure before assuming it 
 
 ## Group 5 — surface and hygiene
 
-### Step 13 · item 13 — worker names collide between pools — OPEN
+### Step 13 ✅ · item 13 — worker names collide between pools — DONE
 `executor.hpp:50` · read-only
 
 ```c++
@@ -718,6 +721,19 @@ either.
 > The pool takes an optional name and prefixes its workers with it, defaulting to something unique
 > per instance. It costs one constructor parameter and makes step 5's reporting legible; land them
 > in that order.
+
+**Proposed 2026-10-09:** `executor(std::size_t worker_count, std::string name = {})`; an empty name
+becomes `pool_<n>`, `n` from a process-wide counter, so every pool differs; workers are
+`<name>_worker_<i>`. A flux store can pass its own id.
+**Tests (written first):** `two_pools_name_their_workers_apart` (two unnamed pools, a task that throws
+in each: the warnings name different workers) - failing, both `pool_worker_0`;
+`a_named_pool_prefixes_its_workers` (a pool named `store_a`: its worker's name starts with it) -
+fails to compile until the parameter exists.
+
+**Landed 2026-10-09 (uncommitted), as proposed.** `unnamed_pools`, a process-wide atomic at
+namespace scope - outside the template, so pools of different task types are numbered apart too.
+README: the sample stall output names `pool_1_worker_*`, and the paragraph that warned the names
+were not unique between pools now says how they are made.
 
 ### Step 14 ✅ · item 14 — `struct worker` is a one-field wrapper
 `executor.hpp:119-121` as imported; the struct is gone, so the site is historical · read-only
@@ -739,7 +755,7 @@ stayed, so every use reads `workers_[index].exec->` for no benefit.
 > `untangle::executor::worker::~worker()` at frame #9, and that symbol no longer exists — the same
 > race comes back pointing at `~shared_ptr` / `_M_destroy`.
 
-### Step 15 · item 15 — copy and move are suppressed by accident — OPEN
+### Step 15 ✅ · item 15 — copy and move are suppressed by accident — DONE
 `executor.hpp:170` · read-only
 
 `executor` must not be copied or moved: the workers' callbacks capture `this`, so a moved-from pool
@@ -750,7 +766,13 @@ suppresses the implicit moves. Both are side effects.
 A reader has to work out that the pool is pinned, and the compiler's error names `std::mutex`
 rather than the reason.
 
-> `= delete` both, with one line saying why: the workers hold `this`. The async plan's step 20 is
+**Test (a guard, passing - the step is that it passes by accident):**
+`a_pool_is_neither_copied_nor_moved`, four `static_assert`s. Proposed as below.
+
+> `= delete` both, with one line saying why: the workers hold `this`.
+
+**Landed 2026-10-09 (uncommitted).** The four deleted, after the constructor, under "every worker's
+callbacks hold this pool's `this`". The async plan's step 20 is
 > the counter-case worth reading first — there, writing the rule of five out explicitly was tried,
 > measured and reverted. This is the opposite situation, a type that must not move, so the deletion
 > states an invariant rather than restating a default.
@@ -775,7 +797,7 @@ queue hold different things.
 
 > Nothing, for now. Revisit with async step 35 B.
 
-### Step 17 · item 17 — `pending()` is advisory and does not say so — OPEN
+### Step 17 ✅ · item 17 — `pending()` is advisory and does not say so — DONE
 `executor.hpp:111-114` · read-only
 
 It returns the queue's depth under the lock, which is true at the instant it is read and possibly
@@ -787,7 +809,11 @@ Both are the right behaviours. Neither is written down, and "pending" reads like
 > One `@remark`: it is the queue's depth, not the pool's occupancy, and it is a reading rather than
 > a reservation. Documentation only.
 
-### Step 18 · item 18 — no way to wait for the pool to drain short of destroying it — OPEN, API decision
+**Done in `d1245d7`** (step 31), found closed in the 2026-10-09 housekeeping: `pending()` is "how many
+tasks are waiting in the workers' queues, not yet taken to run", with "@remark Advisory: true the
+moment it is read" - both halves of the remark asked for.
+
+### Step 18 ✅ · item 18 — no way to wait for the pool to drain short of destroying it — DONE
 `executor.hpp:64-79` · read-only
 
 The drain is in the destructor and only there. A caller that wants to know its batch has finished
@@ -800,6 +826,10 @@ rather than difficulty.
 
 > If taken: `wait_idle()`, the same predicate, no `accepting_ = false`, and the destructor calls
 > it. Sequence it after step 7, which decides what "idle" means for a task that submits more work.
+
+**Done in `2f4d8ce`** ("feat: add wait api"), found closed in the 2026-10-09 housekeeping: `wait()`
+drains, refuses new work while it does, puts back what it found, and the destructor calls it. The
+row had not been updated.
 
 ### Step 23 ✅ · item 20 — `submit()` does not match the interface it wraps — DONE
 `executor.hpp:171` · not a finding; a naming decision taken after step 22
