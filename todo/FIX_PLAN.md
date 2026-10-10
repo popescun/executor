@@ -37,13 +37,19 @@ rest 10 µs), and on 4 workers the executor delivers in 35.4-35.5 ms against `QT
 analysis of the executor, async and the actuator, each fix prototyped and measured alone: **step 34
 (fewer moves of the action) is the one the benchmark shows**, submitting 15-20% faster and level
 with `QThreadPool`; 35 is optional, 36 and 37 measured and not worth taking, 38 and 39 open.
-**2026-10-10 — step 34 done (`ce6fc83`, async pin `f8f3c43`):** a task is copied or moved into its
-worker's queue once, through the actuator's step 30 (`f21a58b`) and async's 54 (`1f8a02d`). With real
-work the executor submits 1000 tasks in 18.3-18.8 µs on 1 worker and 29.3-29.7 on 4, against
-`QThreadPool`'s 19.8-22.0 and 28.1-33.9: level. 57 of 57 on Debug, ASan and TSan; `doc/refman.pdf` at
-31 pages. **Behind it:** empty tasks on one worker are processed later than before (186-258 µs
-against 132-177), in both run orders and through either build - it follows the faster submit; still
-delivered ahead of `QThreadPool`. Recorded, not pursued.
+**2026-10-10 — step 34 landed (`ce6fc83`, async pin `f8f3c43`), with a regression:** a task is
+copied or moved into its worker's queue once, through the actuator's step 30 (`f21a58b`) and async's
+54 (`1f8a02d`). With real work the executor submits 1000 tasks in 18.3-18.8 µs on 1 worker and
+29.3-29.7 on 4, against `QThreadPool`'s 19.8-22.0 and 28.1-33.9: level. 57 of 57 on Debug, ASan
+and TSan; `doc/refman.pdf` at 31 pages. **⚠ REGRESSION, OPEN: step 34 made one case slower.** 1000
+empty tasks on one worker are delivered in 204-277 µs against 155-193 before it - in both run orders
+and through either build. Still ahead of `QThreadPool` (~290-315), but slower than we were. Traced:
+the faster submit gets the main thread to its event loop sooner, and a worker posting while the main
+thread drains posts 3-6x slower. To be fixed by step 40; step 34 is not closed until it is.
+**2026-10-10 — step 40 opened, to fix step 34's regression: every result wakes the main thread.**
+A worker posts one result per task to the main thread; while the main thread is in its loop the
+worker takes 150-330 µs to process 1000 empty tasks, and 55 µs when it is not. Every pool pays it,
+`QThreadPool` too. Delivering results by the batch is a design decision, open.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -209,12 +215,13 @@ returns something give back — so read those two before deciding what it means 
 | 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed `99ebed7` |
 | **Group 9 — performance, benched against QThreadPool** |
 | 33 | 30 | a task waits behind its own worker while another worker idles | `:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) | CONFIRMED (`bench/qt_pool_vs_this`, mixed batch) — OPEN, design decision |
-| 34 ✅ | 31 | a task's action is moved five times between `add_task()` and the queue | `:424` (`give_to_worker`); async 54, actuator 30 | CONFIRMED (tests, benchmark) — fixed `ce6fc83`; a follow-up on one worker open |
+| 34 ⚠ | 31 | a task's action is moved five times between `add_task()` and the queue | `:424` (`give_to_worker`); async 54, actuator 30 | CONFIRMED (tests, benchmark) — landed `ce6fc83`; **REGRESSION OPEN**: one worker, empty tasks, delivered later - step 40 |
 | 35 | 32 | the queue frees its storage with every batch, and the next submit allocates it under the lock | async 55, actuator 31 | CONFIRMED (Qt-free probe), not visible in the benchmark — OPEN, optional |
 | 36 | 33 | a parked worker is notified once per submit until it wakes | async 56 | measured (probe, benchmark) — no time saved, decline recommended |
 | 37 | 34 | the per-worker counts share a cache line | `:568` (`given_`) | measured (probe, benchmark) — no effect, decline recommended |
 | 38 | 35 | a worker takes its queue's lock up to five times per batch | async 57 | read-only, counted by the probe — OPEN, not prototyped |
 | 39 | 36 | a refused add prints its warning under the queue's lock | async 58 | read-only — OPEN, hygiene |
+| 40 | 37 | every result wakes the main thread: one post per task - **fixes step 34's regression** | the callback, `bench/qt_pool_vs_this.cpp:155`; fluxcpp's presenters | CONFIRMED (benchmark, main thread held) — OPEN, design decision |
 
 ---
 
@@ -1705,7 +1712,7 @@ it, the other worker idle - the short tasks run on the idle worker.
 within noise of `QThreadPool`, and the uniform and empty batches are no worse than in
 `bench/README.md`.
 
-### Step 34 ✅ · item 31 — a task's action is moved five times between `add_task()` and the queue — DONE
+### Step 34 · item 31 — a task's action is moved five times between `add_task()` and the queue — LANDED, REGRESSION OPEN
 `executor.hpp:271` (`add_task`), `:424` (`give_to_worker`); async `async.hpp:589` (`add_task`, its
 step 54); actuator `actuator.hpp:1191` (`bind_task`, its step 30) · CONFIRMED by
 `bench/qt_pool_vs_this`, 2026-10-10; sites at `640508a`, async `b98dfd9`, actuator `fccaad1`
@@ -1767,7 +1774,9 @@ each against the old code, alternating, µs to submit 1000 tasks:
 Delivery with real work unchanged; the mixed batch on 4 workers still ~34.5 ms against
 `QThreadPool`'s 32-33, step 33's.
 
-**Open: empty tasks on one worker are processed later.** Seven runs each, in both orders (old first,
+**⚠ REGRESSION: empty tasks on one worker are delivered later.** Found after landing, measured
+before the commit message was written and left out of it - the measurement was still running. Seven
+runs each, in both orders (old first,
 then new first): the last of 1000 empty tasks finishes on the worker at 186-258 µs against 132-177,
 and is delivered at 204-277 against 155-193; `QThreadPool` steady at ~300 throughout, so still ahead
 of it, by less. One task alone and four workers are unchanged. Nothing on the worker's path changed.
@@ -1777,16 +1786,31 @@ runs in rotation with it and with `bench/build`: processed at 222-247 µs (mirro
 (`bench/build`) against the old mirror's 122-186. It follows the code, and the faster the submit the
 later the worker: submitted in 29-35 µs (new, mirror), 38-43 (new, `bench/build`), 35-49 (old).
 
-**Likeliest cause, not proven:** most of the worker's time comes after the submit has ended (30-45
-µs against 120-250), so the queue's lock cannot be all of it. The worker posts every result to the
-main thread, and the main thread starts taking them off Qt's event queue the moment it finishes
-submitting: the sooner it gets there, the longer it and the worker meet on that queue. `QThreadPool`
-submits in ~65 µs, so its main thread gets there later. Probing it would mean holding the main
-thread back before its loop and seeing the worker recover.
+**Probed: the main thread held.** Most of the worker's time comes after the submit has ended (30-45
+µs against 120-250), so the queue's lock could not be all of it. A scratchpad copy of the benchmark
+spins the main thread for a set time after submitting, before its event loop, built against the old
+code and the new through the same mirror; one worker, 1000 empty tasks, five runs each, delivered µs:
 
-**Recorded, not pursued:** it is one case - empty tasks, one worker - where the executor still
-delivers ahead of `QThreadPool` (204-277 µs against ~290-315); with real work the change is level or
-faster everywhere.
+| main thread held | old | new | `QThreadPool` |
+|---|---|---|---|
+| 0 µs - as the benchmark | 152-190 | 192-250 | 231-290 |
+| 30 µs | 97-99 | 90-95 | 140-165 |
+| 60 µs | 128-129 | 118-121 | 151-165 |
+| 100 µs | 167-174 | 159-164 | 193-208 |
+| 150 µs | 219-223 | 210-241 | 240-249 |
+
+Held at all, the worker processes the 1000 in ~55 µs, old code and new alike, against 150-330
+unheld.
+
+**Cause.** At the same main-thread timing the new code delivers sooner at every hold, so the
+regression is not in the work the change cut. The change's faster submit gets the main thread to its
+loop ~9 µs sooner, and a worker posting while the main thread drains is 3-6x slower - in the old code
+as in the new, and in `QThreadPool`. The cost underneath is per-result delivery.
+
+**It is still a regression, and this step stays open on it** (user, 2026-10-10: regressions are
+addressed at once). Step 40 fixes it; this step closes when the benchmark delivers 1000 empty tasks
+on one worker no later than before it, 155-193 µs, with every other case still where step 34 left
+it.
 
 ### Step 35 · item 32 — the queue frees its storage with every batch, and the next submit allocates it under the lock — OPEN, optional
 async `async.hpp:900` (`execute_actions`, its step 55), `:852` (`add_queued_task`); actuator
@@ -1849,3 +1873,39 @@ async `async.hpp:823`, `:860`, `:865`, its step 58 · read from the code, 2026-1
 `add_queued_action()` and `add_queued_task()` call `std::println(stderr, ...)` while holding
 `action_mutex_`. Only a refused add does, so the hot path pays nothing, but I/O under a lock the
 worker needs is the pattern to avoid. **Proposed:** note the refusal under the lock, print after it.
+
+### Step 40 · item 37 — every result wakes the main thread: one post per task — OPEN, fixes step 34's regression
+the task's callback, which posts its result: `bench/qt_pool_vs_this.cpp:155` (`shared::post`), as
+fluxcpp's presenters do · CONFIRMED by `bench/qt_pool_vs_this` with the main thread held, 2026-10-10
+
+**The problem.** Every result reaches the main thread on its own:
+`QMetaObject::invokeMethod(..., Qt::QueuedConnection)`, one post per task. When the main thread is in
+its event loop, a worker posting to it slows down 3-6x: one worker processes 1000 empty tasks in
+150-330 µs while the main thread drains, and in ~55 µs when the main thread is held back after
+submitting (step 34's probe). It is the larger part of what the benchmark calls delivery on empty
+batches, for every pool - `QThreadPool` delivers in 140-165 µs held 30 µs, 231-290 unheld. And it is
+the realistic case: a UI thread sits in its loop, waiting, while a pool answers it.
+
+**Likely mechanism, not proven:** a post to a thread waiting in its event loop has to wake it - on
+macOS a run-loop source signalled and the loop woken, a system call - paid once per result. A main
+thread already busy needs no wake-up, and a post to it is cheap.
+
+**The executor does not post** - the callback does, on the worker's thread. So the fix is where
+results are delivered:
+- (a) **In the caller, coalesced:** the callback appends the result to a list shared with the main
+  thread and posts only when the list was empty; the main thread takes the whole list in one event.
+  One wake-up per burst instead of per result, no change to the executor. A pattern for fluxcpp's
+  presenters, and for the benchmark's `shared::post`.
+- (b) **In the executor, by the batch:** a way to hand a worker's drained batch of results to a
+  target in one call - say a per-pool hook raised from `worker_drained()` with what the batch
+  produced. Every caller gets it without writing (a); it needs results collected per batch, which
+  the pool does not do today.
+- (c) Both: (a) now, measured, and (b) if the pattern repeats across presenters.
+
+**To prove first:** prototype (a) in a scratchpad copy of the benchmark, since it changes nothing
+here, and measure every case - a single task must not arrive later (a coalesced post must still go
+out at once when the list was empty), and the batches with real work must not lose.
+
+**Done when:** a decision is taken, **step 34's regression is gone** - 1000 empty tasks on one
+worker delivered in no more than 155-193 µs, as before step 34 - and the benchmark's delivery on empty
+batches drops toward the held figures above without any case getting worse.
