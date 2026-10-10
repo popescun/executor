@@ -10,11 +10,11 @@
  * the way a UI update is - which is what a flux store and presenter do with each answer. Three
  * pools take turns:
  *  - **executor:** `add_task(task, i, callback)`; the callback runs on the worker and posts the
- *    result with `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`, as the prototypes'
- *    presenters do;
+ *    result with `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`, coalesced: a result
+ *    finding others still waiting joins them, and the main thread takes them in one event;
  *  - **QThreadPool:** `start(lambda)`; the lambda runs the task and posts the result the same way;
  *  - **QtConcurrent:** `QtConcurrent::run(&pool, task, i).then(context, ...)` - Qt's own idiom,
- *    whose continuation runs on the context object's thread.
+ *    whose continuation runs on the context object's thread, one per result.
  *
  * Each pool is its own instance with the same worker count. Every run records three times from the
  * first submit: when the main thread finished submitting, when the last task finished on a worker,
@@ -41,6 +41,7 @@
 #include <cstring>
 #include <executor.hpp>
 #include <functional>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -153,10 +154,35 @@ struct shared {
           return result;
         }) {}
 
-  //! Posts @p result to the main thread, as a presenter posts an answer.
+  //! Results waiting for the main thread, and the lock workers and the main thread share over them.
+  std::mutex pending_mutex;
+  std::vector<int> pending;
+
+  //! Posts @p result to the main thread, coalesced: only the result that finds the list empty
+  //! posts, and the main thread takes the whole list in that one event - one wake-up per burst, not
+  //! per result, as a presenter answering many tasks would.
   void post(int result) {
-    QMetaObject::invokeMethod(
-        &context, [this, result] { main.take(result); }, Qt::QueuedConnection);
+    bool first = false;
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex);
+      first = pending.empty();
+      pending.push_back(result);
+    }
+    if (first) {
+      QMetaObject::invokeMethod(&context, [this] { take_pending(); }, Qt::QueuedConnection);
+    }
+  }
+
+  //! On the main thread: everything posted since the last event, in one go.
+  void take_pending() {
+    std::vector<int> taken;
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex);
+      taken.swap(pending);
+    }
+    for (const int result : taken) {
+      main.take(result);
+    }
   }
 };
 
