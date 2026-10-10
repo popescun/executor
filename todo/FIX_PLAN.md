@@ -75,6 +75,10 @@ committed. Alone it left the mixed batch where it was; with batches capped at 16
 gap to `QThreadPool` but slowed empty batches and the submit path. Decided (user): the executor
 beats `QThreadPool` on raw per-task performance, not with balancing tricks. Reverted, tests
 included; the uneven-task gap is accepted.
+**2026-10-10 — step 38 measured, not taken.** Holding the queue's lock between batches made four
+workers' empty batch faster (71-75 µs against 76-89) and kept one worker's out of its fast mode in
+every run (114-132 µs against 53-172): a regression in one case, so not taken. Prototype in the
+scratchpad; the repos unchanged.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -225,6 +229,7 @@ returns something give back — so read those two before deciding what it means 
 | 24 | 21 | the workers are unreachable, and so is every seam on them | `:375` | read-only, surface decision |
 | 25 ✅ | 22 | a pool cannot be stopped without destroying it | `:226` | surface addition — `stop()` |
 | 26 ✅ | 23 | construction starts the workers, and nothing else can | `:187`, `:205`, `:89-99` | CONFIRMED (tests) — `start()` added |
+| 41 | 38 | `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` | `:36-81` | read-only — OPEN, hygiene; with async 59 |
 | **Group 7 — the task type** |
 | 22 ✅ | 19 | `task_t` is fixed at `std::function<void(void)>` | `:45`, `:51`, `:202` | CONFIRMED (probe, tests) — fixed `9daec8b` |
 | 27 ✅ | 24 | a task type that takes arguments is refused, and step 22 ruled that unfixable | `:42`, `:265`, `:371` | CONFIRMED (tests, probe) — fixed (`5ff377b`) |
@@ -244,7 +249,7 @@ returns something give back — so read those two before deciding what it means 
 | 35 | 32 | the queue frees its storage with every batch, and the next submit allocates it under the lock | async 55, actuator 31 | CONFIRMED (Qt-free probe, benchmark once results are coalesced) — OPEN, optional; **its prototype slows 4 workers' empty batch** |
 | 36 | 33 | a parked worker is notified once per submit until it wakes | async 56 | measured (probe, benchmark) — no time saved, decline recommended |
 | 37 | 34 | the per-worker counts share a cache line | `:568` (`given_`) | measured (probe, benchmark) — no effect, decline recommended |
-| 38 | 35 | a worker takes its queue's lock up to five times per batch | async 57 | read-only, counted by the probe — OPEN, not prototyped |
+| 38 ✅ | 35 | a worker takes its queue's lock up to five times per batch | async 57 | measured (benchmark) — **not taken**: one worker's empty batch loses its fast mode |
 | 39 | 36 | a refused add prints its warning under the queue's lock | async 58 | read-only — OPEN, hygiene |
 | 40 ✅ | 37 | every result wakes the main thread: one post per task - **fixed step 34's regression** | the callback, `bench/qt_pool_vs_this.cpp:155`; fluxcpp's presenters | CONFIRMED (benchmark, main thread held) — (a) fixed `456ac6c`; (b) open for the presenters |
 
@@ -1025,6 +1030,36 @@ returned false without reaching the guard it was written for. It is now
 pool, and reads the stderr line as the queued task is refused — the path that is still reachable.
 
 **Verified:** 29 of 29 on `debug`, `asan` and `tsan`; clang-format clean.
+
+### Step 41 · item 38 — `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` — OPEN, hygiene
+`executor.hpp:36-43` (the doc comment), `:44-81` (`adaptive_mutex`, its `cpu_pause()` at `:67-78`);
+async `async.hpp:35-64`, its step 59 · read from the code, 2026-10-10 (user: "all implementations in
+actuator, async, executor should be agnostic of the platform")
+
+**The code is portable; the comment is not.** `adaptive_mutex` tries `std::mutex::try_lock()` up to
+`spin_limit` times with a CPU pause between, then blocks in `lock()`: standard C++ only, nothing
+`#ifdef`'d by platform. Its `cpu_pause()` is conditional on the CPU architecture - `pause` on x86,
+`yield` on ARM, MSVC's intrinsics, nothing elsewhere - which is how a spin hint is written, the
+language having no portable one. But the doc comment gives the reason as a platform's: "A
+std::mutex blocks in the kernel at once on macOS, so each meeting cost a pair of syscalls". That
+was measured on macOS (step 28); on Linux glibc's default mutex does not spin either, and waits in
+the kernel through a futex once contended, so the same likely holds - not measured; on Windows
+`std::mutex` is built on an SRW lock, which already spins a little, so it likely adds less there -
+not measured either.
+
+**And `cpu_pause()` is written twice** - here, private to `adaptive_mutex`, and in async as
+`untangle::async::cpu_pause()`, the same architecture conditions in both.
+
+**Proposed:**
+1. The comment says why in platform-neutral terms - the lock is held for a few instructions, a
+   contended `std::mutex` may go to the kernel at once, trying first keeps most meetings in user
+   space - and says it was measured on macOS, with the benchmark named.
+2. `adaptive_mutex` uses async's `cpu_pause()` and drops its own: one definition of the
+   architecture conditions. The executor already includes `async.hpp`.
+
+No behaviour changes, so no test turns red; the suite and the benchmark are the guards, and
+`doc/refman.pdf` is regenerated. Whether the spin pays off off macOS is step 19's ground: the
+Linux run it owes would show it.
 
 ## Group 6 — the suite
 
@@ -1977,7 +2012,7 @@ The counts in `given_` are adjacent atomics, so a drain's store invalidates the 
 `pick_worker()` reads. Each padded to 128 bytes: no change in the probe or in the benchmark.
 **Recommended: decline.**
 
-### Step 38 · item 35 — a worker takes its queue's lock up to five times per batch — OPEN, not prototyped
+### Step 38 ✅ · item 35 — a worker takes its queue's lock up to five times per batch — MEASURED, not taken
 async `async.hpp:887-964` (`execute_actions`), `:1006-1021` (`notify_finished`), `:1051-1083`
 (`loop`), its step 57 · read from the code, counted by the probe, 2026-10-10
 
@@ -1988,6 +2023,30 @@ two vectors and the deque - where only the deque holds an executor's tasks. **Pr
 drained check and the re-check, carry the answer into the next iteration, and take only what is
 queued. **Expected:** little - the worker side showed nothing in the benchmark (step 35). Prototype
 before planning further.
+
+**Prototyped and measured (2026-10-10), not taken.** `execute_actions()` held the queue's lock
+from one batch to the next: after a batch it relocks once, and either takes the next batch under
+that lock or, drained, releases it for `on_finished` - one lock per busy batch instead of two, and
+`notify_finished()`'s second check of what was just checked gone. Scratchpad `probe/s38`. async's
+77 of 77 and the executor's 57 of 57 on Debug and TSan against it. Three runs each, alternating with
+the committed code:
+
+| | committed (`7e7c2b0`) | prototype | `QThreadPool` |
+|---|---|---|---|
+| empty, 4 workers, delivered | 75.9-88.7 µs | **71.1-74.9** | 204.0-218.9 |
+| empty, 1 worker, delivered, per run | 53, 109, 172 µs | **116, 132, 114** | 102.4-115.2 |
+| mixed, 4 workers, submitted | 44.2-47.9 µs | 39.2-43.8 | - |
+| mixed, 1 / 4 workers, delivered | 113.6-115.9 / 34.9-35.6 ms | 115.0-117.0 / 35.4-35.7 | 113.7-116.1 / 32.5-33.4 |
+| single tasks, 1000 x 10 µs | level | level | - |
+
+It wins on four workers' empty batch and loses one worker's: holding the lock between batches lets
+the worker take work as fast as the submitter adds it, so the two meet on every task and the fast
+mode (53 µs) never comes. A regression by the rule that no case may get worse; the mixed batch, 1-2
+ms either way in ranges that overlap, gives nothing back. **Not taken**, as steps 36 and 37.
+
+(A first run of these tests seemed to hang one async case for 608 and 900 s: the Mac was asleep, lid
+closed, `pmset -g log`. Rerun awake under `caffeinate -i`, every case passed.)
+The code is async's; recorded there as its step 57.
 
 ### Step 39 · item 36 — a refused add prints its warning under the queue's lock — OPEN, hygiene
 async `async.hpp:823`, `:860`, `:865`, its step 58 · read from the code, 2026-10-10
