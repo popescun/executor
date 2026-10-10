@@ -30,6 +30,10 @@ worker looking busy, and an empty task was refused with a warning on stderr. Bot
 **2026-10-09 — housekeeping:** steps 17 and 18 closed (done in `d1245d7` and `2f4d8ce`, the rows
 never updated); steps 13 (pools name their workers) and 15 (copy and move deleted) done
 in `1c1b745`; 50 of 50 on Debug, 55 of 55 on ASan and TSan.
+**2026-10-10 — step 33 (group 8) opened: uneven tasks leave workers idle.** `bench/qt_pool_vs_this`
+gained a mixed batch (1000 tasks, 105 of them 1 ms, the rest 10 µs): on 4 workers the executor
+delivers in 35.4-35.5 ms against `QThreadPool`'s 32.9-33.1, 7.5% behind, in two runs. Step 31's
+first accepted behaviour change, measured. Work stealing proposed; a design decision, open.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -193,6 +197,7 @@ returns something give back — so read those two before deciding what it means 
 | 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) — SUPERSEDED by step 31, never committed |
 | 31 ✅ | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) — fixed `d1245d7` |
 | 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed `99ebed7` |
+| 33 | 30 | a task waits behind its own worker while another worker idles | `:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) | CONFIRMED (`bench/qt_pool_vs_this`, mixed batch) — OPEN, design decision |
 
 ---
 
@@ -1602,3 +1607,57 @@ the user: `add_task()` forwards its arguments to `give_to_worker()`, and that ca
 reaches a worker: it counts it, forwards to the worker's `add_task()`, and takes the count back on a
 refusal. `add_task()` keeps the static check, the refusals and the pick. No behaviour change: 46 of
 46 on Debug, ASan and TSan; docs clean.
+
+### Step 33 · item 30 — a task waits behind its own worker while another worker idles — OPEN
+`executor.hpp:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) · CONFIRMED by
+`bench/qt_pool_vs_this` (`640508a`), 2026-10-10; sites at `7724944`
+
+**The problem.** Step 31 fixes a task's worker at submission, and its first accepted behaviour change
+says so: "a task waits behind its own worker's queue even if another worker goes idle. A smarter
+balancer (stealing) waits for a use case." A batch is submitted long before any worker drains, so
+`pick_worker()` deals it out nearly round-robin by count, and a worker that drew more long tasks
+finishes last while the others idle. `QThreadPool`'s workers take from one shared queue and do not
+have this problem. With uniform tasks, and with one worker - flux's default - nothing changes.
+
+**Measured.** The bench's mixed batch: 1000 tasks, one in ten 1 ms and the rest 10 µs, drawn from a
+fixed seed (105 long), so every pool and every run gets the same batch. Delivered, ms, two runs:
+
+| | 1 worker | 4 workers |
+|---|---|---|
+| executor | 115.3-117.7 | **35.4-35.5** |
+| `QThreadPool` | 115.2-117.7 | **32.9-33.1** |
+| QtConcurrent | 115.4-117.0 | 33.5-33.7 |
+
+`QThreadPool` is at the machine's limit: four workers ran uniform 1 ms tasks 3.57x faster than one on
+every pool, and 117.7 / 3.57 is 33.0. The executor's 2.5 ms is the imbalance alone. It repeats because
+the batch does; another seed, another share of long tasks or more workers moves it, and fewer, longer
+tasks make it larger.
+
+**Proposed: work stealing.** A worker that drains takes queued tasks from the busiest worker before
+it parks. Placement at submission stays as step 31 left it, so submitting costs what it does now.
+- **async first.** `async::execution` has no way to hand a queued task back out: `add_task()`,
+  `add_action()` and `pending()` are all its public surface over the queue. Stealing needs one -
+  say `execution::take_tasks(n)`, returning sealed tasks under the queue's lock, and a way to add a
+  sealed task to another execution without wrapping it again. That is the public sealed-task door
+  step 30 asked for and withdrew; the reason has changed, so async's plan should weigh it afresh.
+- **Who steals:** the drain (`on_finished` -> `worker_drained()`) is where a worker knows it is idle.
+  It picks the worker with the largest `pending()` and takes half of what waits there.
+- **Order:** step 31's second accepted change (submission order per worker, not across the pool)
+  stays true; a stolen task still starts after the tasks queued before it on its new worker.
+- **The counts:** `given_` steers placement only. A stolen task moves its count, or the victim looks
+  busier than it is until it drains.
+
+**Alternatives, not recommended.**
+- (b) A shared queue again: what step 31 replaced, and what cost the submit time it won back.
+- (c) Decline: record the gap and keep step 31's behaviour. Defensible while flux runs one worker per
+  pool; it stops being so the first time a store runs uneven work on several.
+
+**Tests first.** `a_task_waits_for_the_worker_it_was_given` (`test/executor_tests.cpp:1197`) asserts
+the behaviour this step removes: 2 workers held at gates, 4 tasks, one gate opened, 2 run. With
+stealing, the worker whose gate opened runs its own 2, then takes half of the other's 2, and 3 run. That case flips,
+failing until the fix. New: a long task held at a gate on one worker with short tasks queued behind
+it, the other worker idle - the short tasks run on the idle worker.
+
+**Done when:** Debug, ASan and TSan are green in both repos, the mixed batch on 4 workers delivers
+within noise of `QThreadPool`, and the uniform and empty batches are no worse than in
+`bench/README.md`.
