@@ -79,6 +79,11 @@ included; the uneven-task gap is accepted.
 workers' empty batch faster (71-75 µs against 76-89) and kept one worker's out of its fast mode in
 every run (114-132 µs against 53-172): a regression in one case, so not taken. Prototype in the
 scratchpad; the repos unchanged.
+**2026-10-10 — step 41 done (`23ce729`): the pool's lock is a plain `std::mutex`.** `adaptive_mutex`
+went, its copy of `cpu_pause()` and its macOS comment with it: since step 31 the pool's lock is off
+the hot path, and with its spin off every case had stayed where it was. Three runs against the
+committed code: no case worse, one worker's empty batch delivered in 38-55 µs against 70-112. 54 of
+54 on Debug, ASan and TSan; `doc/refman.pdf` at 31 pages.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -251,7 +256,7 @@ returns something give back — so read those two before deciding what it means 
 | 38 ✅ | 35 | a worker takes its queue's lock up to five times per batch | async 57 | measured (benchmark) — **not taken**: one worker's empty batch loses its fast mode |
 | 39 | 36 | a refused add prints its warning under the queue's lock | async 58 | read-only — OPEN, hygiene |
 | 40 ✅ | 37 | every result wakes the main thread: one post per task - **fixed step 34's regression** | the callback, `bench/qt_pool_vs_this.cpp:155`; fluxcpp's presenters | CONFIRMED (benchmark, main thread held) — (a) fixed `456ac6c`; (b) open for the presenters |
-| 41 | 38 | `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` | `:36-81` | measured (benchmark, spin off) — OPEN: replace it with `std::mutex`; with async 59 |
+| 41 ✅ | 38 | `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` | `:36-81` | measured (benchmark, spin off) — fixed `23ce729`: replaced with `std::mutex` |
 
 ---
 
@@ -2096,7 +2101,7 @@ the worst run of each, 203 µs against 187, did not show the regression gone.
 of 5 now against 4 of 5 before, and costs less when it does (92, 118 µs against 166-231). The
 one-worker 10 µs batch is level on five runs. (b) stays open for the presenters.
 
-### Step 41 · item 38 — `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` — OPEN: replace it with `std::mutex`
+### Step 41 ✅ · item 38 — `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` — DONE: replaced with `std::mutex`
 `executor.hpp:36-43` (the doc comment), `:44-81` (`adaptive_mutex`, its `cpu_pause()` at `:67-78`);
 async `async.hpp:35-64`, its step 59 · read from the code, 2026-10-10 (user: "all implementations in
 actuator, async, executor should be agnostic of the platform")
@@ -2159,3 +2164,34 @@ its `cpu_pause()` with it - the platform-flavoured comment and the duplicate gon
 undone because what it was for no longer exists, not because it was wrong. No test turns red; the
 suite, under all three presets, and the benchmark - every case no worse - are the guards, and
 `doc/refman.pdf` is regenerated. async keeps its spin; its comment is step 59's.
+
+**Tests (written first, 2026-10-10).** No behaviour changes, so none could turn red. What the change
+could break is the hand-off between a draining worker and `wait()`, over `mutex_` and
+`finished_cv_` - and a lost notification would not fail a `wait()`, which checks again every
+second, only delay it, so no `wait()` test could see one. The guard,
+`wait_wakes_as_soon_as_the_pool_drains`: 500 rounds of submit-then-`wait()` on two workers, inside
+one second - a single lost notification costs a round a second. Passing before the change, in 6 ms
+on Debug, 4-5 on ASan, 12-13 on TSan. The four `adaptive_mutex_tests` went with the class: they
+tested it, not the pool.
+
+**Landed in `23ce729`.** `mutex_` is a `std::mutex`, `finished_cv_` a `std::condition_variable`;
+`wait()` and `worker_drained()` take `std::unique_lock` and `std::lock_guard` of `std::mutex`.
+`adaptive_mutex`, its `cpu_pause()`, its comment and the `<intrin.h>` include only it needed are
+gone. The guard in 2-3 ms on Debug, 4 on ASan, 12-13 on TSan, three runs each. 54 of 54 on all three
+presets - 57, the guard added, four removed; clang-format clean; `doc/refman.pdf` at 31 pages, no
+doxygen warning from the header. `bench/qt_pool_vs_this`, three runs each against the committed code
+(the scratchpad's `probe/spinb_base`, its only difference an `#ifdef` left off):
+
+| | committed (`5de5bbc`) | step 41 | `QThreadPool` |
+|---|---|---|---|
+| 1 worker, 1000 empty, delivered per run | 70, 112, 92 µs | 55, 38, 38 | 110-143 |
+| 4 workers, 1000 empty, delivered | 72.7-77.8 µs | 74.0-80.2 | 189-239 |
+| submit 1000 x 10 µs, 1 / 4 workers | 19.0-22.8 / 27.8-30.0 µs | 18.4-20.1 / 28.6-30.6 | - |
+| 1000 x 10 µs, 1 / 4 workers, delivered | 11.26-11.35 / 2.99-3.16 ms | 10.84-11.31 / 3.05-3.14 | - |
+| mixed, 1 / 4 workers, delivered | 113.0-113.7 / 33.8-34.8 ms | 110.9-116.0 / 34.0-35.5 | 111.8-115.9 / 31.4-33.1 |
+
+No case worse: four workers' empty batch and mixed batch overlap the committed ranges, and in the
+rotation above - the same change against the same baseline - were level. One worker's empty batch
+was in its fast mode in every run, as it was with no spin anywhere: in its ping-pong the spin had
+been lengthening each hand-off. Step 28's change is undone because what it was for went with step
+31's `pending_`, not because it was wrong.
