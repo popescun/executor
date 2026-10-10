@@ -37,6 +37,13 @@ rest 10 µs), and on 4 workers the executor delivers in 35.4-35.5 ms against `QT
 analysis of the executor, async and the actuator, each fix prototyped and measured alone: **step 34
 (fewer moves of the action) is the one the benchmark shows**, submitting 15-20% faster and level
 with `QThreadPool`; 35 is optional, 36 and 37 measured and not worth taking, 38 and 39 open.
+**2026-10-10 — step 34 done (`ce6fc83`, async pin `f8f3c43`):** a task is copied or moved into its
+worker's queue once, through the actuator's step 30 (`f21a58b`) and async's 54 (`1f8a02d`). With real
+work the executor submits 1000 tasks in 18.3-18.8 µs on 1 worker and 29.3-29.7 on 4, against
+`QThreadPool`'s 19.8-22.0 and 28.1-33.9: level. 57 of 57 on Debug, ASan and TSan; `doc/refman.pdf` at
+31 pages. **Behind it:** empty tasks on one worker are processed later than before (186-258 µs
+against 132-177), in both run orders and through either build - it follows the faster submit; still
+delivered ahead of `QThreadPool`. Recorded, not pursued.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -202,7 +209,7 @@ returns something give back — so read those two before deciding what it means 
 | 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed `99ebed7` |
 | **Group 9 — performance, benched against QThreadPool** |
 | 33 | 30 | a task waits behind its own worker while another worker idles | `:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) | CONFIRMED (`bench/qt_pool_vs_this`, mixed batch) — OPEN, design decision |
-| 34 | 31 | a task's action is moved five times between `add_task()` and the queue | `:424` (`give_to_worker`); async 54, actuator 30 | CONFIRMED (benchmark, the fix alone) — OPEN |
+| 34 ✅ | 31 | a task's action is moved five times between `add_task()` and the queue | `:424` (`give_to_worker`); async 54, actuator 30 | CONFIRMED (tests, benchmark) — fixed `ce6fc83`; a follow-up on one worker open |
 | 35 | 32 | the queue frees its storage with every batch, and the next submit allocates it under the lock | async 55, actuator 31 | CONFIRMED (Qt-free probe), not visible in the benchmark — OPEN, optional |
 | 36 | 33 | a parked worker is notified once per submit until it wakes | async 56 | measured (probe, benchmark) — no time saved, decline recommended |
 | 37 | 34 | the per-worker counts share a cache line | `:568` (`given_`) | measured (probe, benchmark) — no effect, decline recommended |
@@ -1698,7 +1705,7 @@ it, the other worker idle - the short tasks run on the idle worker.
 within noise of `QThreadPool`, and the uniform and empty batches are no worse than in
 `bench/README.md`.
 
-### Step 34 · item 31 — a task's action is moved five times between `add_task()` and the queue — OPEN
+### Step 34 ✅ · item 31 — a task's action is moved five times between `add_task()` and the queue — DONE
 `executor.hpp:271` (`add_task`), `:424` (`give_to_worker`); async `async.hpp:589` (`add_task`, its
 step 54); actuator `actuator.hpp:1191` (`bind_task`, its step 30) · CONFIRMED by
 `bench/qt_pool_vs_this`, 2026-10-10; sites at `640508a`, async `b98dfd9`, actuator `fccaad1`
@@ -1734,6 +1741,52 @@ guard that a named `std::function` still goes in through `execution::add_task()`
 **Order:** actuator step 30, async step 54, then this, each pin bumped in turn.
 **Done when:** Debug, ASan and TSan are green in all three repos, and the benchmark submits with real
 work level with `QThreadPool`, delivery unchanged.
+
+**Decided (user, 2026-10-10):** `executor::add_task()` is two overloads too, `const actionT&` and
+`actionT&&`, as async's - not `give_to_worker()` alone, which would have left a kept task copied and
+moved, and a given-up one moved twice. Each overload runs the checks; `give_to_worker()` stays the one
+place a task reaches a worker and takes a forwarding reference (`action_t`, the type as passed).
+
+**Tests (written first, failing):** `submitting_moves_a_task_given_up_once` - 0 copies and one move
+beyond sealing the task - moved three times; `submitting_copies_a_task_the_caller_keeps_once` - one
+copy and no move beyond sealing - moved twice. `move_counting_task` is a plain functor;
+`moves_to_seal_a_task()` measures the standard library's share. The cases submitting bare lambdas guard
+the conversion path. 50 of 52.
+
+**Landed in `ce6fc83`** (async pin `f8f3c43` to `1f8a02d`). 57 of 57 on Debug, ASan and TSan;
+`doc/refman.pdf` at 31 pages, no doxygen warning from the header. `bench/qt_pool_vs_this`, three runs
+each against the old code, alternating, µs to submit 1000 tasks:
+
+| | before | after | `QThreadPool`, same runs |
+|---|---|---|---|
+| 10 µs, 1 worker | 24.2-25.7 | 18.3-18.8 | 19.8-22.0 |
+| 10 µs, 4 workers | 35.5-36.5 | 29.3-29.7 | 28.1-33.9 |
+| empty, 4 workers | 35.6-36.5 | 29.5-30.1 | 60.5-67.3 |
+| mixed, 1 / 4 workers | 25.4-26.5 / 52.5-52.9 | 19.5-19.7 / 43.3-46.9 | 21.0-24.0 / 40.8-57.5 |
+
+Delivery with real work unchanged; the mixed batch on 4 workers still ~34.5 ms against
+`QThreadPool`'s 32-33, step 33's.
+
+**Open: empty tasks on one worker are processed later.** Seven runs each, in both orders (old first,
+then new first): the last of 1000 empty tasks finishes on the worker at 186-258 µs against 132-177,
+and is delivered at 204-277 against 155-193; `QThreadPool` steady at ~300 throughout, so still ahead
+of it, by less. One task alone and four workers are unchanged. Nothing on the worker's path changed.
+
+**Not the build.** The new headers built through the same scratchpad mirror as the old binary, three
+runs in rotation with it and with `bench/build`: processed at 222-247 µs (mirror) and 149-209
+(`bench/build`) against the old mirror's 122-186. It follows the code, and the faster the submit the
+later the worker: submitted in 29-35 µs (new, mirror), 38-43 (new, `bench/build`), 35-49 (old).
+
+**Likeliest cause, not proven:** most of the worker's time comes after the submit has ended (30-45
+µs against 120-250), so the queue's lock cannot be all of it. The worker posts every result to the
+main thread, and the main thread starts taking them off Qt's event queue the moment it finishes
+submitting: the sooner it gets there, the longer it and the worker meet on that queue. `QThreadPool`
+submits in ~65 µs, so its main thread gets there later. Probing it would mean holding the main
+thread back before its loop and seeing the worker recover.
+
+**Recorded, not pursued:** it is one case - empty tasks, one worker - where the executor still
+delivers ahead of `QThreadPool` (204-277 µs against ~290-315); with real work the change is level or
+faster everywhere.
 
 ### Step 35 · item 32 — the queue frees its storage with every batch, and the next submit allocates it under the lock — OPEN, optional
 async `async.hpp:900` (`execute_actions`, its step 55), `:852` (`add_queued_task`); actuator
