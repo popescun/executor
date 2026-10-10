@@ -64,6 +64,12 @@ slow mode still shows in 2 runs of 5 (92, 118 µs), against 4 of 5 before step 3
 case worse. Step 35 is not needed for it, and back to optional: its prototype removes the slow mode
 but makes 4 workers' empty batch slower (84-91 µs against 75-81) - a regression of its own,
 unresolved.
+**2026-10-10 — step 33 started, tests first.** Against `QThreadPool` the executor is level on real
+work, single tasks and submitting, and well ahead on empty batches; uneven task lengths on 4 workers
+are the gap left, 7-8% behind (`bench/README.md`, `1adfc1f`). Two tests written, one red:
+`a_freed_worker_takes_the_tasks_a_busy_one_holds` replaces
+`a_task_waits_for_the_worker_it_was_given`, and a guard for `wait()`. The fix waits on decisions
+(step 33) and an addition to async.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -228,7 +234,7 @@ returns something give back — so read those two before deciding what it means 
 | 31 ✅ | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) — fixed `d1245d7` |
 | 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed `99ebed7` |
 | **Group 9 — performance, benched against QThreadPool** |
-| 33 | 30 | a task waits behind its own worker while another worker idles | `:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) | CONFIRMED (`bench/qt_pool_vs_this`, mixed batch) — OPEN, design decision |
+| 33 | 30 | a task waits behind its own worker while another worker idles | `:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) | CONFIRMED (`bench/qt_pool_vs_this`, mixed batch) — OPEN: tests written (red), design to decide |
 | 34 ✅ | 31 | a task's action is moved five times between `add_task()` and the queue | `:424` (`give_to_worker`); async 54, actuator 30 | CONFIRMED (tests, benchmark) — fixed `ce6fc83`; **caused a regression** (one worker, empty tasks), resolved by step 40 (`456ac6c`) |
 | 35 | 32 | the queue frees its storage with every batch, and the next submit allocates it under the lock | async 55, actuator 31 | CONFIRMED (Qt-free probe, benchmark once results are coalesced) — OPEN, optional; **its prototype slows 4 workers' empty batch** |
 | 36 | 33 | a parked worker is notified once per submit until it wakes | async 56 | measured (probe, benchmark) — no time saved, decline recommended |
@@ -1672,7 +1678,7 @@ submitted in 18.8-19.6 µs on 1 worker (baseline 23.6-25.4, `QThreadPool` 19.7-2
 (35.6-37.1, `QThreadPool` 28.6-35); delivery and the mixed batch unchanged. Measured alone, all of
 that is step 34's.
 
-### Step 33 · item 30 — a task waits behind its own worker while another worker idles — OPEN
+### Step 33 · item 30 — a task waits behind its own worker while another worker idles — OPEN, tests written
 `executor.hpp:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) · CONFIRMED by
 `bench/qt_pool_vs_this` (`640508a`), 2026-10-10; sites at `7724944`
 
@@ -1718,13 +1724,45 @@ it parks. Placement at submission stays as step 31 left it, so submitting costs 
 
 **Tests first.** `a_task_waits_for_the_worker_it_was_given` (`test/executor_tests.cpp:1197`) asserts
 the behaviour this step removes: 2 workers held at gates, 4 tasks, one gate opened, 2 run. With
-stealing, the worker whose gate opened runs its own 2, then takes half of the other's 2, and 3 run. That case flips,
-failing until the fix. New: a long task held at a gate on one worker with short tasks queued behind
-it, the other worker idle - the short tasks run on the idle worker.
+stealing, the worker whose gate opened runs its own 2, then takes half of the other's 2, and 3 run.
+That case flips, failing until the fix. New: a long task held at a gate on one worker with short
+tasks queued behind it, the other worker idle - the short tasks run on the idle worker.
 
 **Done when:** Debug, ASan and TSan are green in both repos, the mixed batch on 4 workers delivers
 within noise of `QThreadPool`, and the uniform and empty batches are no worse than in
 `bench/README.md`.
+
+**Where it stands (2026-10-10, `bench/README.md` at `1adfc1f`).** After steps 34 and 40 the mixed
+batch on 4 workers is still 7-8% behind, 2.3-2.5 ms in each of five runs: 32.8-35.5 ms against
+`QThreadPool`'s 30.4-33.1. Every other case is level or ahead, so this is the gap left.
+
+**Tests (written first, 2026-10-10).** The plan above had the flipped case expect 3 - the freed
+worker taking half of the other's 2. Written instead on the outcome, so it holds however much a
+steal takes:
+- `a_freed_worker_takes_the_tasks_a_busy_one_holds`, replacing
+  `a_task_waits_for_the_worker_it_was_given` - 2 workers held at gates, 4 tasks queued two per
+  worker, one gate opened: all 4 run and notify their callbacks while the other worker is still
+  held. **Failing:** "the freed worker left 2 tasks waiting behind a busy one".
+- `wait_counts_a_task_on_its_way_between_workers`, a guard - a stolen task is in neither queue for a
+  moment, and a drain asking each worker in turn could miss it there. 200 rounds of a 200 µs
+  task and 20 short ones behind it, each ended by `wait()`, which must find all 21 run.
+  **Passing**, plain and under TSan; the fix must keep it so.
+52 of 53.
+
+**To decide before the fix** (proposed; the user's):
+1. **async first:** a public way to take sealed tasks out of an execution's queue under its lock -
+   say `execution::take_tasks(n)` - and to queue a sealed task on another without wrapping it again.
+   The sealed-task door async's step 50 added and withdrew; its own step, test first, in async's
+   plan.
+2. **When:** in `worker_drained()`, before the worker parks. The victim is chosen from the lock-free
+   `given_` counts, and only a queue that clearly has a backlog is locked - locking every queue on
+   every drain would cost the empty batches their lead.
+3. **How much:** half the victim's queue, stealing again when it runs out - the test holds either
+   way.
+4. **`wait()`:** the move is held under a lock `wait()` also takes, or the tasks in flight are
+   counted; the guard above is the net.
+5. **The benchmark:** the mixed batch on 4 workers within noise of `QThreadPool`, and no other case
+   worse - the empty batches included.
 
 ### Step 34 ✅ · item 31 — a task's action is moved five times between `add_task()` and the queue — DONE, its regression resolved by step 40
 `executor.hpp:271` (`add_task`), `:424` (`give_to_worker`); async `async.hpp:589` (`add_task`, its
