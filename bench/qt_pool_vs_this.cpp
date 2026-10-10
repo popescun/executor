@@ -12,7 +12,9 @@
  *  - **executor:** `add_task(task, i, callback)`; the callback runs on the worker and posts the
  *    result with `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`, coalesced: a result
  *    finding others still waiting joins them, and the main thread takes them in one event;
- *  - **QThreadPool:** `start(lambda)`; the lambda runs the task and posts the result the same way;
+ *  - **QThreadPool:** `start(lambda)`; the lambda holds what the executor's sealed task holds - its
+ *    own copy of the task, the argument and the callback - runs the task and hands the callback
+ *    the result, which posts it the same way;
  *  - **QtConcurrent:** `QtConcurrent::run(&pool, task, i).then(context, ...)` - Qt's own idiom,
  *    whose continuation runs on the context object's thread, one per result.
  *
@@ -208,8 +210,12 @@ struct qthreadpool_pool {
     pool.setMaxThreadCount(static_cast<int>(worker_count));
   }
 
+  //! The same work per task as the executor's add_task(): a copy of the task, its argument and a
+  //! callback, sealed together; running it hands the callback the task's result.
   bool submit(int i) {
-    pool.start([this, i] { common.post(common.task(i)); });
+    pool.start([task = common.task, i, callback = [this](int result) { common.post(result); }] {
+      callback(task(i));
+    });
     return true;
   }
 
