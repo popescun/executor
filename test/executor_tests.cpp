@@ -1257,6 +1257,30 @@ TEST(executor_tests, concurrent_waits_leave_the_pool_accepting) {
 }
 
 /**
+ * @brief wait() returns as soon as the pool drains, not at its next periodic check.
+ *
+ * A worker that drains while a wait() counts itself notifies it under the pool's lock. A lost
+ * notification would not fail a wait() - it checks again every second - only delay it, so a test of
+ * what wait() returns cannot see one. Many short waits in a row can: each lost one costs a second.
+ */
+TEST(executor_tests, wait_wakes_as_soon_as_the_pool_drains) {
+  constexpr int rounds = 500;
+  std::atomic_int ran = {0};
+  executor pool(2);
+  pool.start();
+
+  const auto start = std::chrono::steady_clock::now();
+  for (int round = 0; round < rounds; ++round) {
+    ASSERT_TRUE(pool.add_task([&ran] { ran.fetch_add(1); }, ignore_result));
+    pool.wait();
+  }
+  const auto took = std::chrono::steady_clock::now() - start;
+
+  EXPECT_EQ(ran.load(), rounds);
+  EXPECT_LT(took, 1s) << "a wait() missed the drain's notification and slept until its next check";
+}
+
+/**
  * @brief Opens two gates when it goes out of scope, so a failed check cannot leave a worker held.
  *
  * Declared after the pool, it is destroyed first: the pool's destructor waits for its workers.
@@ -1443,97 +1467,4 @@ TEST(executor_tests, a_pool_is_neither_copied_nor_moved) {
   static_assert(!std::is_copy_assignable_v<executor>);
   static_assert(!std::is_move_constructible_v<executor>);
   static_assert(!std::is_move_assignable_v<executor>);
-}
-
-// ---------------------------------------------------------------------------
-// adaptive_mutex - the pool's lock: spins briefly, then blocks
-// ---------------------------------------------------------------------------
-
-//! Many threads, one counter that is not atomic: only the lock keeps the count exact.
-TEST(adaptive_mutex_tests, excludes_under_contention) {
-  untangle::adaptive_mutex mutex;
-  int count = 0;
-  constexpr int threads = 8;
-  constexpr int rounds = 20'000;
-
-  {
-    std::vector<std::jthread> contenders;
-    for (int t = 0; t < threads; ++t) {
-      contenders.emplace_back([&] {
-        for (int i = 0; i < rounds; ++i) {
-          std::lock_guard<untangle::adaptive_mutex> lock(mutex);
-          ++count;
-        }
-      });
-    }
-  }
-
-  EXPECT_EQ(count, threads * rounds) << "two threads were inside the lock at once";
-}
-
-//! try_lock() never waits: it fails while another thread holds the lock.
-TEST(adaptive_mutex_tests, try_lock_fails_while_held_elsewhere) {
-  untangle::adaptive_mutex mutex;
-  mutex.lock();
-
-  bool taken_while_held = true;
-  std::thread([&] { taken_while_held = mutex.try_lock(); }).join();
-  EXPECT_FALSE(taken_while_held) << "try_lock() took a held lock";
-
-  mutex.unlock();
-
-  bool taken_when_free = false;
-  std::thread([&] {
-    taken_when_free = mutex.try_lock();
-    if (taken_when_free) {
-      mutex.unlock();
-    }
-  }).join();
-  EXPECT_TRUE(taken_when_free) << "try_lock() failed on a free lock";
-}
-
-//! A holder that outlasts the spin: lock() blocks until it lets go, then takes it.
-TEST(adaptive_mutex_tests, lock_waits_out_a_long_holder) {
-  untangle::adaptive_mutex mutex;
-  std::atomic_bool released = {false};
-  std::atomic_bool taken = {false};
-
-  mutex.lock();
-  std::thread waiter([&] {
-    std::lock_guard<untangle::adaptive_mutex> lock(mutex);
-    taken = true;
-    EXPECT_TRUE(released.load()) << "lock() returned while the lock was held";
-  });
-
-  std::this_thread::sleep_for(50ms);
-  EXPECT_FALSE(taken.load()) << "lock() returned while the lock was held";
-
-  released = true;
-  mutex.unlock();
-  waiter.join();
-
-  EXPECT_TRUE(taken.load()) << "lock() never took the released lock";
-}
-
-//! The pool waits on it through std::condition_variable_any.
-TEST(adaptive_mutex_tests, works_with_condition_variable_any) {
-  untangle::adaptive_mutex mutex;
-  std::condition_variable_any ready_cv;
-  bool ready = false;
-
-  std::thread notifier([&] {
-    std::this_thread::sleep_for(10ms);
-    {
-      std::lock_guard<untangle::adaptive_mutex> lock(mutex);
-      ready = true;
-    }
-    ready_cv.notify_all();
-  });
-
-  {
-    std::unique_lock<untangle::adaptive_mutex> lock(mutex);
-    EXPECT_TRUE(ready_cv.wait_for(lock, 5s, [&] { return ready; })) << "the wait never woke";
-  }
-
-  notifier.join();
 }

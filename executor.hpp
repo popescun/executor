@@ -27,58 +27,7 @@
 #include <utility>
 #include <vector>
 
-#ifdef _MSC_VER
-#include <intrin.h>
-#endif
-
 namespace untangle {
-
-/**
- * @brief A mutex that spins briefly before it blocks.
- *
- * The pool's lock is held for a few instructions at a time, by the submitter and by every worker
- * after every batch. A std::mutex blocks in the kernel at once on macOS, so each meeting cost a
- * pair of syscalls; spinning first ends most of them in user space. Measured with
- * bench/qt_pool_vs_this.
- */
-class adaptive_mutex {
- public:
-  //! How many times lock() tries before it blocks.
-  static constexpr int spin_limit = 100;
-
-  //! Tries up to spin_limit times, then blocks until the lock is free.
-  void lock() {
-    for (int attempt = 0; attempt < spin_limit; ++attempt) {
-      if (mutex_.try_lock()) {
-        return;
-      }
-      cpu_pause();
-    }
-    mutex_.lock();
-  }
-
-  //! Takes the lock if it is free, and never waits.
-  bool try_lock() { return mutex_.try_lock(); }
-
-  //! Releases the lock.
-  void unlock() { mutex_.unlock(); }
-
- private:
-  //! Tells the core this is a spin, so it saves power and yields to its sibling thread.
-  static void cpu_pause() noexcept {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-    _mm_pause();
-#elif defined(_MSC_VER) && defined(_M_ARM64)
-    __yield();
-#elif defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-    __asm__ __volatile__("yield");
-#endif
-  }
-
-  std::mutex mutex_;
-};
 
 //! Numbers the pools that are not given a name, across every task type, so no two are alike.
 inline std::atomic<std::size_t> unnamed_pools = {0};
@@ -213,7 +162,7 @@ class executor {
     const bool was_running = running_.exchange(false);
 
     {
-      std::unique_lock<adaptive_mutex> lock(mutex_);
+      std::unique_lock<std::mutex> lock(mutex_);
 
       // Counted under the lock, before the first check: a worker that drains after this sees it and
       // notifies, and one that drained before it is seen by that first check.
@@ -496,7 +445,7 @@ class executor {
 
     // The lock only for a wait(), which counts itself under it before its first check.
     if (waiting_.load() > 0) {
-      std::lock_guard<adaptive_mutex> lock(mutex_);
+      std::lock_guard<std::mutex> lock(mutex_);
       finished_cv_.notify_all();
     }
   }
@@ -570,8 +519,8 @@ class executor {
   static constexpr int report_first_ms = 1000;
   static constexpr int report_max_ms = 30000;
 
-  mutable adaptive_mutex mutex_;
-  std::condition_variable_any finished_cv_;
+  mutable std::mutex mutex_;
+  std::condition_variable finished_cv_;
 
   //! Serialises wait(). Not mutex_, which finished_cv_ has to own while it waits.
   std::mutex wait_mutex_;
