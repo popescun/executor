@@ -29,7 +29,7 @@ worker looking busy, and an empty task was refused with a warning on stderr. Bot
 `99ebed7`; 46 of 46 on Debug, ASan and TSan.
 **2026-10-09 — housekeeping:** steps 17 and 18 closed (done in `d1245d7` and `2f4d8ce`, the rows
 never updated); steps 13 (pools name their workers) and 15 (copy and move deleted) done
-(uncommitted); 50 of 50 on Debug, 55 of 55 on ASan and TSan.
+in `1c1b745`; 50 of 50 on Debug, 55 of 55 on ASan and TSan.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -170,9 +170,9 @@ returns something give back — so read those two before deciding what it means 
 | 11 ✅ | 11 | every worker prints to stdout on shutdown | `async.hpp:757` | CONFIRMED (14 lines of 38) — fixed upstream, async `2a06497` |
 | 12 ✅ | 12 | the 10ms tick, once per worker | `async.hpp:744-747` | measured, not a defect — gone anyway, async `502650b` |
 | **Group 5 — surface and hygiene** |
-| 13 ✅ | 13 | worker names collide between pools | `:65` | CONFIRMED (test) — fixed (uncommitted) |
+| 13 ✅ | 13 | worker names collide between pools | `:65` | CONFIRMED (test) — fixed `1c1b745` |
 | 14 ✅ | 14 | `struct worker` is a one-field wrapper the prototype outgrew | `:119-121` | read-only |
-| 15 ✅ | 15 | copy and move are suppressed by accident, not by statement | `:181` | read-only — fixed (uncommitted) |
+| 15 ✅ | 15 | copy and move are suppressed by accident, not by statement | `:181` | read-only — fixed `1c1b745` |
 | 16 | 16 | a move-only task does not compile | `:41` | CONFIRMED (compile probe) |
 | 17 ✅ | 17 | `pending()` is advisory and does not say so | `:126-129` | documented in `d1245d7` |
 | 18 ✅ | 18 | no way to wait for the pool to drain short of destroying it | `:79-94` | `wait()`, `2f4d8ce` |
@@ -730,7 +730,7 @@ in each: the warnings name different workers) - failing, both `pool_worker_0`;
 `a_named_pool_prefixes_its_workers` (a pool named `store_a`: its worker's name starts with it) -
 fails to compile until the parameter exists.
 
-**Landed 2026-10-09 (uncommitted), as proposed.** `unnamed_pools`, a process-wide atomic at
+**Landed in `1c1b745`, as proposed.** `unnamed_pools`, a process-wide atomic at
 namespace scope - outside the template, so pools of different task types are numbered apart too.
 README: the sample stall output names `pool_1_worker_*`, and the paragraph that warned the names
 were not unique between pools now says how they are made.
@@ -771,7 +771,7 @@ rather than the reason.
 
 > `= delete` both, with one line saying why: the workers hold `this`.
 
-**Landed 2026-10-09 (uncommitted).** The four deleted, after the constructor, under "every worker's
+**Landed in `1c1b745`.** The four deleted, after the constructor, under "every worker's
 callbacks hold this pool's `this`". The async plan's step 20 is
 > the counter-case worth reading first — there, writing the rule of five out explicitly was tried,
 > measured and reverted. This is the opposite situation, a type that must not move, so the deletion
