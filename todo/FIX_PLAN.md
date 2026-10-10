@@ -229,7 +229,6 @@ returns something give back — so read those two before deciding what it means 
 | 24 | 21 | the workers are unreachable, and so is every seam on them | `:375` | read-only, surface decision |
 | 25 ✅ | 22 | a pool cannot be stopped without destroying it | `:226` | surface addition — `stop()` |
 | 26 ✅ | 23 | construction starts the workers, and nothing else can | `:187`, `:205`, `:89-99` | CONFIRMED (tests) — `start()` added |
-| 41 | 38 | `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` | `:36-81` | measured (benchmark, spin off) — OPEN: replace it with `std::mutex`; with async 59 |
 | **Group 7 — the task type** |
 | 22 ✅ | 19 | `task_t` is fixed at `std::function<void(void)>` | `:45`, `:51`, `:202` | CONFIRMED (probe, tests) — fixed `9daec8b` |
 | 27 ✅ | 24 | a task type that takes arguments is refused, and step 22 ruled that unfixable | `:42`, `:265`, `:371` | CONFIRMED (tests, probe) — fixed (`5ff377b`) |
@@ -252,6 +251,7 @@ returns something give back — so read those two before deciding what it means 
 | 38 ✅ | 35 | a worker takes its queue's lock up to five times per batch | async 57 | measured (benchmark) — **not taken**: one worker's empty batch loses its fast mode |
 | 39 | 36 | a refused add prints its warning under the queue's lock | async 58 | read-only — OPEN, hygiene |
 | 40 ✅ | 37 | every result wakes the main thread: one post per task - **fixed step 34's regression** | the callback, `bench/qt_pool_vs_this.cpp:155`; fluxcpp's presenters | CONFIRMED (benchmark, main thread held) — (a) fixed `456ac6c`; (b) open for the presenters |
+| 41 | 38 | `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` | `:36-81` | measured (benchmark, spin off) — OPEN: replace it with `std::mutex`; with async 59 |
 
 ---
 
@@ -1030,70 +1030,6 @@ returned false without reaching the guard it was written for. It is now
 pool, and reads the stderr line as the queued task is refused — the path that is still reachable.
 
 **Verified:** 29 of 29 on `debug`, `asan` and `tsan`; clang-format clean.
-
-### Step 41 · item 38 — `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` — OPEN: replace it with `std::mutex`
-`executor.hpp:36-43` (the doc comment), `:44-81` (`adaptive_mutex`, its `cpu_pause()` at `:67-78`);
-async `async.hpp:35-64`, its step 59 · read from the code, 2026-10-10 (user: "all implementations in
-actuator, async, executor should be agnostic of the platform")
-
-**The code is portable; the comment is not.** `adaptive_mutex` tries `std::mutex::try_lock()` up to
-`spin_limit` times with a CPU pause between, then blocks in `lock()`: standard C++ only, nothing
-`#ifdef`'d by platform. Its `cpu_pause()` is conditional on the CPU architecture - `pause` on x86,
-`yield` on ARM, MSVC's intrinsics, nothing elsewhere - which is how a spin hint is written, the
-language having no portable one. But the doc comment gives the reason as a platform's: "A
-std::mutex blocks in the kernel at once on macOS, so each meeting cost a pair of syscalls". That
-was measured on macOS (step 28); on Linux glibc's default mutex does not spin either, and waits in
-the kernel through a futex once contended, so the same likely holds - not measured; on Windows
-`std::mutex` is built on an SRW lock, which already spins a little, so it likely adds less there -
-not measured either.
-
-**And `cpu_pause()` is written twice** - here, private to `adaptive_mutex`, and in async as
-`untangle::async::cpu_pause()`, the same architecture conditions in both.
-
-**Proposed:**
-1. The comment says why in platform-neutral terms - the lock is held for a few instructions, a
-   contended `std::mutex` may go to the kernel at once, trying first keeps most meetings in user
-   space - and says it was measured on macOS, with the benchmark named.
-2. `adaptive_mutex` uses async's `cpu_pause()` and drops its own: one definition of the
-   architecture conditions. The executor already includes `async.hpp`.
-
-No behaviour changes, so no test turns red; the suite and the benchmark are the guards, and
-`doc/refman.pdf` is regenerated. Whether the spin pays off off macOS is step 19's ground: the
-Linux run it owes would show it.
-
-**Measured (2026-10-10): what each spin is worth now.** The current code built four ways from a
-scratchpad mirror (`probe/spin`) - async's `lock_spinning()` and this `adaptive_mutex` each with
-their tries at 0, so straight to `std::mutex::lock()` - with the benchmark as committed (`260d984`),
-three runs each in rotation:
-
-| | spinning (committed) | async without | executor without | neither | `QThreadPool` |
-|---|---|---|---|---|---|
-| 4 workers, 1000 empty, delivered | 75.0-79.1 µs | **131.5-166.0** | 72.9-79.8 | **153.8-153.9** | 205.3-339.2 |
-| submit 1000 x 10 µs, 4 workers | 29.1-30.9 µs | **53.6-58.8** | 29.1-30.0 | 34.0-53.6 | 29.6-33.5 |
-| submit mixed, 4 workers | 35.4-48.9 µs | **66.9-97.7** | 40.7-48.6 | **96.0-99.4** | 38.8-49.5 |
-| 1 worker, 1000 empty, delivered per run | 50, 157, 93 µs | 102, 67, 72 | 93, 34, 66 | 66, 45, 46 | 111.9-156.8 |
-| single tasks, real work, mixed delivered | - | level | level | level | - |
-
-- **async's spin is essential:** without it every four-worker case slows down, empty batches 2x -
-  its queue lock is met by the submitter and a worker on every task.
-- **This one buys nothing any more:** without it every case stays in the committed code's ranges.
-  Since step 31 `add_task()` never takes the pool's lock; only `wait()` and a drain with a `wait()`
-  counted do, neither on the hot path. Step 28's reason went with `pending_`.
-- **One worker's empty batch does better with neither spinning** (45-66 µs against 50-157, three
-  runs, the noisy case): in its ping-pong the submitter and the worker hand the queue lock to each
-  other task by task, and spinning seems to lengthen each hand-off. Fewer tries in async, rather
-  than none, might keep four workers fast and ease it - a measurement for later, under the rule that
-  no case gets worse.
-- `QThreadPool`'s `QMutex` does not spin at all: one compare-and-swap (`fastTryLock()`, installed
-  `qmutex.h`), then `lockInternal()`, which goes straight to `futexWait()` - or, on macOS, a Mach
-  `semaphore_wait()` (`qmutex.cpp`, `qmutex_mac.cpp`, Qt's 6.8 and 6.11 branches).
-
-**Proposed instead (2026-10-10):** `mutex_` becomes a plain `std::mutex` and `adaptive_mutex` goes,
-its `cpu_pause()` with it - the platform-flavoured comment and the duplicate gone together, and
-`finished_cv_` can be a `std::condition_variable` again rather than `_any`. Step 28's change is
-undone because what it was for no longer exists, not because it was wrong. No test turns red; the
-suite, under all three presets, and the benchmark - every case no worse - are the guards, and
-`doc/refman.pdf` is regenerated. async keeps its spin; its comment is step 59's.
 
 ## Group 6 — the suite
 
@@ -2159,3 +2095,67 @@ the worst run of each, 203 µs against 187, did not show the regression gone.
 34, median 202. The slow mode - a ping-pong on the queue's lock, step 35's - still shows in 2 runs
 of 5 now against 4 of 5 before, and costs less when it does (92, 118 µs against 166-231). The
 one-worker 10 µs batch is level on five runs. (b) stays open for the presenters.
+
+### Step 41 · item 38 — `adaptive_mutex` explains itself by macOS, and keeps its own copy of async's `cpu_pause()` — OPEN: replace it with `std::mutex`
+`executor.hpp:36-43` (the doc comment), `:44-81` (`adaptive_mutex`, its `cpu_pause()` at `:67-78`);
+async `async.hpp:35-64`, its step 59 · read from the code, 2026-10-10 (user: "all implementations in
+actuator, async, executor should be agnostic of the platform")
+
+**The code is portable; the comment is not.** `adaptive_mutex` tries `std::mutex::try_lock()` up to
+`spin_limit` times with a CPU pause between, then blocks in `lock()`: standard C++ only, nothing
+`#ifdef`'d by platform. Its `cpu_pause()` is conditional on the CPU architecture - `pause` on x86,
+`yield` on ARM, MSVC's intrinsics, nothing elsewhere - which is how a spin hint is written, the
+language having no portable one. But the doc comment gives the reason as a platform's: "A
+std::mutex blocks in the kernel at once on macOS, so each meeting cost a pair of syscalls". That
+was measured on macOS (step 28); on Linux glibc's default mutex does not spin either, and waits in
+the kernel through a futex once contended, so the same likely holds - not measured; on Windows
+`std::mutex` is built on an SRW lock, which already spins a little, so it likely adds less there -
+not measured either.
+
+**And `cpu_pause()` is written twice** - here, private to `adaptive_mutex`, and in async as
+`untangle::async::cpu_pause()`, the same architecture conditions in both.
+
+**Proposed:**
+1. The comment says why in platform-neutral terms - the lock is held for a few instructions, a
+   contended `std::mutex` may go to the kernel at once, trying first keeps most meetings in user
+   space - and says it was measured on macOS, with the benchmark named.
+2. `adaptive_mutex` uses async's `cpu_pause()` and drops its own: one definition of the
+   architecture conditions. The executor already includes `async.hpp`.
+
+No behaviour changes, so no test turns red; the suite and the benchmark are the guards, and
+`doc/refman.pdf` is regenerated. Whether the spin pays off off macOS is step 19's ground: the
+Linux run it owes would show it.
+
+**Measured (2026-10-10): what each spin is worth now.** The current code built four ways from a
+scratchpad mirror (`probe/spin`) - async's `lock_spinning()` and this `adaptive_mutex` each with
+their tries at 0, so straight to `std::mutex::lock()` - with the benchmark as committed (`260d984`),
+three runs each in rotation:
+
+| | spinning (committed) | async without | executor without | neither | `QThreadPool` |
+|---|---|---|---|---|---|
+| 4 workers, 1000 empty, delivered | 75.0-79.1 µs | **131.5-166.0** | 72.9-79.8 | **153.8-153.9** | 205.3-339.2 |
+| submit 1000 x 10 µs, 4 workers | 29.1-30.9 µs | **53.6-58.8** | 29.1-30.0 | 34.0-53.6 | 29.6-33.5 |
+| submit mixed, 4 workers | 35.4-48.9 µs | **66.9-97.7** | 40.7-48.6 | **96.0-99.4** | 38.8-49.5 |
+| 1 worker, 1000 empty, delivered per run | 50, 157, 93 µs | 102, 67, 72 | 93, 34, 66 | 66, 45, 46 | 111.9-156.8 |
+| single tasks, real work, mixed delivered | - | level | level | level | - |
+
+- **async's spin is essential:** without it every four-worker case slows down, empty batches 2x -
+  its queue lock is met by the submitter and a worker on every task.
+- **This one buys nothing any more:** without it every case stays in the committed code's ranges.
+  Since step 31 `add_task()` never takes the pool's lock; only `wait()` and a drain with a `wait()`
+  counted do, neither on the hot path. Step 28's reason went with `pending_`.
+- **One worker's empty batch does better with neither spinning** (45-66 µs against 50-157, three
+  runs, the noisy case): in its ping-pong the submitter and the worker hand the queue lock to each
+  other task by task, and spinning seems to lengthen each hand-off. Fewer tries in async, rather
+  than none, might keep four workers fast and ease it - a measurement for later, under the rule that
+  no case gets worse.
+- `QThreadPool`'s `QMutex` does not spin at all: one compare-and-swap (`fastTryLock()`, installed
+  `qmutex.h`), then `lockInternal()`, which goes straight to `futexWait()` - or, on macOS, a Mach
+  `semaphore_wait()` (`qmutex.cpp`, `qmutex_mac.cpp`, Qt's 6.8 and 6.11 branches).
+
+**Proposed instead (2026-10-10):** `mutex_` becomes a plain `std::mutex` and `adaptive_mutex` goes,
+its `cpu_pause()` with it - the platform-flavoured comment and the duplicate gone together, and
+`finished_cv_` can be a `std::condition_variable` again rather than `_any`. Step 28's change is
+undone because what it was for no longer exists, not because it was wrong. No test turns red; the
+suite, under all three presets, and the benchmark - every case no worse - are the guards, and
+`doc/refman.pdf` is regenerated. async keeps its spin; its comment is step 59's.
