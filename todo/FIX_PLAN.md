@@ -30,10 +30,13 @@ worker looking busy, and an empty task was refused with a warning on stderr. Bot
 **2026-10-09 — housekeeping:** steps 17 and 18 closed (done in `d1245d7` and `2f4d8ce`, the rows
 never updated); steps 13 (pools name their workers) and 15 (copy and move deleted) done
 in `1c1b745`; 50 of 50 on Debug, 55 of 55 on ASan and TSan.
-**2026-10-10 — step 33 (group 8) opened: uneven tasks leave workers idle.** `bench/qt_pool_vs_this`
-gained a mixed batch (1000 tasks, 105 of them 1 ms, the rest 10 µs): on 4 workers the executor
-delivers in 35.4-35.5 ms against `QThreadPool`'s 32.9-33.1, 7.5% behind, in two runs. Step 31's
-first accepted behaviour change, measured. Work stealing proposed; a design decision, open.
+**2026-10-10 — group 9 opened: performance, benched against `QThreadPool`.** Step 33, uneven tasks
+leave workers idle: `bench/qt_pool_vs_this` gained a mixed batch (1000 tasks, 105 of them 1 ms, the
+rest 10 µs), and on 4 workers the executor delivers in 35.4-35.5 ms against `QThreadPool`'s
+32.9-33.1, 7.5% behind; work stealing proposed, a design decision. Steps 34 to 39 come from an
+analysis of the executor, async and the actuator, each fix prototyped and measured alone: **step 34
+(fewer moves of the action) is the one the benchmark shows**, submitting 15-20% faster and level
+with `QThreadPool`; 35 is optional, 36 and 37 measured and not worth taking, 38 and 39 open.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -197,7 +200,14 @@ returns something give back — so read those two before deciding what it means 
 | 30 | 27 | each task reaches its worker alone, wrapped twice | `:396-414`, `:422-426`, `:431-450`, `:457-465` | CONFIRMED (profile, scratchpad variants) — SUPERSEDED by step 31, never committed |
 | 31 ✅ | 28 | the pool keeps a queue of its own between the door and the workers | `:197-237`, `:258-284`, `:286-289`, `:387-465`, `:521` | CONFIRMED (prototype, scratchpad) — fixed `d1245d7` |
 | 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed `99ebed7` |
+| **Group 9 — performance, benched against QThreadPool** |
 | 33 | 30 | a task waits behind its own worker while another worker idles | `:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) | CONFIRMED (`bench/qt_pool_vs_this`, mixed batch) — OPEN, design decision |
+| 34 | 31 | a task's action is moved five times between `add_task()` and the queue | `:424` (`give_to_worker`); async 54, actuator 30 | CONFIRMED (benchmark, the fix alone) — OPEN |
+| 35 | 32 | the queue frees its storage with every batch, and the next submit allocates it under the lock | async 55, actuator 31 | CONFIRMED (Qt-free probe), not visible in the benchmark — OPEN, optional |
+| 36 | 33 | a parked worker is notified once per submit until it wakes | async 56 | measured (probe, benchmark) — no time saved, decline recommended |
+| 37 | 34 | the per-worker counts share a cache line | `:568` (`given_`) | measured (probe, benchmark) — no effect, decline recommended |
+| 38 | 35 | a worker takes its queue's lock up to five times per batch | async 57 | read-only, counted by the probe — OPEN, not prototyped |
+| 39 | 36 | a refused add prints its warning under the queue's lock | async 58 | read-only — OPEN, hygiene |
 
 ---
 
@@ -1608,6 +1618,32 @@ reaches a worker: it counts it, forwards to the worker's `add_task()`, and takes
 refusal. `add_task()` keeps the static check, the refusals and the pick. No behaviour change: 46 of
 46 on Debug, ASan and TSan; docs clean.
 
+## Group 9 — performance, benched against QThreadPool
+
+Every step here is measured with `bench/qt_pool_vs_this`, which runs the same batches on the
+executor, on `QThreadPool` and on QtConcurrent, each result delivered to the main thread as a
+presenter's is (`bench/README.md`). A step is judged on what that benchmark shows: a gain found only
+in a Qt-free harness, whose callbacks do nothing, is not one on flux-shaped work - async's step 53
+was removed for exactly that. Each fix is a step of its own, here and, where the code is theirs, in
+async's or the actuator's plan.
+
+**Where the executor stands** (`bench/README.md`, 2026-10-10): level with `QThreadPool` on real work
+and on single tasks, ahead on empty batches; behind on submitting with real work (step 34) and on
+uneven task lengths (step 33).
+
+**Method, 2026-10-10.** A variant is built from a mirror of the repo in the scratchpad -
+`executor.hpp`, `async/`, `async/actuator/`, `bench/`, `test/` - holding the changed headers, each fix
+behind a macro of its own. **Not by an `-I` placed ahead of the repo's:** the bench's and the suite's
+own include directories come first, and the first builds made that way compiled the real headers
+and measured the current code against itself. `ninja -t deps` shows which headers a build used.
+Variant and baseline run alternately, so both meet the same machine.
+
+**Steps 34 to 37 together:** the executor's 55 of 55 on Debug and under TSan; async's and the
+actuator's suites not yet run against them. Three runs each, alternating: with real work, 1000 tasks
+submitted in 18.8-19.6 µs on 1 worker (baseline 23.6-25.4, `QThreadPool` 19.7-22) and 29.3-29.8 on 4
+(35.6-37.1, `QThreadPool` 28.6-35); delivery and the mixed batch unchanged. Measured alone, all of
+that is step 34's.
+
 ### Step 33 · item 30 — a task waits behind its own worker while another worker idles — OPEN
 `executor.hpp:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) · CONFIRMED by
 `bench/qt_pool_vs_this` (`640508a`), 2026-10-10; sites at `7724944`
@@ -1661,3 +1697,102 @@ it, the other worker idle - the short tasks run on the idle worker.
 **Done when:** Debug, ASan and TSan are green in both repos, the mixed batch on 4 workers delivers
 within noise of `QThreadPool`, and the uniform and empty batches are no worse than in
 `bench/README.md`.
+
+### Step 34 · item 31 — a task's action is moved five times between `add_task()` and the queue — OPEN
+`executor.hpp:271` (`add_task`), `:424` (`give_to_worker`); async `async.hpp:589` (`add_task`, its
+step 54); actuator `actuator.hpp:1191` (`bind_task`, its step 30) · CONFIRMED by
+`bench/qt_pool_vs_this`, 2026-10-10; sites at `640508a`, async `b98dfd9`, actuator `fccaad1`
+
+**The problem.** Every layer takes the action by value. `add_task()` copies the caller's; then
+`give_to_worker()`, `execution::add_task()` and `bind_task()` each take it by value and move it on,
+the lambda's capture moves it again, and so does the `task_t` built from the lambda: a copy and five
+moves of a `std::function` per task. One holding its callable in the small buffer moves it by cloning
+through its vtable - two indirect calls a move. That is the submitter's time, and with real work the
+submitter is where the executor trailed `QThreadPool`.
+
+**Measured** - the fix alone, two runs alternating with the baseline, µs to submit 1000 tasks:
+
+| | baseline | fewer moves | `QThreadPool`, same runs |
+|---|---|---|---|
+| 10 µs, 1 worker | 24-26 | 20-23 | 20.3-22.1 |
+| 10 µs, 4 workers | 37-38 | 31 | 26.9-31.5 |
+| empty, 4 workers | 36 | 30 | 62.0-70.5 |
+| mixed, 1 / 4 workers | 27 / 46-54 | 22 / 44-49 | 21.7-27.7 / 38.3-49.9 |
+
+Delivery unchanged. Steps 35, 36 and 37, each alone, left submitting where it was.
+
+**Proposed:** pass the action down by reference and move it once, into the task.
+`give_to_worker()` is private and takes `actionT&&`. `bind_task()` takes a forwarding reference
+(actuator step 30). `execution::add_task()` is public: the prototype's `actionT&&` stops a caller
+passing a named `std::function` from compiling, so it takes a forwarding reference too, or gains a
+`const actionT&` overload (async step 54).
+
+**Tests first.** A callable that counts its copies and moves, wrapped in the task type: between
+`add_task()` and the queue, one copy from a caller's lvalue and at most two moves - failing today. A
+guard that a named `std::function` still goes in through `execution::add_task()`.
+
+**Order:** actuator step 30, async step 54, then this, each pin bumped in turn.
+**Done when:** Debug, ASan and TSan are green in all three repos, and the benchmark submits with real
+work level with `QThreadPool`, delivery unchanged.
+
+### Step 35 · item 32 — the queue frees its storage with every batch, and the next submit allocates it under the lock — OPEN, optional
+async `async.hpp:900` (`execute_actions`, its step 55), `:852` (`add_queued_task`); actuator
+`actuator.hpp:617` (`call_tasks`, its step 31) · CONFIRMED by a Qt-free probe, 2026-10-10; not
+visible in the benchmark
+
+**The problem.** A worker takes its batch with `batch = std::move(action_actuator_)`, which leaves
+the queue's deque without storage, and the batch's storage is freed once it has run. The first
+`push_back` after every batch allocates the deque's map and a block again - inside
+`add_queued_task()`'s lock, so the worker waits on that allocation too.
+
+**Measured.** The probe (scratchpad `probe/allocs.cpp`: 10000 empty tasks, a callback that adds to an
+atomic, one worker that keeps up): 2.25-2.78 allocations per task and 183-517 ns per submit; with the
+fix 1.00 and 148-178. The 1.00 left is the sealed task's own (actuator step 29). In the benchmark,
+nothing: its workers post every result to the main thread, stay slower than the submitter and let
+their queues build up, so the batch-per-task ping-pong this fixes never happens.
+
+**Proposed:** the worker keeps a spare deque that has kept its storage, and hands it to the queue as
+it takes a batch; `call_tasks()` gives its storage back instead of freeing it.
+
+**To decide:** async's step 53 is the precedent - what paid on a Qt-free harness and not on the
+benchmark was removed. Take it only if a caller without a Qt hop, with trivial callbacks, matters.
+
+### Step 36 · item 33 — a parked worker is notified once per submit until it wakes — MEASURED, decline recommended
+async `async.hpp:828`, `:868` (the adds), `:1063-1069` (`loop`), its step 56 · measured, 2026-10-10
+
+**The problem.** An add notifies when `sleeping_` is set, and only the worker clears it, once it holds
+the lock again; every add in that window notifies again. **Measured** (probe, 4 workers, 10000 empty
+tasks): 0.63-0.72 `notify_one` per task; with the add clearing `sleeping_` as it notifies, 0.03-0.06.
+**No time saved:** 100-114 against 107-146 ns per submit in the probe, nothing in the benchmark - a
+notify to a worker already waking is cheap on macOS. And it adds a rule: the worker must re-park in a
+loop of its own, or a spurious wake-up leaves it parked with the flag cleared and the next add never
+notifies.
+
+**Recommended: decline**, keeping the count on record.
+
+### Step 37 · item 34 — the per-worker counts share a cache line — MEASURED, decline recommended
+`executor.hpp:568` (`given_`), `:397` (`pick_worker`), `:477` (`worker_drained`) · measured,
+2026-10-10
+
+The counts in `given_` are adjacent atomics, so a drain's store invalidates the line every
+`pick_worker()` reads. Each padded to 128 bytes: no change in the probe or in the benchmark.
+**Recommended: decline.**
+
+### Step 38 · item 35 — a worker takes its queue's lock up to five times per batch — OPEN, not prototyped
+async `async.hpp:887-964` (`execute_actions`), `:1006-1021` (`notify_finished`), `:1051-1083`
+(`loop`), its step 57 · read from the code, counted by the probe, 2026-10-10
+
+Busy, a worker takes the lock about twice per batch; draining, five times - to take the batch, to
+check it drained, in `notify_finished()` to check the same again, at the next iteration's check, and
+in `loop()` to park. And taking the batch moves the whole actuator under the lock - two lists, a map,
+two vectors and the deque - where only the deque holds an executor's tasks. **Proposed:** merge the
+drained check and the re-check, carry the answer into the next iteration, and take only what is
+queued. **Expected:** little - the worker side showed nothing in the benchmark (step 35). Prototype
+before planning further.
+
+### Step 39 · item 36 — a refused add prints its warning under the queue's lock — OPEN, hygiene
+async `async.hpp:823`, `:860`, `:865`, its step 58 · read from the code, 2026-10-10
+
+`add_queued_action()` and `add_queued_task()` call `std::println(stderr, ...)` while holding
+`action_mutex_`. Only a refused add does, so the hot path pays nothing, but I/O under a lock the
+worker needs is the pattern to avoid. **Proposed:** note the refusal under the lock, print after it.
