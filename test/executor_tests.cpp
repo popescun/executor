@@ -715,6 +715,88 @@ TEST(executor_tests, a_pool_runs_a_task_type_that_is_not_a_std_function) {
   EXPECT_EQ(ran.load(), tasks);
 }
 
+namespace {
+
+/**
+ * @brief A task type that is not a std::function, and counts its own copies and moves.
+ *
+ * A std::function relocates what it holds differently on each standard library, so counting
+ * through one would measure the library.
+ */
+struct move_counting_task {
+  using result_type = int;
+
+  move_counting_task() = default;
+  move_counting_task(const move_counting_task&) { copies.fetch_add(1, std::memory_order_relaxed); }
+  move_counting_task(move_counting_task&&) noexcept {
+    moves.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  int operator()(int n) const { return n; }
+
+  static inline std::atomic_int copies = {0};
+  static inline std::atomic_int moves = {0};
+};
+
+//! How many times a sealed task moves a callable it is built from: the standard library's share,
+//! which the cases below allow for so that they count only the pool's own moves.
+int moves_to_seal_a_task() {
+  const auto before = move_counting_task::moves.load();
+  untangle::task_t sealed = [task = move_counting_task{}] { (void)task(0); };
+  (void)sealed;
+  return move_counting_task::moves.load() - before;
+}
+
+}  // namespace
+
+/**
+ * @brief A task the caller gives up is moved into its worker's queue once.
+ *
+ * What every submission through a binding or a temporary costs, so a move more is paid per task.
+ */
+TEST(executor_tests, submitting_moves_a_task_given_up_once) {
+  using counting_executor = untangle::executor<move_counting_task>;
+
+  const int sealing = moves_to_seal_a_task();
+  move_counting_task task;
+  counting_executor pool(1);
+  pool.start();
+
+  const auto copies_before = move_counting_task::copies.load();
+  const auto moves_before = move_counting_task::moves.load();
+
+  EXPECT_TRUE(pool.add_task(std::move(task), 7, ignore_result));
+
+  EXPECT_EQ(move_counting_task::copies.load() - copies_before, 0)
+      << "a task moved into add_task() was copied";
+  EXPECT_EQ(move_counting_task::moves.load() - moves_before, sealing + 1)
+      << "the task was moved " << move_counting_task::moves.load() - moves_before - sealing
+      << " times on its way into the queue";
+}
+
+/**
+ * @brief A task the caller keeps is copied into its worker's queue once, and not moved after.
+ */
+TEST(executor_tests, submitting_copies_a_task_the_caller_keeps_once) {
+  using counting_executor = untangle::executor<move_counting_task>;
+
+  const int sealing = moves_to_seal_a_task();
+  const move_counting_task task;
+  counting_executor pool(1);
+  pool.start();
+
+  const auto copies_before = move_counting_task::copies.load();
+  const auto moves_before = move_counting_task::moves.load();
+
+  EXPECT_TRUE(pool.add_task(task, 7, ignore_result));
+
+  EXPECT_EQ(move_counting_task::copies.load() - copies_before, 1)
+      << "the queue does not hold one copy of the caller's task";
+  EXPECT_EQ(move_counting_task::moves.load() - moves_before, sealing)
+      << "the copy was moved " << move_counting_task::moves.load() - moves_before - sealing
+      << " times on its way into the queue";
+}
+
 // --- step 27, item 24 ----------------------------------------------------------------------------
 // The two cases below do not compile: executor.hpp:42 refuses a task type that takes arguments, so
 // the whole binary fails to build and the 25 cases above it cannot be run until the fix lands. They

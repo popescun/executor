@@ -259,7 +259,7 @@ class executor {
    * before any worker is asked.
    *
    * @tparam Args - The argument types to bind, of which the last is the callback.
-   * @param task - The task to run.
+   * @param task - The task to run, copied into the worker's queue.
    * @param args - What to bind, followed by the callback. Copied by the worker's queue, so a task
    * taking a reference gets the pool's copy.
    *
@@ -268,10 +268,27 @@ class executor {
    * stopped worker, or because the task could never do its job. It will not run or notify.
    */
   template <typename... Args>
-  bool add_task(actionT task, Args&&... args) {
+  bool add_task(const actionT& task, Args&&... args) {
     // The call the pool will make, which is not quite the one written at the call site: what
     // reaches the task is the copies the worker binds, so that is the call that has to compile.
     // Without this the mismatch surfaces deep inside bind_task()'s std::apply.
+    static_assert(invocable_with_bound<Args...>(),
+                  "executor: the task cannot be called with the arguments given to add_task() "
+                  "before its callback");
+
+    if (!running_ || task_is_empty(task, args...)) {
+      return false;
+    }
+
+    return give_to_worker(pick_worker(), task, std::forward<Args>(args)...);
+  }
+
+  /**
+   * @brief Gives work that must report to a worker as the overload above does, moving the task into
+   * the queue rather than copying it. A temporary and a lambda land here.
+   */
+  template <typename... Args>
+  bool add_task(actionT&& task, Args&&... args) {
     static_assert(invocable_with_bound<Args...>(),
                   "executor: the task cannot be called with the arguments given to add_task() "
                   "before its callback");
@@ -415,17 +432,18 @@ class executor {
   /**
    * @brief Hands a task, with its arguments and callback, to worker @p index, and counts it.
    *
-   * The worker binds it, as for any caller of execution::add_task(): the arguments are forwarded
-   * once, from add_task() through here.
+   * The worker binds it, as for any caller of execution::add_task(): the task and its arguments are
+   * forwarded once, from add_task() through here.
    *
+   * @tparam action_t - The task's type as passed: a reference for one the caller keeps.
    * @return true - the worker queued it. false - the worker is stopped and refused it.
    */
-  template <typename... Args>
-  bool give_to_worker(std::size_t index, actionT task, Args&&... args) {
+  template <typename action_t, typename... Args>
+  bool give_to_worker(std::size_t index, action_t&& task, Args&&... args) {
     // No lock: the counts only steer pick_worker(), so a stale one costs balance, not correctness.
     given_[index].fetch_add(1, std::memory_order_relaxed);
 
-    if (workers_[index]->add_task(std::move(task), std::forward<Args>(args)...)) {
+    if (workers_[index]->add_task(std::forward<action_t>(task), std::forward<Args>(args)...)) {
       return true;
     }
 
