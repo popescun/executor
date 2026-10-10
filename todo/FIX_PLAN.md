@@ -40,12 +40,13 @@ with `QThreadPool`; 35 is optional, 36 and 37 measured and not worth taking, 38 
 **2026-10-10 — step 34 landed (`ce6fc83`, async pin `f8f3c43`), with a regression:** a task is
 copied or moved into its worker's queue once, through the actuator's step 30 (`f21a58b`) and async's
 54 (`1f8a02d`). With real work the executor submits 1000 tasks in 18.3-18.8 µs on 1 worker and
-29.3-29.7 on 4, against `QThreadPool`'s 19.8-22.0 and 28.1-33.9: level. 57 of 57 on Debug, ASan
-and TSan; `doc/refman.pdf` at 31 pages. **⚠ REGRESSION, OPEN: step 34 made one case slower.** 1000
-empty tasks on one worker are delivered in 204-277 µs against 155-193 before it - in both run orders
-and through either build. Still ahead of `QThreadPool` (~290-315), but slower than we were. Traced:
-the faster submit gets the main thread to its event loop sooner, and a worker posting while the main
-thread drains posts 3-6x slower. To be fixed by step 40; step 34 is not closed until it is.
+29.3-29.7 on 4, against `QThreadPool`'s 19.8-22.0 and 28.1-33.9: level. 57 of 57 on Debug, ASan and
+TSan; `doc/refman.pdf` at 31 pages. **⚠ REGRESSION: step 34 made one case slower - resolved by step
+40, below.** 1000 empty tasks on one worker are delivered in 204-277 µs against 155-193 before it -
+in both run orders and through either build. Still ahead of `QThreadPool` (~290-315), but slower
+than we were. Traced: the faster submit gets the main thread to its event loop sooner, and a worker
+posting while the main thread drains posts 3-6x slower. To be fixed by step 40; step 34 is not
+closed until it is.
 **2026-10-10 — step 40 opened, to fix step 34's regression: every result wakes the main thread.**
 A worker posts one result per task to the main thread; while the main thread is in its loop the
 worker takes 150-330 µs to process 1000 empty tasks, and 55 µs when it is not. Every pool pays it,
@@ -55,8 +56,14 @@ instead of per result, for the executor and `QThreadPool` alike (QtConcurrent ke
 Empty batches on 4 workers delivered in 77-87 µs against `QThreadPool`'s 198-254; single tasks and
 real work level. **Step 34's regression is not closed by it:** with posting cheap, one worker keeps
 up with the submitter on empty tasks and runs fall into two modes, in the old code as in the new -
-delivered in 54-73 µs, or behind a 102-200 µs submit, a ping-pong on the queue's lock. That is step
-35's, no longer optional; being measured.
+delivered in 54-73 µs, or behind a 102-200 µs submit, a ping-pong on the queue's lock.
+**2026-10-10 — step 34's regression resolved, steps 34 and 40 done.** Five runs each, one worker,
+1000 empty tasks delivered: 48-118 µs now (median 53) against 54-231 before step 34 (median 202) -
+every run under the 155-193 step 34 had to get back to, and ahead of `QThreadPool`'s 102-151. The
+slow mode still shows in 2 runs of 5 (92, 118 µs), against 4 of 5 before step 34 (166-231). No other
+case worse. Step 35 is not needed for it, and back to optional: its prototype removes the slow mode
+but makes 4 workers' empty batch slower (84-91 µs against 75-81) - a regression of its own,
+unresolved.
 **Tests:** 32 of 32 green on Debug, ASan and TSan, 2026-09-22; clang-format clean;
 doxygen clean, `doc/refman.pdf` at 25 pages (was 19 at the import), rebuilt with
 `tools/make_doc.sh`. **Steps 2 and 4 are closed** (`b68cc97`, `032da65`). The destructor waits on an
@@ -222,13 +229,13 @@ returns something give back — so read those two before deciding what it means 
 | 32 ✅ | 29 | `add_task()` counts a task its worker refuses, and an empty one now warns | `add_task` | CONFIRMED (tests) — fixed `99ebed7` |
 | **Group 9 — performance, benched against QThreadPool** |
 | 33 | 30 | a task waits behind its own worker while another worker idles | `:397-413` (`pick_worker`), `:424-434` (`give_to_worker`) | CONFIRMED (`bench/qt_pool_vs_this`, mixed batch) — OPEN, design decision |
-| 34 ⚠ | 31 | a task's action is moved five times between `add_task()` and the queue | `:424` (`give_to_worker`); async 54, actuator 30 | CONFIRMED (tests, benchmark) — landed `ce6fc83`; **REGRESSION OPEN**: one worker, empty tasks, delivered later - step 40 |
-| 35 | 32 | the queue frees its storage with every batch, and the next submit allocates it under the lock | async 55, actuator 31 | CONFIRMED (Qt-free probe); in the benchmark once results are coalesced (step 40) — OPEN, **needed for step 34's regression** |
+| 34 ✅ | 31 | a task's action is moved five times between `add_task()` and the queue | `:424` (`give_to_worker`); async 54, actuator 30 | CONFIRMED (tests, benchmark) — fixed `ce6fc83`; **caused a regression** (one worker, empty tasks), resolved by step 40 (`456ac6c`) |
+| 35 | 32 | the queue frees its storage with every batch, and the next submit allocates it under the lock | async 55, actuator 31 | CONFIRMED (Qt-free probe, benchmark once results are coalesced) — OPEN, optional; **its prototype slows 4 workers' empty batch** |
 | 36 | 33 | a parked worker is notified once per submit until it wakes | async 56 | measured (probe, benchmark) — no time saved, decline recommended |
 | 37 | 34 | the per-worker counts share a cache line | `:568` (`given_`) | measured (probe, benchmark) — no effect, decline recommended |
 | 38 | 35 | a worker takes its queue's lock up to five times per batch | async 57 | read-only, counted by the probe — OPEN, not prototyped |
 | 39 | 36 | a refused add prints its warning under the queue's lock | async 58 | read-only — OPEN, hygiene |
-| 40 | 37 | every result wakes the main thread: one post per task - **fixes step 34's regression** | the callback, `bench/qt_pool_vs_this.cpp:155`; fluxcpp's presenters | CONFIRMED (benchmark, main thread held) — (a) landed `456ac6c`; regression not yet closed, step 35 |
+| 40 ✅ | 37 | every result wakes the main thread: one post per task - **fixed step 34's regression** | the callback, `bench/qt_pool_vs_this.cpp:155`; fluxcpp's presenters | CONFIRMED (benchmark, main thread held) — (a) fixed `456ac6c`; (b) open for the presenters |
 
 ---
 
@@ -1719,7 +1726,7 @@ it, the other worker idle - the short tasks run on the idle worker.
 within noise of `QThreadPool`, and the uniform and empty batches are no worse than in
 `bench/README.md`.
 
-### Step 34 · item 31 — a task's action is moved five times between `add_task()` and the queue — LANDED, REGRESSION OPEN
+### Step 34 ✅ · item 31 — a task's action is moved five times between `add_task()` and the queue — DONE, its regression resolved by step 40
 `executor.hpp:271` (`add_task`), `:424` (`give_to_worker`); async `async.hpp:589` (`add_task`, its
 step 54); actuator `actuator.hpp:1191` (`bind_task`, its step 30) · CONFIRMED by
 `bench/qt_pool_vs_this`, 2026-10-10; sites at `640508a`, async `b98dfd9`, actuator `fccaad1`
@@ -1819,7 +1826,21 @@ addressed at once). Step 40 fixes it; this step closes when the benchmark delive
 on one worker no later than before it, 155-193 µs, with every other case still where step 34 left
 it.
 
-### Step 35 · item 32 — the queue frees its storage with every batch, and the next submit allocates it under the lock — OPEN, needed for step 34's regression
+**Resolved (2026-10-10), by step 40's coalescing (`456ac6c`).** Five runs each, alternating, the
+benchmark as committed against the code before step 34 built with the same benchmark source; one
+worker, 1000 empty tasks:
+
+| | delivered, per run | median |
+|---|---|---|
+| before step 34 | 54, 166, 202, 204, 231 µs | 202 |
+| now (`ce6fc83` + `456ac6c`) | 48, 51, 53, 92, 118 µs | 53 |
+| `QThreadPool`, same runs | 102-151 µs | 111 |
+
+Every run under 155-193; single tasks, real work and the mixed batches level within noise - the
+one-worker 10 µs batch, under 1% on three runs before, overlaps fully on five (10.99-11.56 ms
+against 10.84-11.42). Step 35 was not needed.
+
+### Step 35 · item 32 — the queue frees its storage with every batch, and the next submit allocates it under the lock — OPEN, optional; the prototype slows 4 workers
 async `async.hpp:900` (`execute_actions`, its step 55), `:852` (`add_queued_task`); actuator
 `actuator.hpp:617` (`call_tasks`, its step 31) · CONFIRMED by a Qt-free probe, 2026-10-10; not
 visible in the benchmark
@@ -1843,11 +1864,22 @@ benchmark was removed. Take it only if a caller without a Qt hop, with trivial c
 
 **No longer Qt-free only (2026-10-10).** Once the benchmark coalesces its results (step 40,
 `456ac6c`), a worker no longer pays per post, and on empty tasks one worker keeps up with the
-submitter: the ping-pong this step fixes happens in the benchmark. Three runs each, in the old code and the new
-alike, 1000 empty tasks on one worker fall into two modes - submitted in 43-59 µs and delivered in
-54-73, or delivered right behind a submit of 102-200 µs. The slow mode is what keeps step 34's
-regression open. Being measured: the current code with this step's change prototyped on it, five
-runs each against the current code and the code before step 34.
+submitter: the ping-pong this step fixes happens in the benchmark. Three runs each, in the old code
+and the new alike, 1000 empty tasks on one worker fall into two modes - submitted in 43-59 µs and
+delivered in 54-73, or delivered right behind a submit of 102-200 µs.
+
+**Measured on the current code** (prototype on `ce6fc83` + `456ac6c`, scratchpad `probe/kb`), five
+runs each, alternating with the current code and the code before step 34; empty tasks, delivered:
+
+| | before step 34 | now | now + this step |
+|---|---|---|---|
+| 1 worker, 1000 | 54-231 µs (median 202) | 48-118 (53) | 52-67 (53) |
+| 4 workers, 1000 | 81-88 (81) | 75-81 (76) | **84-91 (84)** |
+
+It removes the slow mode on one worker - all five runs fast - but **makes 4 workers' empty batch
+slower**, in ranges that do not overlap: a regression of its own. Not needed for step 34's, which
+step 40 resolved. **Not to be taken as prototyped**; if it is pursued, the 4-worker cost is found
+and removed first.
 
 ### Step 36 · item 33 — a parked worker is notified once per submit until it wakes — MEASURED, decline recommended
 async `async.hpp:828`, `:868` (the adds), `:1063-1069` (`loop`), its step 56 · measured, 2026-10-10
@@ -1889,7 +1921,7 @@ async `async.hpp:823`, `:860`, `:865`, its step 58 · read from the code, 2026-1
 `action_mutex_`. Only a refused add does, so the hot path pays nothing, but I/O under a lock the
 worker needs is the pattern to avoid. **Proposed:** note the refusal under the lock, print after it.
 
-### Step 40 · item 37 — every result wakes the main thread: one post per task — (a) LANDED, step 34's regression not yet closed
+### Step 40 ✅ · item 37 — every result wakes the main thread: one post per task — DONE, (a); step 34's regression resolved
 the task's callback, which posts its result: `bench/qt_pool_vs_this.cpp:155` (`shared::post`), as
 fluxcpp's presenters do · CONFIRMED by `bench/qt_pool_vs_this` with the main thread held, 2026-10-10
 
@@ -1951,8 +1983,11 @@ source, delivered:
 Per-result posting had the executor at 192-250 µs and `QThreadPool` at 231-401 for one worker's
 empty batch, and 306-367 and 390-439 on four. Every run passed the checks.
 
-**Still open:** one worker, 1000 empty tasks. Both versions fall into two modes, per run - submitted
-in 43-59 µs and delivered in 54-73, or delivered right behind a submit of 102-200 µs - and the worst
-run of each, 203 µs now against 187, does not show the regression gone. The slow mode is step 35's
-ping-pong. The one-worker 10 µs batch, 10.89-10.91 ms against 10.82-10.88, is under 1% on three runs
-and is re-measured with step 35's prototype, five runs each.
+On three runs one worker's empty batch was not settled: both versions fall into two modes per run -
+submitted in 43-59 µs and delivered in 54-73, or delivered right behind a submit of 102-200 µs - and
+the worst run of each, 203 µs against 187, did not show the regression gone.
+
+**Closed on five runs each** (step 34's table): 48-118 µs now, median 53, against 54-231 before step
+34, median 202. The slow mode - a ping-pong on the queue's lock, step 35's - still shows in 2 runs
+of 5 now against 4 of 5 before, and costs less when it does (92, 118 µs against 166-231). The
+one-worker 10 µs batch is level on five runs. (b) stays open for the presenters.
