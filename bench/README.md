@@ -9,7 +9,8 @@ cmake --build bench/build
 bench/build/qt_pool_vs_this [--reps N]
 ```
 
-It prints a markdown table and exits non-zero if any check failed.
+It prints a markdown table, then how many tasks of the mixed batch are long, and exits non-zero if
+any check failed.
 
 ## What is compared
 
@@ -27,6 +28,11 @@ It prints a markdown table and exits non-zero if any check failed.
   could place one pool's threads on efficiency cores and not the other's.
 - **Cases:** 1 or 4 workers; batches of 1 task (latency) or 1000 (throughput); 21 runs per case, or
   210 for a single task. The pools take turns, after an untimed run each.
+- **Mixed lengths:** one more batch of 1000 tasks, on 1 or 4 workers, where one task in ten takes
+  1 ms and the rest 10 µs. Which tasks are long is drawn from a fixed seed (105 of the 1000), so
+  every pool and every run gets the same batch. It is not a fixed stride: the executor spreads a
+  batch nearly round-robin, and a stride matching the worker count would put every long task on one
+  worker.
 - **What is recorded:** each run records three times from the first submit, as medians:
   - **submitted:** when the main thread finished submitting, which is how long the UI thread was
     busy;
@@ -89,6 +95,32 @@ the code.
 - **Delivery adds little:** with 1000 tasks the last result reaches the main thread 4–42 µs after the
   last task finished, except with QtConcurrent, whose continuations add 0.41 ms on empty tasks.
 
+### Mixed lengths
+
+Two runs on the same code, 2026-10-10, delivered, in ms:
+
+| workers | pool         | run 1  | run 2  |
+|--------:|--------------|-------:|-------:|
+|       1 | executor     | 117.69 | 115.26 |
+|       1 | QThreadPool  | 117.65 | 115.25 |
+|       1 | QtConcurrent | 117.00 | 115.44 |
+|       4 | executor     |  35.41 |  35.50 |
+|       4 | QThreadPool  |  32.94 |  33.05 |
+|       4 | QtConcurrent |  33.54 |  33.66 |
+
+- **With uneven tasks the executor is 7.5% behind on 4 workers:** 2.5 ms in both runs. With one
+  worker the pools are equal, as they must be: one queue cannot be unbalanced.
+- **`QThreadPool` is at the machine's limit.** Four workers ran uniform 1 ms tasks 3.57x faster
+  than one, on every pool, and 117.7 / 3.57 is 33.0.
+- **The cause is where a task goes.** The batch is submitted in about 50 µs, before any worker
+  drains, so the executor deals it out round-robin and each worker's share of long tasks is the
+  draw's. About 26 of the 105 is fair; the worker that got more finishes last while the others
+  idle. `QThreadPool`'s workers take from one shared queue, so an idle one takes the next task.
+- **The gap repeats because the batch does.** Another seed, another share of long tasks or more
+  workers would move it; fewer, longer tasks make it larger. Closing it means work stealing.
+- **Submitting is as for uniform tasks:** 22–56 µs per 1000 on every pool but QtConcurrent, the
+  executor ahead in one run and behind in the other.
+
 ### How the executor got here
 
 The first runs put the executor behind `QThreadPool` on empty batches, by up to 5x in submitting.
@@ -127,4 +159,4 @@ enters the loop only while results are missing.
 ## Not covered
 
 One hop per batch instead of per result, results delivered to a real UI (painting), several pools at
-once (one per store), and memory.
+once (one per store), memory, and mixed lengths beyond one seed and one share of long tasks.

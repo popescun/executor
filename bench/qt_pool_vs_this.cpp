@@ -41,6 +41,7 @@
 #include <cstring>
 #include <executor.hpp>
 #include <functional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -141,12 +142,13 @@ struct shared {
   QObject context;
   worker_side workers;
   main_side main;
+  std::vector<std::uint32_t> iterations;  //!< Per task.
   task_t task;
 
-  explicit shared(std::uint32_t iterations)
-      : task([this, iterations](int i) {
+  explicit shared(std::vector<std::uint32_t> per_task)
+      : iterations(std::move(per_task)), task([this](int i) {
           raise_thread();
-          const int result = compute(i, iterations);
+          const int result = compute(i, iterations[static_cast<std::size_t>(i)]);
           workers.task_finished();
           return result;
         }) {}
@@ -272,21 +274,23 @@ struct series {
   }
 };
 
-void print_row(const char* pool_name, std::size_t worker_count, std::size_t tasks, double task_us,
+void print_row(const char* pool_name, std::size_t worker_count, std::size_t tasks, const char* work,
                const series& s) {
   const double delivered = median(s.delivered);
-  std::printf("| %7zu | %5zu | %7.1f | %-12s | %10.1f | %10.1f | %10.1f | %8.2f |\n", worker_count,
-              tasks, task_us, pool_name, median(s.submitted), median(s.processed), delivered,
+  std::printf("| %7zu | %5zu | %7s | %-12s | %10.1f | %10.1f | %10.1f | %8.2f |\n", worker_count,
+              tasks, work, pool_name, median(s.submitted), median(s.processed), delivered,
               delivered / static_cast<double>(tasks));
   std::fflush(stdout);
 }
 
 /**
  * @brief One case on all three pools: they take turns within each repetition, after one untimed
- * run each, which also starts their threads.
+ * run each, which also starts their threads. @p iterations holds one task's work per task, and
+ * @p work names it in the table.
  */
-bool run_case(std::size_t worker_count, std::size_t tasks, std::uint32_t iterations, double task_us,
+bool run_case(std::size_t worker_count, const char* work, const std::vector<std::uint32_t>& iterations,
               std::size_t reps) {
+  const std::size_t tasks = iterations.size();
   shared common(iterations);
   executor_pool executor(common, worker_count);
   qthreadpool_pool qthreadpool(common, worker_count);
@@ -294,7 +298,7 @@ bool run_case(std::size_t worker_count, std::size_t tasks, std::uint32_t iterati
 
   std::int64_t expected_sum = 0;
   for (std::size_t i = 0; i < tasks; ++i) {
-    expected_sum += compute(static_cast<int>(i), iterations);
+    expected_sum += compute(static_cast<int>(i), iterations[i]);
   }
 
   sample one;
@@ -315,9 +319,9 @@ bool run_case(std::size_t worker_count, std::size_t tasks, std::uint32_t iterati
     return false;
   }
 
-  print_row(executor_pool::name, worker_count, tasks, task_us, executor_times);
-  print_row(qthreadpool_pool::name, worker_count, tasks, task_us, qthreadpool_times);
-  print_row(qtconcurrent_pool::name, worker_count, tasks, task_us, qtconcurrent_times);
+  print_row(executor_pool::name, worker_count, tasks, work, executor_times);
+  print_row(qthreadpool_pool::name, worker_count, tasks, work, qthreadpool_times);
+  print_row(qtconcurrent_pool::name, worker_count, tasks, work, qtconcurrent_times);
   return true;
 }
 
@@ -337,6 +341,23 @@ std::uint32_t iterations_for(double micros_wanted) {
     per_iteration = attempt == 0 ? measured : std::min(per_iteration, measured);
   }
   return static_cast<std::uint32_t>(micros_wanted / per_iteration);
+}
+
+/**
+ * @brief @p tasks task lengths: one in ten @p long_iterations, the rest @p short_iterations.
+ *
+ * Drawn from a fixed seed, so every pool and every run gets the same batch. Not a fixed stride: the
+ * executor spreads a batch nearly round-robin, and a stride matching the worker count would put
+ * every long task on one worker.
+ */
+std::vector<std::uint32_t> mixed_batch(std::size_t tasks, std::uint32_t short_iterations,
+                                       std::uint32_t long_iterations) {
+  std::mt19937 draw(2026);
+  std::vector<std::uint32_t> lengths(tasks);
+  for (auto& length : lengths) {
+    length = draw() % 10 == 0 ? long_iterations : short_iterations;
+  }
+  return lengths;
 }
 
 }  // namespace bench
@@ -372,13 +393,28 @@ int main(int argc, char* argv[]) {
   bool ok = true;
   for (const double task_us : {0.0, 10.0}) {
     const std::uint32_t iterations = bench::iterations_for(task_us);
+    char work[16];
+    std::snprintf(work, sizeof work, "%.1f", task_us);
     for (const std::size_t worker_count : {1, 4}) {
       for (const std::size_t tasks : {1, 1000}) {
-        ok = bench::run_case(worker_count, tasks, iterations, task_us,
+        ok = bench::run_case(worker_count, work, std::vector<std::uint32_t>(tasks, iterations),
                              tasks == 1 ? reps * 10 : reps) &&
              ok;
       }
     }
   }
+
+  // Mixed lengths: a pool that fixes a task's worker at submission can leave short tasks waiting
+  // behind a long one while another worker idles.
+  const std::uint32_t short_iterations = bench::iterations_for(10.0);
+  const std::uint32_t long_iterations = bench::iterations_for(1000.0);
+  const std::vector<std::uint32_t> mixed =
+      bench::mixed_batch(1000, short_iterations, long_iterations);
+  for (const std::size_t worker_count : {1, 4}) {
+    ok = bench::run_case(worker_count, "mixed", mixed, reps) && ok;
+  }
+  std::printf("\nmixed: %zu of %zu tasks take 1000 us, the rest 10 us\n",
+              static_cast<std::size_t>(std::count(mixed.begin(), mixed.end(), long_iterations)),
+              mixed.size());
   return ok ? 0 : 1;
 }
