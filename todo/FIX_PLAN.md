@@ -2192,6 +2192,9 @@ doxygen warning from the header. `bench/qt_pool_vs_this`, three runs each agains
 
 No case worse: four workers' empty batch and mixed batch overlap the committed ranges, and in the
 rotation above - the same change against the same baseline - were level. One worker's empty batch
-was in its fast mode in every run, as it was with no spin anywhere: in its ping-pong the spin had
-been lengthening each hand-off. Step 28's change is undone because what it was for went with step
-31's `pending_`, not because it was wrong.
+was in its fast mode in every run. **Why is not known:** the pool's lock is not taken in the
+benchmark - `add_task()` has not since step 31, and nothing calls `wait()` - so this change cannot
+have acted on that hand-off; an earlier note here saying the spin had been lengthening it was wrong.
+Code layout, or chance, remain. Three more runs at `9603fa5`, for the bench README, were fast too:
+six in a row. Step 28's change is undone because what it was for went with step 31's `pending_`, not
+because it was wrong.
