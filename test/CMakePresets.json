@@ -5,6 +5,7 @@
       "name": "debug",
       "displayName": "Debug",
       "description": "The suite as it is normally run. Every case is expected green here; a sanitizer-sensitive case passes without proving anything.",
+      "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -15,6 +16,7 @@
       "name": "release",
       "displayName": "Release",
       "description": "What the CI build job compiles on macOS, Windows and Linux.",
+      "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
@@ -25,6 +27,7 @@
       "name": "asan",
       "displayName": "Debug + AddressSanitizer",
       "description": "Names a dangling read rather than leaving it to be inferred. Its silence is not an acquittal for a data race: ASan faults only when a read actually lands after the free.",
+      "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-address",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -35,18 +38,13 @@
       "name": "tsan",
       "displayName": "Debug + ThreadSanitizer",
       "description": "Where the pool's threading defects are visible. Fix plan step 2's race aborts here and cannot be seen on any other preset.",
+      "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-thread",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "EXECUTOR_SANITIZE": "thread"
       }
     }
-  ],
-  "buildPresets": [
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "asan", "configurePreset": "asan" },
-    { "name": "tsan", "configurePreset": "tsan" }
   ],
   "testPresets": [
     {
