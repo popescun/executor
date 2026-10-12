@@ -62,7 +62,7 @@ jobs:
       # test/CMakeLists.txt requires CMake 4.1, which is newer than some runner
       # images ship. Installing it via pip pins the same version on all three.
       - name: Install CMake
-        run: pip install "cmake>=4.1"
+        run: pip install "cmake>=4.1" ninja
 
       - name: Show versions
         shell: bash
@@ -82,19 +82,28 @@ jobs:
           echo "CC=gcc-14" >> "$GITHUB_ENV"
           echo "CXX=g++-14" >> "$GITHUB_ENV"
 
+      # Ninja does not find MSVC on its own the way the Visual Studio generator does. This runs
+      # vcvarsall, so cl.exe and its INCLUDE and LIB reach the steps below. Windows only.
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # The presets live in test/CMakePresets.json, so cmake --preset is run from there. The release
+      # preset builds into test/build-release. No build presets: CLion lists each as a duplicate
+      # profile, so Build names the preset's binaryDir.
       - name: Configure
-        run: cmake -S test -B test/build -DCMAKE_BUILD_TYPE=Release
+        working-directory: test
+        run: cmake --preset release
 
-      # --config matters on multi-config generators (Visual Studio); it is
-      # ignored elsewhere, so one command covers all three platforms.
       - name: Build
-        run: cmake --build test/build --config Release
+        working-directory: test
+        run: cmake --build build-release
 
-      # --no-tests=error: every TEST() is registered by gtest_discover_tests, so
-      # an empty suite here means discovery failed rather than that there is
-      # nothing to run.
+      # The release test preset carries --output-on-failure and noTestsAction=error: every TEST()
+      # is registered by gtest_discover_tests, so an empty suite means discovery failed.
       - name: Test
-        run: ctest --test-dir test/build --build-config Release --output-on-failure --no-tests=error
+        working-directory: test
+        run: ctest --preset release
 
   # The pool is what makes the header's threading assumptions observable, so the
   # suite is run again under the two sanitizers that name a defect rather than
