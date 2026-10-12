@@ -105,7 +105,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [address, thread]
+        include:
+          - preset: asan
+            dir: build-address
+          - preset: tsan
+            dir: build-thread
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -117,7 +121,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install CMake
-        run: pip install "cmake>=4.1"
+        run: pip install "cmake>=4.1" ninja
 
       - name: Use GCC 14
         run: |
@@ -127,25 +131,24 @@ jobs:
           echo "CXX=g++-14" >> "$GITHUB_ENV"
 
       # A separate build directory per sanitizer: address and thread instrument
-      # the same accesses in incompatible ways and cannot be combined.
+      # the same accesses in incompatible ways and cannot be combined. The
+      # presets live in test/CMakePresets.json, so cmake --preset is run from
+      # there. No build presets: CLion lists each as a duplicate profile, so
+      # Build names the preset's binaryDir.
       - name: Configure
-        run: >
-          cmake -S test -B test/build-${{ matrix.sanitizer }}
-          -DCMAKE_BUILD_TYPE=Debug
-          -DEXECUTOR_SANITIZE=${{ matrix.sanitizer }}
+        working-directory: test
+        run: cmake --preset ${{ matrix.preset }}
 
       - name: Build
-        run: cmake --build test/build-${{ matrix.sanitizer }}
+        working-directory: test
+        run: cmake --build ${{ matrix.dir }}
 
-      # halt_on_error makes a report a failed test rather than a line in a log
-      # that a passing exit code buries.
+      # The test preset sets halt_on_error, which makes a report a failed test
+      # rather than a line in a log that a passing exit code buries. It also
+      # carries --output-on-failure and noTestsAction=error.
       - name: Test
-        env:
-          ASAN_OPTIONS: halt_on_error=1
-          TSAN_OPTIONS: halt_on_error=1
-        run: >
-          ctest --test-dir test/build-${{ matrix.sanitizer }}
-          --output-on-failure --no-tests=error
+        working-directory: test
+        run: ctest --preset ${{ matrix.preset }}
 
   # tools/make_doc.sh fails on any doxygen warning that is not an obsolete-tag
   # notice, so this job is what keeps an undocumented member or a broken \ref
