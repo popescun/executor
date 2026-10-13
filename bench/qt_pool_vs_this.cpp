@@ -320,8 +320,8 @@ void print_row(const char* pool_name, std::size_t worker_count, std::size_t task
  * run each, which also starts their threads. @p iterations holds one task's work per task, and
  * @p work names it in the table.
  */
-bool run_case(std::size_t worker_count, const char* work, const std::vector<std::uint32_t>& iterations,
-              std::size_t reps) {
+bool run_case(std::size_t worker_count, const char* work,
+              const std::vector<std::uint32_t>& iterations, std::size_t reps) {
   const std::size_t tasks = iterations.size();
   shared common(iterations);
   executor_pool executor(common, worker_count);
