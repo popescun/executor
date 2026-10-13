@@ -63,7 +63,7 @@ class executor {
     }
 
     workers_.reserve(worker_count);
-    given_ = std::make_unique<std::atomic<std::size_t>[]>(worker_count);
+    given_ = std::make_unique<given_count[]>(worker_count);
 
     for (std::size_t index = 0; index < worker_count; ++index) {
       auto next = worker_execution::create_instance(name + "_worker_" + std::to_string(index));
@@ -355,6 +355,10 @@ class executor {
 
   using worker_execution = untangle::async::execution<actionT>;
 
+  //! One worker's count. alignas pads it to a cache line of its own, so threads writing different
+  //! workers' counts don't keep invalidating one shared line (false sharing).
+  struct alignas(128) given_count : std::atomic<std::size_t> {};
+
   /**
    * @brief The first idle worker, the warmest; else the one given the fewest since it last drained.
    *
@@ -532,7 +536,7 @@ class executor {
   std::vector<std::shared_ptr<worker_execution>> workers_;
 
   //! Per worker: tasks given since it last drained. Steers pick_worker() only, so read unlocked.
-  std::unique_ptr<std::atomic<std::size_t>[]> given_;
+  std::unique_ptr<given_count[]> given_;
 
   //! How many wait() calls are waiting. A drained worker takes mutex_ to notify only then.
   std::atomic<std::size_t> waiting_ = {0};
