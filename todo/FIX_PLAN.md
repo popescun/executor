@@ -36,7 +36,7 @@ rest 10 µs), and on 4 workers the executor delivers in 35.4-35.5 ms against `QT
 32.9-33.1, 7.5% behind; work stealing proposed, a design decision. Steps 34 to 39 come from an
 analysis of the executor, async and the actuator, each fix prototyped and measured alone: **step 34
 (fewer moves of the action) is the one the benchmark shows**, submitting 15-20% faster and level
-with `QThreadPool`; 35 is optional, 36 measured and not worth taking, 37 taken though it measured no effect, 38 and 39 open.
+with `QThreadPool`; 35 is optional, 36 and 37 measured and not worth taking, 38 and 39 open.
 **2026-10-10 — step 34 landed (`ce6fc83`, async pin `f8f3c43`), with a regression:** a task is
 copied or moved into its worker's queue once, through the actuator's step 30 (`f21a58b`) and async's
 54 (`1f8a02d`). With real work the executor submits 1000 tasks in 18.3-18.8 µs on 1 worker and
@@ -252,7 +252,7 @@ returns something give back — so read those two before deciding what it means 
 | 34 ✅ | 31 | a task's action is moved five times between `add_task()` and the queue | `:424` (`give_to_worker`); async 54, actuator 30 | CONFIRMED (tests, benchmark) — fixed `ce6fc83`; **caused a regression** (one worker, empty tasks), resolved by step 40 (`456ac6c`) |
 | 35 | 32 | the queue frees its storage with every batch, and the next submit allocates it under the lock | async 55, actuator 31 | CONFIRMED (Qt-free probe, benchmark once results are coalesced) — OPEN, optional; **its prototype slows 4 workers' empty batch** |
 | 36 | 33 | a parked worker is notified once per submit until it wakes | async 56 | measured (probe, benchmark) — no time saved, decline recommended |
-| 37 ✅ | 34 | the per-worker counts share a cache line | `:539` (`given_`) | measured (probe, benchmark) — no effect; **taken** 2026-10-13: each count padded to its own line |
+| 37 ✅ | 34 | the per-worker counts share a cache line | `:535` (`given_`) | measured (probe, benchmark) — **DECLINED**: padding slows 4 workers' empty batch 17%; taken `c565343`, reverted |
 | 38 ✅ | 35 | a worker takes its queue's lock up to five times per batch | async 57 | measured (benchmark) — **not taken**: one worker's empty batch loses its fast mode |
 | 39 | 36 | a refused add prints its warning under the queue's lock | async 58 | read-only — OPEN, hygiene |
 | 40 ✅ | 37 | every result wakes the main thread: one post per task - **fixed step 34's regression** | the callback, `bench/qt_pool_vs_this.cpp:155`; fluxcpp's presenters | CONFIRMED (benchmark, main thread held) — (a) fixed `456ac6c`; (b) open for the presenters |
@@ -1979,16 +1979,29 @@ notifies.
 
 **Recommended: decline**, keeping the count on record.
 
-### Step 37 ✅ · item 34 — the per-worker counts share a cache line — TAKEN
-`executor.hpp:539` (`given_`), `:367` (`pick_worker`), `:447` (`worker_drained`) · measured,
-2026-10-10; taken 2026-10-13
+### Step 37 ✅ · item 34 — the per-worker counts share a cache line — DECLINED
+`executor.hpp:535` (`given_`), `:363` (`pick_worker`), `:443` (`worker_drained`) · measured,
+2026-10-10 and 2026-10-13
 
 The counts in `given_` are adjacent atomics, so a drain's store invalidates the line every
 `pick_worker()` reads. Each padded to 128 bytes: no change in the probe or in the benchmark.
 
-**Taken (2026-10-13)** despite no measured effect, so the counts stay apart as workers are added:
-`given_count`, `alignas(128)` and inheriting `std::atomic<std::size_t>`, so no call site changed.
-The executor's 54 of 54 on Debug and TSan.
+**Taken and reverted (2026-10-13).** `c565343` padded each count to its own line - `given_count`,
+`alignas(128)` and inheriting `std::atomic<std::size_t>` - and `bench/qt_pool_vs_this`, three runs
+each against `1afbe92`, alternating, measured it:
+
+| | unpadded (`1afbe92`) | padded (`c565343`) |
+|---|---|---|
+| empty, 4 workers, delivered | **74.0-76.1 µs** | 87.4-90.2 |
+| 1000 x 10 µs, 4 workers, delivered | 3159-3232 µs | 3107-3145 |
+| mixed, 4 workers, delivered | 33.2-35.6 ms | 35.1-35.6 |
+| empty, 1 worker; single tasks | noisy / level | noisy / level |
+
+Four workers' empty batch 17% slower, in ranges that don't overlap: a regression by the rule that
+no case may get worse. The access is not the one padding helps. `pick_worker()` reads every count
+on every task, so packed they are one line to the submitter and padded four, each last written by
+another core; the writes are mostly the submitter's own `fetch_add`, a worker's reset only once per
+drained batch. **Declined**, as step 36.
 
 ### Step 38 ✅ · item 35 — a worker takes its queue's lock up to five times per batch — MEASURED, not taken
 async `async.hpp:887-964` (`execute_actions`), `:1006-1021` (`notify_finished`), `:1051-1083`
@@ -2020,7 +2033,7 @@ the committed code:
 It wins on four workers' empty batch and loses one worker's: holding the lock between batches lets
 the worker take work as fast as the submitter adds it, so the two meet on every task and the fast
 mode (53 µs) never comes. A regression by the rule that no case may get worse; the mixed batch, 1-2
-ms either way in ranges that overlap, gives nothing back. **Not taken**, as step 36.
+ms either way in ranges that overlap, gives nothing back. **Not taken**, as steps 36 and 37.
 
 (A first run of these tests seemed to hang one async case for 608 and 900 s: the Mac was asleep, lid
 closed, `pmset -g log`. Rerun awake under `caffeinate -i`, every case passed.)
