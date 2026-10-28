@@ -14,6 +14,12 @@ task's action.
 of 5 green; steps 3 and 4 were merged into step 2. All three repos in the chain are closed.** This is a feature plan, not a fix plan. Claims marked **PROBED** were compiled and run on
 2026-09-24/25; the rest are read-only and say so.
 
+**2026-10-28 — steps 7 and 8 opened: one pool shared by many owners.** A second feature in this
+file, planned with the user for fluxcpp's stores and aggregators (fluxcpp's `todo/FEATURE_PLAN.md`).
+Step 7 gives tasks a type, light or heavy, and the pool workers of each type; step 8 gives an owner
+an ordering key, so its tasks never overlap and finish in the order they were added, on whichever
+worker their type picks. Nothing written yet; sites at `0d0ecb9`.
+
 **Baseline.** `executor` at `c2bf9f0`, `async` at `985a991`, `actuator` at `a8b8b47`. Sites are line
 numbers at those commits and move with every step that lands.
 
@@ -95,6 +101,8 @@ notifying door builds an `untangle::task<R>` through `untangle::bind_task()` ins
 | 4 | — merged into step 2, see below | — | — |
 | 5 ✅ | `on_task_error`, the callback's thread, the destructor, and `README.md` | `:87-96`, `:288-308`, `README.md` | transcription — **DONE** (`e784324`) |
 | 6 ✅ | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **DONE** (`e784324`) |
+| 7 | a task cannot say it is heavy: every worker takes any task, so a long one can hold all of them | `:56` (constructor), `:220-250` (`add_task`), `:363` (`pick_worker`) | planned 2026-10-28 — OPEN |
+| 8 | tasks from one owner on a shared pool overlap and finish out of order | `:220-250`, `:156` (`wait`), `:257` (`pending`) | planned 2026-10-28 — OPEN |
 
 ### Step 1 ✅ · `add_task()` renamed `add_action()` — DONE
 
@@ -233,6 +241,95 @@ fixing a typo in the subject, and the citations inside that very commit were sta
 landed. The actuator's plan did it three times before that. **A plan's own update belongs in a
 later commit**, not because of bookkeeping etiquette but because it is the only shape in which the
 number can be true: a commit cannot contain its own hash, and an amend rewrites it after the fact.
+
+## One pool, many owners — steps 7 and 8, opened 2026-10-28
+
+**Why (2026-10-28, user):** fluxcpp's stores and aggregators each own a pool, a worker each by
+default, so an app with many of them runs as many threads. They should be able to share one fixed
+pool instead, say four workers, passed to each by reference. Owning a pool stays possible too:
+sharing is an extra mode, not a replacement (fluxcpp's `todo/FEATURE_PLAN.md`). Two things are
+missing for that: a heavy task must not take every worker (step 7), and one owner's tasks must not
+overlap or reorder once they can land on different workers (step 8).
+
+**Settled with the user:**
+- The type is the task's, not its owner's: one store runs both kinds.
+- It lives in this header, as an enum. No struct that groups pools.
+- The pool keeps one owner's tasks in order. A wrapper in fluxcpp was weighed and set aside, because
+  it cannot work with a pool-wide drain (step 8).
+- A pool-wide `wait()` is acceptable to the user, and so is its refusing new work meanwhile. So is a
+  pool whose lifetime, start and stop the application manages.
+
+### Step 7 · a task cannot say it is heavy — OPEN
+`executor.hpp:56` (constructor), `:220-250` (`add_task`), `:363-385` (`pick_worker`) · planned
+2026-10-28, sites at `0d0ecb9`
+
+**The problem.** Every worker takes any task. On a pool shared by many owners, a few long tasks can
+hold every worker, and every owner's short ones wait behind them.
+
+> Proposed - agreed with the user, nothing written:
+> - **`enum class task_type : std::uint8_t { light, heavy };`** in this header. The two kinds are
+>   enough for now.
+> - **A second constructor, `executor(std::size_t light_count, std::size_t heavy_count, std::string
+>   name = {})`.** The first, `executor(worker_count, name)`, stays and builds light workers only.
+>   Zero light workers is refused, as zero workers is today. Zero heavy workers is allowed.
+> - **`add_task(task_type type, task, args..., callback)`** gives the task to a worker of that type,
+>   picked as `pick_worker()` picks today, but within that type: the first idle one, else the one
+>   given the fewest. The untyped `add_task(task, args..., callback)` stays as it is, with any
+>   worker and no extra cost.
+> - **A heavy task on a pool with no heavy workers runs on a light one,** and the pool warns once on
+>   stderr (not once per task) that it should be built with `(light_count, heavy_count)` to dedicate
+>   heavy workers.
+> - **Workers are named after their type,** `<name>_light_<i>` and `<name>_heavy_<i>`, in every
+>   warning.
+> - **Tests:** typed tasks land only on workers of their type; the fallback runs and warns once; the
+>   untyped path behaves as today; the new constructor's refusals.
+> - **Bench:** `bench/qt_pool_vs_this` shows the untyped path no slower.
+
+### Step 8 · one owner's tasks overlap and reorder on a shared pool — OPEN
+`executor.hpp:220-250` (`add_task`), `:156-200` (`wait`), `:257` (`pending`), `:390-405`
+(`give_to_worker`) · planned 2026-10-28, sites at `0d0ecb9`
+
+**The problem.** An owner that holds state, such as a fluxcpp store, counts on its tasks running
+one at a time and in the order it added them, as they do on a pool of its own with one worker. On a
+shared pool, and with step 7's types, two of its tasks can run at once on two workers and finish in
+either order: its state races, and its answers go out of order.
+
+**Why in the pool, not in a wrapper over it.** A wrapper would hand over an owner's next task
+through the public `add_task()`, which `wait()` refuses while it drains, so a pool-wide drain would
+drop what the wrapper still holds. Each owner would then need a drain of its own. Inside the pool
+the hand-over is internal: what was accepted runs, and `wait()` and `pending()` see it.
+
+> Proposed - agreed with the user, nothing written:
+> - **`std::size_t sequence()`** returns a fresh ordering key, a counter: nothing is allocated.
+> - **`add_task(std::size_t sequence, task_type type, task, args..., callback)`.** Tasks with the
+>   same key never overlap and run in the order they were added, each on a worker of its own type.
+>   Tasks with different keys run in parallel, as now. Added means the order `add_task()` calls get
+>   the lock: one thread's order is kept, two threads' are not ordered between them.
+> - **How:** under a lock, a map from key to a queue and a flag for whether one is running.
+>   - If the key has a task running, the new one queues and the call answers true.
+>   - Otherwise it goes to a worker at once. A worker's refusal clears the flag and answers false,
+>     as today.
+>   - The key's entry is erased once its queue empties, so keys need no release.
+> - **The hand-over** runs on the worker, inside the finished task's callback, after the user's own
+>   callback: so the next task starts only once the previous one's callback has run. A task that
+>   throws hands over too, then rethrows, so `on_task_error` still sees it. The hand-over is
+>   internal, so it is not refused while `wait()` drains: what was accepted runs.
+> - **`wait()`** stays correct with no change to its check. The hand-over happens while the
+>   finishing worker is still busy, so `nothing_running()` sees no gap. The keys' queues are finite,
+>   so the drain ends. **`pending()`** adds the keys' queues.
+> - **An explicit `stop()` with tasks still queued under a key** drops them, with a warning naming
+>   how many. The destructor drains before it stops, so it drops nothing.
+> - **Cost:** a lock and a map lookup per keyed task; untyped and typed tasks pay nothing new.
+> - **Tests, under TSan and ASan:**
+>   - one key's tasks never overlap and finish in order, across types;
+>   - a task that throws still hands over;
+>   - `wait()` drains every key's queue, and `pending()` counts it;
+>   - two keys run in parallel;
+>   - a key's light task waits for its own heavy one, but another key's does not;
+>   - `stop()` drops what is queued, and warns.
+> - **Not here, later:** an owner answering light tasks while its own heavy one runs. That gives up
+>   the ordering for those tasks, so it belongs to the owner: fluxcpp's feature plan, "later".
+> - **Order:** this repo first, then async's pin if it moves (it should not), then fluxcpp's pin.
 
 ## Order
 
