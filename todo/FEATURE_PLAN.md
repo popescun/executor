@@ -19,6 +19,9 @@ file, planned with the user for fluxcpp's stores and aggregators (fluxcpp's `tod
 Step 7 gives tasks a type, light or heavy, and the pool workers of each type; step 8 gives an owner
 an ordering key, so its tasks never overlap and finish in the order they were added, on whichever
 worker their type picks. Nothing written yet; sites at `0d0ecb9`.
+**2026-10-29 — step 7 done (`f0de732`).** 63 of 63 on Debug, ASan and TSan; `doc/refman.pdf` at 33
+pages. A 4-5% submit gap in the bench was placement, not code: the bench now builds with
+`-falign-functions=64`. Step 8 next.
 
 **Baseline.** `executor` at `c2bf9f0`, `async` at `985a991`, `actuator` at `a8b8b47`. Sites are line
 numbers at those commits and move with every step that lands.
@@ -101,7 +104,7 @@ notifying door builds an `untangle::task<R>` through `untangle::bind_task()` ins
 | 4 | — merged into step 2, see below | — | — |
 | 5 ✅ | `on_task_error`, the callback's thread, the destructor, and `README.md` | `:87-96`, `:288-308`, `README.md` | transcription — **DONE** (`e784324`) |
 | 6 ✅ | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **DONE** (`e784324`) |
-| 7 | a task cannot say it is heavy: every worker takes any task, so a long one can hold all of them | `:56` (constructor), `:220-250` (`add_task`), `:363` (`pick_worker`) | planned 2026-10-28 — OPEN |
+| 7 ✅ | a task cannot say it is heavy: every worker takes any task, so a long one can hold all of them | `:56` (constructor), `:220-250` (`add_task`), `:363` (`pick_worker`) | CONFIRMED (9 cases, 63 of 63 on Debug, ASan and TSan) — **DONE** (`f0de732`) |
 | 8 | tasks from one owner on a shared pool overlap and finish out of order | `:220-250`, `:156` (`wait`), `:257` (`pending`) | planned 2026-10-28 — OPEN |
 
 ### Step 1 ✅ · `add_task()` renamed `add_action()` — DONE
@@ -259,7 +262,7 @@ overlap or reorder once they can land on different workers (step 8).
 - A pool-wide `wait()` is acceptable to the user, and so is its refusing new work meanwhile. So is a
   pool whose lifetime, start and stop the application manages.
 
-### Step 7 · a task cannot say it is heavy — OPEN
+### Step 7 ✅ · a task cannot say it is heavy — DONE (`f0de732`)
 `executor.hpp:56` (constructor), `:220-250` (`add_task`), `:363-385` (`pick_worker`) · planned
 2026-10-28, sites at `0d0ecb9`
 
@@ -284,6 +287,63 @@ hold every worker, and every owner's short ones wait behind them.
 > - **Tests:** typed tasks land only on workers of their type; the fallback runs and warns once; the
 >   untyped path behaves as today; the new constructor's refusals.
 > - **Bench:** `bench/qt_pool_vs_this` shows the untyped path no slower.
+
+**Landed in `f0de732`.**
+- **`task_type`:** `enum class task_type : std::uint8_t { light, heavy }`, in `untangle`.
+- **Constructors:** `executor(light_count, heavy_count, name)` puts the light workers first and the
+  heavy ones after, so each type is one range of `workers_`. Zero light workers throws
+  `std::invalid_argument`; zero heavy workers is allowed. `executor(worker_count, name)` delegates
+  with no heavy workers.
+- **`add_task(task_type, ...)`:** copying and moving overloads. `pick_worker(type)` picks within the
+  type's range through `pick_worker(first, last)`, the old loop over a range; the untyped
+  `pick_worker()` is that over every worker.
+- **The fallback:** a heavy task on a pool with no heavy workers goes to a light one, and the pool
+  prints, once per pool: `warning: executor <name>: a heavy task found no heavy workers and ran on a
+  light one - build the pool with (light_count, heavy_count) to dedicate heavy workers`.
+- **Names:** workers are `<name>_light_<i>` and `<name>_heavy_<i>`, no longer `<name>_worker_<i>`.
+  The README and the doc blocks say so; every new or changed function documents its parameters and
+  return.
+- **Tests, written first and red until the API existed:**
+  - `a_typed_task_runs_on_a_worker_of_its_type`
+  - `a_pool_built_with_one_count_has_light_workers`
+  - `a_light_task_does_not_wait_for_heavy_work`
+  - `a_heavy_task_waits_for_a_heavy_worker`
+  - `a_burst_of_heavy_tasks_is_spread_over_idle_heavy_workers`
+  - `a_heavy_task_without_heavy_workers_runs_light_and_warns_once`
+  - `an_untyped_task_runs_on_any_worker`
+  - `a_pool_with_no_light_workers_is_refused`
+  - `a_typed_task_notifies_its_callback`
+
+  63 of 63 on Debug, ASan and TSan; fluxcpp's 39 of 39 against it.
+
+**The bench, and why it looked like a regression.** `bench/qt_pool_vs_this`, alternating with the
+code before it (`1c3a203`), as built then - no alignment flag. Submit times, median of 6-12 runs:
+
+| case | before | step 7 |
+|---|---|---|
+| 1000 x 10 µs, 4 / 1 workers | 30.1 / 19.1 µs | 31.4 / 19.9 |
+| mixed, 4 workers | 43.5 µs | 45.6 |
+| delivery, every case | - | level |
+
+About 1 ns per untyped task, 4-5%. Two variants did not close it: the new members placed last (kept;
+it narrowed the 4-worker empty and mixed batches) and a loop of its own for the untyped
+`pick_worker()` (no effect, dropped). **The cause is placement:** the untyped path's machine code
+is the same - in `run_batch`, where `submit()`, `add_task()` and `pick_worker()` are inlined, one
+load is scheduled two instructions earlier, and `give_to_worker()` is identical - but
+`give_to_worker()`, called once per task, moved from byte 52 to byte 20 of its cache line. Both
+built with `-falign-functions=64`, four runs each, alternating:
+
+| case | before | step 7 |
+|---|---|---|
+| 1000 x 10 µs, 4 / 1 workers | 31.7 / 20.1 µs | 30.6 / 19.1 |
+| 1000 empty, 4 workers | 36.5 µs | 34.3 |
+| mixed, 4 / 1 workers | 43.2 / 22.6 µs | 38.5 / 22.7 |
+| single tasks, delivery | level | level |
+
+Level or faster. One worker's empty batch follows placement into its fast or slow mode, in both
+versions alike (step 7 fast unaligned, slow aligned). **Decided (user, 2026-10-29):** no
+regression; the bench builds with `-falign-functions=64` from now on, so a comparison measures code
+and not placement (`bench/CMakeLists.txt`, `bench/README.md`).
 
 ### Step 8 · one owner's tasks overlap and reorder on a shared pool — OPEN
 `executor.hpp:220-250` (`add_task`), `:156-200` (`wait`), `:257` (`pending`), `:390-405`
@@ -363,6 +423,8 @@ the chain.
 | `1b4e2e1` | — this plan, in its pre-decision form |
 | `25bf0ec` | — `async` bumped to `d90b28f`, the tip whose plan is closed |
 | `e784324` | 1, 2 and 5 — the two doors, one queue, `actionT`, 5 cases, `README.md` and the reference |
+| `1c3a203` | — this plan: steps 7 and 8 |
+| `f0de732` | 7 — task types, light and heavy workers, 9 cases, `README.md` and the reference |
 
 **CLOSED.** Every step is done or merged, and all of it is in `e784324`. 32 of 32 and 5 of 5 green,
 clang-format clean, doxygen clean, `README.md` and `doc/refman.pdf` current.
