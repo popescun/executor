@@ -43,6 +43,11 @@ any check failed.
     busy;
   - **processed:** when the last task finished on a worker;
   - **delivered:** when the last result arrived on the main thread.
+- **Aligned functions:** the bench is built with `-falign-functions=64` (2026-10-29), so every
+  function starts on a cache line. Without it an edit anywhere in `executor.hpp` moves the functions
+  after it: step 7 of the feature plan measured its untyped submits 4-5% slower, with the same
+  machine code on that path, and level or faster once both builds were aligned. Results recorded
+  before that date were built without it.
 - **Checks:** the results are summed on the main thread and checked. A run that has not delivered
   everything after 10 s fails.
 

@@ -40,6 +40,14 @@ qt_add_executable(qt_pool_vs_this qt_pool_vs_this.cpp)
 target_include_directories(qt_pool_vs_this PRIVATE .. ../async)
 target_link_libraries(qt_pool_vs_this PRIVATE Qt6::Core Qt6::Concurrent Threads::Threads)
 
+# Every function starts on a 64-byte cache line. Without it, an edit anywhere in executor.hpp moves
+# the functions after it, and a hot one landing elsewhere in its line shows up as a gain or a loss of
+# its own: two versions with the same code measured 4-5% apart (feature plan, step 7). Aligned, a
+# comparison measures the code, not where the linker happened to place it.
+if (NOT MSVC)
+  target_compile_options(qt_pool_vs_this PRIVATE -falign-functions=64)
+endif()
+
 # As in fluxcpp's Qt prototypes: Qt's keyword macros stay out of headers that are not Qt's.
 target_compile_definitions(qt_pool_vs_this PRIVATE QT_NO_KEYWORDS)
 set_target_properties(qt_pool_vs_this PROPERTIES MACOSX_BUNDLE OFF)
