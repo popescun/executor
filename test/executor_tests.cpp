@@ -17,12 +17,14 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <executor.hpp>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -1467,4 +1469,183 @@ TEST(executor_tests, a_pool_is_neither_copied_nor_moved) {
   static_assert(!std::is_copy_assignable_v<executor>);
   static_assert(!std::is_move_constructible_v<executor>);
   static_assert(!std::is_move_assignable_v<executor>);
+}
+
+// Task types (FEATURE_PLAN.md, step 7): a pool has light and heavy workers, and a task says which
+// kind may run it.
+
+namespace {
+
+using untangle::task_type;
+
+//! What the pool prints when a heavy task finds no heavy worker.
+constexpr std::string_view no_heavy_workers = "no heavy workers";
+
+//! How many times @p needle occurs in @p text.
+std::size_t occurrences(const std::string& text, std::string_view needle) {
+  std::size_t count = 0;
+  for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+    ++count;
+  }
+  return count;
+}
+
+/**
+ * @brief The worker that ran a task of @p type on @p pool, read from the warning it printed for
+ * a task that threw.
+ */
+std::string worker_running(executor& pool, task_type type) {
+  testing::internal::CaptureStderr();
+  const bool taken =
+      pool.add_task(type, [] { throw std::runtime_error("expected"); }, ignore_result);
+  pool.wait();
+  const std::string reported = testing::internal::GetCapturedStderr();
+  return taken ? worker_named_in(reported) : std::string{};
+}
+
+}  // namespace
+
+/**
+ * @brief A heavy task runs on a heavy worker, a light one on a light worker, and the workers are
+ * named after their type.
+ */
+TEST(executor_tests, a_typed_task_runs_on_a_worker_of_its_type) {
+  executor pool(1, 1, "split");
+  pool.start();
+
+  EXPECT_EQ(worker_running(pool, task_type::heavy), "split_heavy_0");
+  EXPECT_EQ(worker_running(pool, task_type::light), "split_light_0");
+}
+
+/**
+ * @brief The constructor with one count builds light workers only, named after their type.
+ */
+TEST(executor_tests, a_pool_built_with_one_count_has_light_workers) {
+  executor pool(1, "store_a");
+  pool.start();
+
+  EXPECT_EQ(worker_running(pool, task_type::light), "store_a_light_0");
+}
+
+/**
+ * @brief Heavy work holding every heavy worker does not hold up a light task.
+ */
+TEST(executor_tests, a_light_task_does_not_wait_for_heavy_work) {
+  gate heavy;
+  gate unused;
+  std::atomic_int ran = {0};
+  executor pool(1, 1);
+  open_on_exit opener{heavy, unused};
+  pool.start();
+
+  ASSERT_TRUE(pool.add_task(task_type::heavy, [&heavy] { heavy(); }, ignore_result));
+  ASSERT_TRUE(wait_for([&heavy] { return heavy.arrived() == 1; }, 2s));
+
+  ASSERT_TRUE(pool.add_task(task_type::light, [&ran] { ran.fetch_add(1); }, ignore_result));
+  EXPECT_TRUE(wait_for([&ran] { return ran.load() == 1; }, 2s))
+      << "the light task waited behind the heavy one";
+}
+
+/**
+ * @brief A heavy task waits for a heavy worker, even while a light worker is idle.
+ */
+TEST(executor_tests, a_heavy_task_waits_for_a_heavy_worker) {
+  gate heavy;
+  gate unused;
+  std::atomic_int ran = {0};
+  executor pool(1, 1);
+  open_on_exit opener{heavy, unused};
+  pool.start();
+
+  ASSERT_TRUE(pool.add_task(task_type::heavy, [&heavy] { heavy(); }, ignore_result));
+  ASSERT_TRUE(wait_for([&heavy] { return heavy.arrived() == 1; }, 2s));
+
+  ASSERT_TRUE(pool.add_task(task_type::heavy, [&ran] { ran.fetch_add(1); }, ignore_result));
+  std::this_thread::sleep_for(100ms);
+  EXPECT_EQ(ran.load(), 0) << "the heavy task ran on the light worker";
+
+  heavy.open();
+  EXPECT_TRUE(wait_for([&ran] { return ran.load() == 1; }, 2s));
+}
+
+/**
+ * @brief Heavy tasks added back to back are spread over the idle heavy workers.
+ */
+TEST(executor_tests, a_burst_of_heavy_tasks_is_spread_over_idle_heavy_workers) {
+  gate busy_a;
+  gate busy_b;
+  executor pool(1, 2);
+  open_on_exit opener{busy_a, busy_b};
+  pool.start();
+
+  ASSERT_TRUE(pool.add_task(task_type::heavy, [&busy_a] { busy_a(); }, ignore_result));
+  ASSERT_TRUE(pool.add_task(task_type::heavy, [&busy_b] { busy_b(); }, ignore_result));
+
+  EXPECT_TRUE(wait_for([&] { return busy_a.arrived() == 1 && busy_b.arrived() == 1; }, 2s))
+      << "both heavy tasks went to one heavy worker";
+}
+
+/**
+ * @brief A heavy task on a pool with no heavy workers runs on a light one, and the pool says so
+ * once, not once per task.
+ */
+TEST(executor_tests, a_heavy_task_without_heavy_workers_runs_light_and_warns_once) {
+  std::atomic_int ran = {0};
+
+  testing::internal::CaptureStderr();
+  {
+    executor pool(2);
+    pool.start();
+    for (int i = 0; i < 3; ++i) {
+      EXPECT_TRUE(pool.add_task(task_type::heavy, [&ran] { ran.fetch_add(1); }, ignore_result));
+    }
+    pool.wait();
+  }
+  const std::string reported = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(ran.load(), 3) << "a heavy task did not run";
+  EXPECT_EQ(occurrences(reported, no_heavy_workers), 1u) << "the pool printed: " << reported;
+}
+
+/**
+ * @brief An untyped task runs on any worker, heavy ones included, as before task types.
+ */
+TEST(executor_tests, an_untyped_task_runs_on_any_worker) {
+  gate light;
+  gate unused;
+  std::atomic_int ran = {0};
+  executor pool(1, 1);
+  open_on_exit opener{light, unused};
+  pool.start();
+
+  ASSERT_TRUE(pool.add_task(task_type::light, [&light] { light(); }, ignore_result));
+  ASSERT_TRUE(wait_for([&light] { return light.arrived() == 1; }, 2s));
+
+  ASSERT_TRUE(pool.add_task([&ran] { ran.fetch_add(1); }, ignore_result));
+  EXPECT_TRUE(wait_for([&ran] { return ran.load() == 1; }, 2s))
+      << "the untyped task waited for the light worker while the heavy one was idle";
+}
+
+/**
+ * @brief A pool needs a light worker; heavy ones are optional.
+ */
+TEST(executor_tests, a_pool_with_no_light_workers_is_refused) {
+  EXPECT_THROW(executor(0, 1), std::invalid_argument);
+  EXPECT_THROW(executor(0, 0), std::invalid_argument);
+  EXPECT_NO_THROW(executor(1, 0));
+}
+
+/**
+ * @brief A typed task's callback is notified, as an untyped one's is.
+ */
+TEST(executor_tests, a_typed_task_notifies_its_callback) {
+  std::atomic_int notified = {0};
+  executor pool(1, 1);
+  pool.start();
+
+  ASSERT_TRUE(pool.add_task(task_type::heavy, [] {}, [&notified] { notified.fetch_add(1); }));
+  ASSERT_TRUE(pool.add_task(task_type::light, [] {}, [&notified] { notified.fetch_add(1); }));
+  pool.wait();
+
+  EXPECT_EQ(notified.load(), 2);
 }

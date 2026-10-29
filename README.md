@@ -134,6 +134,29 @@ what spreads the work, with no scheduling logic of its own: 400 tasks over 4 wor
 worker and what the destructor reads to decide the pool is idle. A tally kept here would be the
 pool's belief about its workers; this is the workers' own answer, and it cannot drift.
 
+### light and heavy workers
+
+A pool has light workers, and may have heavy ones too. `untangle::task_type` says which kind may run
+a task:
+
+```c++
+untangle::executor<std::function<void(void)>> pool(2, 2, "app");  // 2 light, 2 heavy
+pool.start();
+
+pool.add_task(untangle::task_type::heavy, [] { count_primes(); }, [] {});
+pool.add_task(untangle::task_type::light, [] { read_limit(); }, [] {});
+pool.add_task([] { anything(); }, [] {});  // untyped: any worker
+```
+
+A typed task goes to a worker of its type, picked as above within that type. Long tasks then hold
+only the heavy workers, and light ones keep running beside them. An untyped task goes to any
+worker, as before.
+
+`executor(worker_count, name)` builds light workers only. A heavy task on such a pool, or on one
+built with no heavy workers, runs on a light worker, and the pool warns once on stderr that it
+should be built with `(light_count, heavy_count)`. A pool with no light worker is refused, as one
+with no worker is.
+
 ## running, stopping, restarting
 
 **A pool is built stopped.** The constructor makes the workers and wires them up; `start()` runs
@@ -210,9 +233,9 @@ drain's, so a plain `wait()` prints it exactly as a destructor does; the second 
 alone:
 
 ```
-executor: still waiting to drain after 1s - 1 queued, 2 in a task: pool_1_worker_0, pool_1_worker_1
-executor: still waiting to drain after 3s - 0 queued, 1 in a task: pool_1_worker_1
-executor: still waiting to stop after 1s - 1 not left its thread: pool_1_worker_1
+executor: still waiting to drain after 1s - 1 queued, 2 in a task: pool_1_light_0, pool_1_light_1
+executor: still waiting to drain after 3s - 0 queued, 1 in a task: pool_1_light_1
+executor: still waiting to stop after 1s - 1 not left its thread: pool_1_light_1
 ```
 
 The interval starts at a second and doubles to a ceiling of thirty, so a stuck teardown says
@@ -255,8 +278,9 @@ and that is the case most worth hearing about. Assign it before the first `add_t
 reads it — and expect it on a worker's thread, with more than one worker possibly inside it at once.
 Leave it unset and the pool warns on stderr instead, naming the worker.
 
-**The name says which pool too.** Workers are named `<pool>_worker_<i>`, after the name the pool was
-given - `executor pool(2, "store_a")` has `store_a_worker_0` and `store_a_worker_1` - or, without one,
+**The name says which pool too.** Workers are named `<pool>_light_<i>` and `<pool>_heavy_<i>`, after
+the name the pool was given - `executor pool(2, "store_a")` has `store_a_light_0` and
+`store_a_light_1` - or, without one,
 `pool_<n>`, numbered across the process: two pools never share a worker name, so every warning - the
 failure reports above and the destructor's waits alike - says where it came from.
 

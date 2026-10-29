@@ -14,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -33,6 +34,14 @@ namespace untangle {
 inline std::atomic<std::size_t> unnamed_pools = {0};
 
 /**
+ * @brief Which workers may run a task: a pool has light workers, and may have heavy ones too.
+ *
+ * Heavy work goes to heavy workers, so a few long tasks cannot hold every worker while short ones
+ * wait behind them.
+ */
+enum class task_type : std::uint8_t { light, heavy };
+
+/**
  * @brief Runs tasks on a fixed pool of untangle::async::execution workers.
  *
  * \ref add_task() is the one door: it carries a callback and reports the result to it.
@@ -40,33 +49,58 @@ inline std::atomic<std::size_t> unnamed_pools = {0};
  * Each worker keeps its own queue. A task goes to a worker when it is submitted - the first idle
  * one, else the one given the fewest since it last drained - and waits there for that worker.
  *
+ * Workers are light or heavy (\ref task_type). A typed task goes to a worker of its type; an
+ * untyped one to any worker.
+ *
  * @tparam actionT - The callable the pool runs. One pool runs one signature, arguments and result.
  */
 template <typename actionT>
 class executor {
  public:
   /**
-   * @brief Builds \p worker_count workers. They do not run until \ref start().
+   * @brief Builds \p worker_count light workers, and no heavy one. They do not run until
+   * \ref start().
    *
    * @param worker_count - How many workers to run. Must not be zero.
-   * @param name - What its workers are named after, `<name>_worker_<i>`, in every warning they
+   * @param name - What its workers are named after, `<name>_light_<i>`, in every warning they
    * print. Left empty, it is `pool_<n>`, numbered across the process, so two pools are never alike.
    * @throws std::invalid_argument - \p worker_count is zero: such a pool could never run its work.
    */
-  explicit executor(std::size_t worker_count, std::string name = {}) {
-    if (worker_count == 0) {
-      throw std::invalid_argument("executor: worker_count must not be zero");
+  explicit executor(std::size_t worker_count, std::string name = {})
+      : executor(worker_count, 0, std::move(name)) {}
+
+  /**
+   * @brief Builds \p light_count light workers and \p heavy_count heavy ones. They do not run
+   * until \ref start().
+   *
+   * @param light_count - How many light workers to run. Must not be zero: an untyped or light task
+   * could never run.
+   * @param heavy_count - How many heavy workers to run. May be zero: heavy tasks then run on the
+   * light workers, and the pool warns once.
+   * @param name - What its workers are named after, `<name>_light_<i>` and `<name>_heavy_<i>`, in
+   * every warning they print. Left empty, it is `pool_<n>`, numbered across the process.
+   * @throws std::invalid_argument - \p light_count is zero.
+   */
+  executor(std::size_t light_count, std::size_t heavy_count, std::string name = {})
+      : light_count_(light_count) {
+    if (light_count == 0) {
+      throw std::invalid_argument("executor: light_count must not be zero");
     }
 
     if (name.empty()) {
       name = "pool_" + std::to_string(unnamed_pools.fetch_add(1) + 1);
     }
 
+    name_ = name;
+    const std::size_t worker_count = light_count + heavy_count;
     workers_.reserve(worker_count);
     given_ = std::make_unique<std::atomic<std::size_t>[]>(worker_count);
 
+    // The light workers first, then the heavy ones: each type is one contiguous range.
     for (std::size_t index = 0; index < worker_count; ++index) {
-      auto next = worker_execution::create_instance(name + "_worker_" + std::to_string(index));
+      auto next = worker_execution::create_instance(
+          index < light_count ? name + "_light_" + std::to_string(index)
+                              : name + "_heavy_" + std::to_string(index - light_count));
 
       // Tells the pool this worker has run everything it was given.
       next->on_finished = [this, index] { worker_drained(index); };
@@ -235,6 +269,12 @@ class executor {
   /**
    * @brief Gives work that must report to a worker as the overload above does, moving the task into
    * the queue rather than copying it. A temporary and a lambda land here.
+   *
+   * @tparam Args - The argument types to bind, of which the last is the callback.
+   * @param task - The task to run, moved into the worker's queue.
+   * @param args - What to bind, followed by the callback, as for the overload above.
+   * @return true - accepted, and the callback will be notified once it has run.
+   * @return false - refused, for the same reasons as the overload above. It will not run or notify.
    */
   template <typename... Args>
   bool add_task(actionT&& task, Args&&... args) {
@@ -247,6 +287,57 @@ class executor {
     }
 
     return give_to_worker(pick_worker(), std::move(task), std::forward<Args>(args)...);
+  }
+
+  /**
+   * @brief Gives work that must report to a worker of \p type, as the untyped door does to any
+   * worker: the first idle one of that type, else the one of that type given the fewest.
+   *
+   * A heavy task on a pool built with no heavy workers runs on a light one, and the pool warns
+   * once, the first time, that it should be built with heavy workers.
+   *
+   * @tparam Args - The argument types to bind, of which the last is the callback.
+   * @param type - Which workers may run it.
+   * @param task - The task to run, copied into the worker's queue.
+   * @param args - What to bind, followed by the callback, as for the untyped door.
+   * @return true - accepted, and the callback will be notified once it has run.
+   * @return false - refused, as by the untyped door.
+   */
+  template <typename... Args>
+  bool add_task(task_type type, const actionT& task, Args&&... args) {
+    static_assert(invocable_with_bound<Args...>(),
+                  "executor: the task cannot be called with the arguments given to add_task() "
+                  "before its callback");
+
+    if (!running_ || task_is_empty(task, args...)) {
+      return false;
+    }
+
+    return give_to_worker(pick_worker(type), task, std::forward<Args>(args)...);
+  }
+
+  /**
+   * @brief Gives work that must report to a worker of \p type as the overload above does, moving
+   * the task into the queue rather than copying it. A temporary and a lambda land here.
+   *
+   * @tparam Args - The argument types to bind, of which the last is the callback.
+   * @param type - Which workers may run it.
+   * @param task - The task to run, moved into the worker's queue.
+   * @param args - What to bind, followed by the callback, as for the untyped door.
+   * @return true - accepted, and the callback will be notified once it has run.
+   * @return false - refused, as by the untyped door.
+   */
+  template <typename... Args>
+  bool add_task(task_type type, actionT&& task, Args&&... args) {
+    static_assert(invocable_with_bound<Args...>(),
+                  "executor: the task cannot be called with the arguments given to add_task() "
+                  "before its callback");
+
+    if (!running_ || task_is_empty(task, args...)) {
+      return false;
+    }
+
+    return give_to_worker(pick_worker(type), std::move(task), std::forward<Args>(args)...);
   }
 
   /**
@@ -356,15 +447,57 @@ class executor {
   using worker_execution = untangle::async::execution<actionT>;
 
   /**
-   * @brief The first idle worker, the warmest; else the one given the fewest since it last drained.
+   * @brief Picks the worker for an untyped task, from every worker, light and heavy alike.
+   *
+   * @return The index in workers_ of the first idle worker, else of the one given the fewest tasks
+   * since it last drained.
+   */
+  std::size_t pick_worker() const { return pick_worker(0, workers_.size()); }
+
+  /**
+   * @brief Picks the worker for a task of \p type, from the workers of that type only.
+   *
+   * A light task picks among the light workers, a heavy task among the heavy ones. A pool built
+   * with no heavy workers has nowhere to send a heavy task, so it picks a light worker instead, and
+   * warns on stderr - the first time only - that the pool should be built with heavy workers.
+   *
+   * @param type - The task's type, which decides the workers to pick from.
+   * @return The index in workers_ of the first idle worker of that type, else of the one of that
+   * type given the fewest tasks since it last drained.
+   */
+  std::size_t pick_worker(task_type type) {
+    if (type == task_type::light) {
+      return pick_worker(0, light_count_);
+    }
+
+    if (light_count_ < workers_.size()) {
+      return pick_worker(light_count_, workers_.size());
+    }
+
+    if (!heavy_fallback_warned_.exchange(true, std::memory_order_relaxed)) {
+      std::println(stderr,
+                   "warning: executor {}: a heavy task found no heavy workers and ran on a light "
+                   "one - build the pool with (light_count, heavy_count) to dedicate heavy workers",
+                   name_);
+    }
+    return pick_worker(0, light_count_);
+  }
+
+  /**
+   * @brief Picks a worker among those at indices [\p first, \p last) of workers_.
    *
    * Read without a lock, so two submitters may pick alike: the counts steer balance only.
+   *
+   * @param first - The index of the first worker to consider.
+   * @param last - One past the index of the last worker to consider. Must be greater than \p first.
+   * @return The index of the first idle worker in the range, the warmest; else of the one in the
+   * range given the fewest tasks since it last drained.
    */
-  std::size_t pick_worker() const {
-    std::size_t best = 0;
-    std::size_t best_count = given_[0].load(std::memory_order_relaxed);
+  std::size_t pick_worker(std::size_t first, std::size_t last) const {
+    std::size_t best = first;
+    std::size_t best_count = given_[first].load(std::memory_order_relaxed);
 
-    for (std::size_t index = 0; index < workers_.size(); ++index) {
+    for (std::size_t index = first; index < last; ++index) {
       const std::size_t count = given_[index].load(std::memory_order_relaxed);
       if (count == 0) {
         return index;
@@ -539,6 +672,15 @@ class executor {
   //! Whether the pool accepts work. False until start(), false from stop(), and false for as long
   //! as wait() is draining, which puts back whatever it found.
   std::atomic_bool running_ = {false};
+
+  //! How many of workers_, from the front, are light; the rest are heavy.
+  std::size_t light_count_;
+
+  //! What the workers are named after, for the pool's own warnings.
+  std::string name_;
+
+  //! Whether the pool has warned that a heavy task found no heavy worker. Once is enough.
+  std::atomic_bool heavy_fallback_warned_ = {false};
 };
 
 }  // namespace untangle
