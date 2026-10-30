@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Nicolae Popescu. MIT License.
 
 /**
- * @brief Walks untangle::executor through its main scenarios, and reports what it observed.
+ * @brief Walks untangle::owned_executor through its main scenarios, and reports what it observed.
  *
  * Unlike executor_tests.cpp, which states an expectation for every behaviour, these cases print
  * what happened and assert only what does not depend on how the machine schedules: a timing
@@ -14,9 +14,9 @@
 
 #include <atomic>
 #include <chrono>
-#include <executor.hpp>
 #include <functional>
 #include <mutex>
+#include <owned_executor.hpp>
 #include <print>
 #include <thread>
 #include <vector>
@@ -25,7 +25,7 @@ namespace {
 
 // The pool under test, named once: executor is a template on its task type, the way the execution
 // it runs tasks on is a template on its action type.
-using executor = untangle::executor<std::function<void(void)>>;
+using executor = untangle::owned_executor<std::function<void(void)>>;
 using namespace std::chrono_literals;
 
 //! The callback for work whose result nobody reads: add_task() requires one, and this takes

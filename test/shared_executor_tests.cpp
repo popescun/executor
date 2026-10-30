@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Nicolae Popescu. MIT License.
 
 /**
- * @brief Behaviour tests for untangle::executor.
+ * @brief Behaviour tests for untangle::shared_executor.
  *
  * Unlike executor_smoke_test.cpp, which walks the pool through its scenarios and prints what
  * happened, every case here states an expectation and fails when it does not hold. Most are about a
@@ -18,10 +18,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
-#include <executor.hpp>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_executor.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -32,7 +32,7 @@
 namespace {
 
 // The pool under test, named once: executor is a template on its task type.
-using executor = untangle::executor<std::function<void(void)>>;
+using executor = untangle::shared_executor<std::function<void(void)>>;
 using namespace std::chrono_literals;
 using ::testing::InSequence;
 
@@ -121,7 +121,7 @@ class gate {
  *
  * The mock outlives the pool, so the expectation is verified after the destructor has finished.
  */
-TEST(executor_tests, every_submitted_task_runs_exactly_once) {
+TEST(shared_executor_tests, every_submitted_task_runs_exactly_once) {
   constexpr int task_count = 200;
   mock_work work;
   EXPECT_CALL(work, run()).Times(task_count);
@@ -140,7 +140,7 @@ TEST(executor_tests, every_submitted_task_runs_exactly_once) {
  *
  * The task is slow enough that a destructor which only stopped the workers would be caught.
  */
-TEST(executor_tests, the_destructor_finishes_work_in_flight) {
+TEST(shared_executor_tests, the_destructor_finishes_work_in_flight) {
   std::atomic_bool finished = {false};
 
   {
@@ -160,7 +160,7 @@ TEST(executor_tests, the_destructor_finishes_work_in_flight) {
 /**
  * @brief One worker, so what comes back is the shared queue's own order.
  */
-TEST(executor_tests, the_queue_preserves_submission_order) {
+TEST(shared_executor_tests, the_queue_preserves_submission_order) {
   constexpr int task_count = 50;
   mock_work work;
 
@@ -187,7 +187,7 @@ TEST(executor_tests, the_queue_preserves_submission_order) {
  * Every worker is held at the gate, so there is no free worker to find and each task lands in the
  * queue in turn.
  */
-TEST(executor_tests, tasks_queue_while_every_worker_is_busy) {
+TEST(shared_executor_tests, tasks_queue_while_every_worker_is_busy) {
   constexpr std::size_t worker_count = 2;
   constexpr std::size_t queued_count = 5;
 
@@ -221,7 +221,7 @@ TEST(executor_tests, tasks_queue_while_every_worker_is_busy) {
  *
  * With nothing waiting, a task does not sit in the queue while a worker is idle.
  */
-TEST(executor_tests, a_free_worker_takes_a_task_with_an_empty_queue) {
+TEST(shared_executor_tests, a_free_worker_takes_a_task_with_an_empty_queue) {
   gate busy;
   std::atomic_bool ran = {false};
 
@@ -245,7 +245,7 @@ TEST(executor_tests, a_free_worker_takes_a_task_with_an_empty_queue) {
 /**
  * @brief Work queued behind busy workers is picked up as they free up, without being prompted.
  */
-TEST(executor_tests, workers_take_the_queue_as_they_free_up) {
+TEST(shared_executor_tests, workers_take_the_queue_as_they_free_up) {
   constexpr std::size_t worker_count = 2;
   constexpr std::size_t queued_count = 20;
 
@@ -278,7 +278,7 @@ TEST(executor_tests, workers_take_the_queue_as_they_free_up) {
  *
  * Four 150ms tasks on four workers, against a loose bound: a pool that serialised them costs 600ms.
  */
-TEST(executor_tests, tasks_run_concurrently) {
+TEST(shared_executor_tests, tasks_run_concurrently) {
   const auto started = std::chrono::steady_clock::now();
 
   {
@@ -296,7 +296,7 @@ TEST(executor_tests, tasks_run_concurrently) {
 /**
  * @brief Nothing is lost when several threads add tasks at once.
  */
-TEST(executor_tests, concurrent_submission_loses_nothing) {
+TEST(shared_executor_tests, concurrent_submission_loses_nothing) {
   constexpr int per_thread = 100;
   constexpr int submitters = 4;
 
@@ -327,7 +327,7 @@ TEST(executor_tests, concurrent_submission_loses_nothing) {
  *
  * The worker carries on, so what this reads is the task after the throw.
  */
-TEST(executor_tests, a_throwing_task_does_not_stop_the_worker) {
+TEST(shared_executor_tests, a_throwing_task_does_not_stop_the_worker) {
   mock_work work;
   EXPECT_CALL(work, run()).Times(3);
 
@@ -349,7 +349,7 @@ TEST(executor_tests, a_throwing_task_does_not_stop_the_worker) {
  * @remark Both arms are read: async catches a std::exception and anything else separately, and a
  * handler given only the first would leave the second as silent as it was.
  */
-TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
+TEST(shared_executor_tests, what_a_task_throws_reaches_the_caller) {
   std::atomic_int reported = {0};
   std::string reported_what;
   std::atomic_int reported_unknown = {0};
@@ -385,7 +385,7 @@ TEST(executor_tests, what_a_task_throws_reaches_the_caller) {
  * Each worker keeps its own queue, so work a worker was given before stop() is its to run. Nothing
  * is refused or dropped, so stderr says nothing about it.
  */
-TEST(executor_tests, stop_runs_what_was_already_submitted) {
+TEST(shared_executor_tests, stop_runs_what_was_already_submitted) {
   constexpr int queued_count = 4;
 
   gate busy;
@@ -425,7 +425,7 @@ TEST(executor_tests, stop_runs_what_was_already_submitted) {
  * The inner task is waited for inside the scope: once the destructor starts, the pool refuses the
  * work its own worker is about to add.
  */
-TEST(executor_tests, a_task_can_add_more_work) {
+TEST(shared_executor_tests, a_task_can_add_more_work) {
   mock_work work;
   EXPECT_CALL(work, run()).Times(1);
 
@@ -451,7 +451,7 @@ TEST(executor_tests, a_task_can_add_more_work) {
  * destructor has stopped accepting, and the destructor is waiting for this very task to return. So
  * the task polls, and the case fails as a timeout rather than as a hang.
  */
-TEST(executor_tests, add_task_is_refused_once_the_pool_is_shutting_down) {
+TEST(shared_executor_tests, add_task_is_refused_once_the_pool_is_shutting_down) {
   auto pool = std::make_unique<executor>(2);
   pool->start();
 
@@ -485,7 +485,7 @@ TEST(executor_tests, add_task_is_refused_once_the_pool_is_shutting_down) {
  * worker thread is refused like any other caller. Letting in-flight work spawn more is what could
  * keep a shutdown from ever ending.
  */
-TEST(executor_tests, a_running_task_cannot_add_work_once_the_pool_stops) {
+TEST(shared_executor_tests, a_running_task_cannot_add_work_once_the_pool_stops) {
   gate hold;
   std::atomic_bool refused = {false};
   std::atomic_bool spawned = {false};
@@ -514,7 +514,7 @@ TEST(executor_tests, a_running_task_cannot_add_work_once_the_pool_stops) {
 /**
  * @brief pending() is the queue's depth, not the pool's occupancy.
  */
-TEST(executor_tests, pending_counts_only_what_is_waiting) {
+TEST(shared_executor_tests, pending_counts_only_what_is_waiting) {
   gate busy;
 
   {
@@ -539,7 +539,7 @@ TEST(executor_tests, pending_counts_only_what_is_waiting) {
 /**
  * @brief A pool nothing was submitted to still shuts down.
  */
-TEST(executor_tests, an_idle_pool_shuts_down) {
+TEST(shared_executor_tests, an_idle_pool_shuts_down) {
   executor pool(4);
   pool.start();
   EXPECT_EQ(pool.pending(), 0u);
@@ -551,7 +551,7 @@ TEST(executor_tests, an_idle_pool_shuts_down) {
  * Its workers are built but not running, so a task taken now would sit unrun and the destructor
  * would wait for it.
  */
-TEST(executor_tests, an_unstarted_pool_refuses_work) {
+TEST(shared_executor_tests, an_unstarted_pool_refuses_work) {
   std::atomic_int ran = {0};
 
   {
@@ -568,7 +568,7 @@ TEST(executor_tests, an_unstarted_pool_refuses_work) {
 /**
  * @brief A pool that was never started destructs without waiting for anything.
  */
-TEST(executor_tests, an_unstarted_pool_shuts_down) {
+TEST(shared_executor_tests, an_unstarted_pool_shuts_down) {
   const auto began = std::chrono::steady_clock::now();
 
   {
@@ -581,7 +581,7 @@ TEST(executor_tests, an_unstarted_pool_shuts_down) {
 /**
  * @brief start() runs the workers, and the pool takes work from then on.
  */
-TEST(executor_tests, a_started_pool_runs_what_it_is_given) {
+TEST(shared_executor_tests, a_started_pool_runs_what_it_is_given) {
   mock_work work;
   EXPECT_CALL(work, run()).Times(8);
 
@@ -601,7 +601,7 @@ TEST(executor_tests, a_started_pool_runs_what_it_is_given) {
  * stop() ends the workers' working life and start() gives them a new one, so the tasks refused in
  * between are the only ones lost.
  */
-TEST(executor_tests, a_stopped_pool_can_be_started_again) {
+TEST(shared_executor_tests, a_stopped_pool_can_be_started_again) {
   std::atomic_int ran = {0};
   const auto task = [&ran] { ran.fetch_add(1, std::memory_order_relaxed); };
 
@@ -627,7 +627,7 @@ TEST(executor_tests, a_stopped_pool_can_be_started_again) {
  * With no workers it would take work and then wait, in the destructor, for a queue nothing can
  * empty.
  */
-TEST(executor_tests, a_pool_with_no_workers_is_refused) {
+TEST(shared_executor_tests, a_pool_with_no_workers_is_refused) {
   EXPECT_THROW(executor(0), std::invalid_argument);
 }
 
@@ -639,7 +639,7 @@ TEST(executor_tests, a_pool_with_no_workers_is_refused) {
  * @remark The task times its own stall rather than waiting to be released, so a plain scope can
  * destroy the pool. `started` is declared before the pool so that it outlives the destructor.
  */
-TEST(executor_tests, a_destructor_stuck_on_a_task_reports_why) {
+TEST(shared_executor_tests, a_destructor_stuck_on_a_task_reports_why) {
   //! Longer than a first report is due, so the destructor is stuck across at least one.
   constexpr auto stall = 2s;
 
@@ -674,8 +674,8 @@ TEST(executor_tests, a_destructor_stuck_on_a_task_reports_why) {
  *
  * The callback throws each result away, so the count rather than the results is what this reads.
  */
-TEST(executor_tests, a_pool_runs_tasks_that_return_a_value) {
-  using int_executor = untangle::executor<std::function<int(void)>>;
+TEST(shared_executor_tests, a_pool_runs_tasks_that_return_a_value) {
+  using int_executor = untangle::shared_executor<std::function<int(void)>>;
 
   constexpr int tasks = 16;
   std::atomic_int ran = {0};
@@ -699,8 +699,8 @@ TEST(executor_tests, a_pool_runs_tasks_that_return_a_value) {
  * Any callable naming its own result_type will do, and such a pool never touches
  * std::function::result_type, which C++20 removed.
  */
-TEST(executor_tests, a_pool_runs_a_task_type_that_is_not_a_std_function) {
-  using counting_executor = untangle::executor<counting_task>;
+TEST(shared_executor_tests, a_pool_runs_a_task_type_that_is_not_a_std_function) {
+  using counting_executor = untangle::shared_executor<counting_task>;
 
   constexpr int tasks = 16;
   std::atomic_int ran = {0};
@@ -744,7 +744,10 @@ struct move_counting_task {
 //! which the cases below allow for so that they count only the pool's own moves.
 int moves_to_seal_a_task() {
   const auto before = move_counting_task::moves.load();
-  untangle::task_t sealed = [task = move_counting_task{}] { (void)task(0); };
+  untangle::task_t sealed = [task = move_counting_task{}] {
+    (void)task(0);
+    return true;
+  };
   (void)sealed;
   return move_counting_task::moves.load() - before;
 }
@@ -756,8 +759,8 @@ int moves_to_seal_a_task() {
  *
  * What every submission through a binding or a temporary costs, so a move more is paid per task.
  */
-TEST(executor_tests, submitting_moves_a_task_given_up_once) {
-  using counting_executor = untangle::executor<move_counting_task>;
+TEST(shared_executor_tests, submitting_moves_a_task_given_up_once) {
+  using counting_executor = untangle::shared_executor<move_counting_task>;
 
   const int sealing = moves_to_seal_a_task();
   move_counting_task task;
@@ -779,8 +782,8 @@ TEST(executor_tests, submitting_moves_a_task_given_up_once) {
 /**
  * @brief A task the caller keeps is copied into its worker's queue once, and not moved after.
  */
-TEST(executor_tests, submitting_copies_a_task_the_caller_keeps_once) {
-  using counting_executor = untangle::executor<move_counting_task>;
+TEST(shared_executor_tests, submitting_copies_a_task_the_caller_keeps_once) {
+  using counting_executor = untangle::shared_executor<move_counting_task>;
 
   const int sealing = moves_to_seal_a_task();
   const move_counting_task task;
@@ -816,8 +819,8 @@ TEST(executor_tests, submitting_copies_a_task_the_caller_keeps_once) {
  * the queue. Which argument reaches which task is the claim; the order they arrive in is not, so
  * the expectations are set per value rather than in sequence.
  */
-TEST(executor_tests, a_pool_runs_a_task_type_that_takes_arguments_and_returns_a_value) {
-  using numbered_executor = untangle::executor<std::function<int(int)>>;
+TEST(shared_executor_tests, a_pool_runs_a_task_type_that_takes_arguments_and_returns_a_value) {
+  using numbered_executor = untangle::shared_executor<std::function<int(int)>>;
 
   constexpr int task_count = 50;
   mock_work work;
@@ -849,8 +852,8 @@ TEST(executor_tests, a_pool_runs_a_task_type_that_takes_arguments_and_returns_a_
  * to keep them until a worker frees up". The single worker is held at the gate, so every task below
  * it waits in pending_ with its argument and is run from there.
  */
-TEST(executor_tests, an_argument_survives_the_queue) {
-  using numbered_executor = untangle::executor<std::function<int(int)>>;
+TEST(shared_executor_tests, an_argument_survives_the_queue) {
+  using numbered_executor = untangle::shared_executor<std::function<int(int)>>;
 
   constexpr int task_count = 50;
   mock_work work;
@@ -900,10 +903,10 @@ TEST(executor_tests, an_argument_survives_the_queue) {
 // untangle::bind_task() with the callback as its last argument; work nobody wants told about passes
 // a callback that ignores the result.
 
-TEST(executor_tests, a_task_notifies_its_callback_with_the_result) {
+TEST(shared_executor_tests, a_task_notifies_its_callback_with_the_result) {
   // Every worker is free as this adds, so the task goes straight to one rather than through the
   // queue - the shortest path the notification has to survive.
-  using int_executor = untangle::executor<std::function<int(int)>>;
+  using int_executor = untangle::shared_executor<std::function<int(int)>>;
 
   std::atomic_int reported = {-1};
   std::atomic_bool ran = {false};
@@ -924,10 +927,10 @@ TEST(executor_tests, a_task_notifies_its_callback_with_the_result) {
   EXPECT_EQ(reported.load(), 42) << "the pool ran the task but never notified its callback";
 }
 
-TEST(executor_tests, a_callback_survives_the_queue) {
+TEST(shared_executor_tests, a_callback_survives_the_queue) {
   // The other half of an_argument_survives_the_queue: the single worker is held at the gate, so the
   // task below it waits in pending_ with its callback and is run from there.
-  using int_executor = untangle::executor<std::function<int(int)>>;
+  using int_executor = untangle::shared_executor<std::function<int(int)>>;
 
   std::atomic_int reported = {-1};
   gate blocker;
@@ -957,7 +960,7 @@ TEST(executor_tests, a_callback_survives_the_queue) {
   EXPECT_EQ(reported.load(), 42) << "a task run from the queue never notified its callback";
 }
 
-TEST(executor_tests, a_void_task_notifies_that_it_finished) {
+TEST(shared_executor_tests, a_void_task_notifies_that_it_finished) {
   // The half no earlier case covered, and the reason a task's callback is required rather than
   // inferred: a task with no result still has a completion to report.
   constexpr int task_count = 8;
@@ -975,12 +978,12 @@ TEST(executor_tests, a_void_task_notifies_that_it_finished) {
   EXPECT_EQ(notified.load(), task_count) << "a void task finished without saying so";
 }
 
-TEST(executor_tests, a_task_that_cannot_notify_is_refused) {
+TEST(shared_executor_tests, a_task_that_cannot_notify_is_refused) {
   // The callback's type is checked at compile time, its emptiness cannot be: an empty std::function
   // is a callback of the right type that can never be called. untangle::bind_task() builds an empty
   // task from one, and a task that can neither run nor notify is refused rather than queued - the
   // answer is the whole report, as it is for a task added to a stopped pool.
-  using int_executor = untangle::executor<std::function<int(int)>>;
+  using int_executor = untangle::shared_executor<std::function<int(int)>>;
 
   std::atomic_bool ran = {false};
   std::function<void(int)> no_callback;
@@ -1001,10 +1004,10 @@ TEST(executor_tests, a_task_that_cannot_notify_is_refused) {
   EXPECT_FALSE(ran.load()) << "a refused task ran anyway";
 }
 
-TEST(executor_tests, a_task_that_throws_does_not_notify_and_reaches_the_caller) {
+TEST(shared_executor_tests, a_task_that_throws_does_not_notify_and_reaches_the_caller) {
   // Finished does not mean failed, through the pool's own reporting seam: no result to hand over,
   // so no notification, and what it threw goes to on_task_error as a failing action's does.
-  using int_executor = untangle::executor<std::function<int(int)>>;
+  using int_executor = untangle::shared_executor<std::function<int(int)>>;
 
   std::atomic_bool notified = {false};
   std::atomic_int reported_errors = {0};
@@ -1036,7 +1039,7 @@ TEST(executor_tests, a_task_that_throws_does_not_notify_and_reaches_the_caller) 
  * @remark What it states on any build is the finish: every task added before the scope closed has
  * run by the time the destructor returns.
  */
-TEST(executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
+TEST(shared_executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
   constexpr int rounds = 50;
   constexpr int tasks_per_round = 64;
   std::atomic_int ran = {0};
@@ -1071,8 +1074,8 @@ TEST(executor_tests, destroying_a_pool_under_load_does_not_race_its_workers) {
  * that was skipped shows up as the second count falling short of the first, which no count of runs
  * alone would catch.
  */
-TEST(executor_tests, destroying_a_pool_with_tasks_queued_does_not_race_their_callbacks) {
-  using int_executor = untangle::executor<std::function<int(int)>>;
+TEST(shared_executor_tests, destroying_a_pool_with_tasks_queued_does_not_race_their_callbacks) {
+  using int_executor = untangle::shared_executor<std::function<int(int)>>;
 
   constexpr int rounds = 50;
   constexpr int tasks_per_round = 64;
@@ -1116,7 +1119,7 @@ TEST(executor_tests, destroying_a_pool_with_tasks_queued_does_not_race_their_cal
  * The case the old wait() failed: it destroyed the workers, so a later task was accepted and then
  * never ran. The pool is destroyed already waited on, which drains it a second time.
  */
-TEST(executor_tests, wait_is_reusable_and_the_pool_runs_what_comes_after) {
+TEST(shared_executor_tests, wait_is_reusable_and_the_pool_runs_what_comes_after) {
   constexpr int rounds = 3;
   std::atomic_int ran = {0};
 
@@ -1138,7 +1141,7 @@ TEST(executor_tests, wait_is_reusable_and_the_pool_runs_what_comes_after) {
  *
  * The only case that fails if the restore is written as an unconditional resumption.
  */
-TEST(executor_tests, wait_leaves_a_pool_that_is_not_running_alone) {
+TEST(shared_executor_tests, wait_leaves_a_pool_that_is_not_running_alone) {
   executor pool(1);
 
   pool.wait();  // never started, so there is nothing to drain and nothing to resume
@@ -1157,7 +1160,7 @@ TEST(executor_tests, wait_leaves_a_pool_that_is_not_running_alone) {
  * More tasks than workers, so most of this waits in pending_ rather than in flight. A callback runs
  * inside the worker's drain, which is what makes it part of the drain rather than after it.
  */
-TEST(executor_tests, wait_drains_the_queue_and_every_callback_with_it) {
+TEST(shared_executor_tests, wait_drains_the_queue_and_every_callback_with_it) {
   constexpr int task_count = 32;
   std::atomic_int notified = {0};
 
@@ -1180,7 +1183,7 @@ TEST(executor_tests, wait_drains_the_queue_and_every_callback_with_it) {
  * Refusing is what lets the drain end at all - work arriving during it, from a task re-adding
  * itself as much as from another thread, would otherwise keep the queue from ever emptying.
  */
-TEST(executor_tests, wait_refuses_new_work_until_it_returns) {
+TEST(shared_executor_tests, wait_refuses_new_work_until_it_returns) {
   gate busy;
   std::atomic_bool returned = {false};
 
@@ -1213,7 +1216,7 @@ TEST(executor_tests, wait_refuses_new_work_until_it_returns) {
  * Overlapping waits used to read each other's cleared flag: the last one out restored the value it
  * had found already false, and the pool refused work from then on with nothing to explain it.
  */
-TEST(executor_tests, concurrent_waits_leave_the_pool_accepting) {
+TEST(shared_executor_tests, concurrent_waits_leave_the_pool_accepting) {
   // The interleaving is a race, so one round is not a reliable probe: unserialised, this reproduced
   // in roughly one run in three.
   constexpr int rounds = 20;
@@ -1265,7 +1268,7 @@ TEST(executor_tests, concurrent_waits_leave_the_pool_accepting) {
  * notification would not fail a wait() - it checks again every second - only delay it, so a test of
  * what wait() returns cannot see one. Many short waits in a row can: each lost one costs a second.
  */
-TEST(executor_tests, wait_wakes_as_soon_as_the_pool_drains) {
+TEST(shared_executor_tests, wait_wakes_as_soon_as_the_pool_drains) {
   constexpr int rounds = 500;
   std::atomic_int ran = {0};
   executor pool(2);
@@ -1302,7 +1305,7 @@ struct open_on_exit {
  * Each worker keeps its own queue, filled at submission: the pool balances by count, not by how
  * long the work takes.
  */
-TEST(executor_tests, a_task_waits_for_the_worker_it_was_given) {
+TEST(shared_executor_tests, a_task_waits_for_the_worker_it_was_given) {
   gate busy_a;
   gate busy_b;
   std::atomic_int ran = {0};
@@ -1332,7 +1335,7 @@ TEST(executor_tests, a_task_waits_for_the_worker_it_was_given) {
 /**
  * @brief Tasks submitted back to back to an idle pool go to different workers.
  */
-TEST(executor_tests, a_burst_is_spread_over_idle_workers) {
+TEST(shared_executor_tests, a_burst_is_spread_over_idle_workers) {
   gate busy_a;
   gate busy_b;
   executor pool(2);
@@ -1353,7 +1356,7 @@ TEST(executor_tests, a_burst_is_spread_over_idle_workers) {
  * The answer is the whole report, as before the workers kept their own queues: no worker is asked,
  * so none warns.
  */
-TEST(executor_tests, an_empty_task_is_refused_without_a_word) {
+TEST(shared_executor_tests, an_empty_task_is_refused_without_a_word) {
   testing::internal::CaptureStderr();
 
   {
@@ -1374,7 +1377,7 @@ TEST(executor_tests, an_empty_task_is_refused_without_a_word) {
  * A worker counts the tasks it was given until it drains; one it never took must not count, or an
  * idle worker looks busy until it is given real work.
  */
-TEST(executor_tests, a_refused_task_leaves_its_worker_free) {
+TEST(shared_executor_tests, a_refused_task_leaves_its_worker_free) {
   executor pool(2);
   pool.start();
 
@@ -1396,7 +1399,7 @@ TEST(executor_tests, a_refused_task_leaves_its_worker_free) {
  *
  * The fastest of five destructions, so a slow machine or a sanitizer build does not trip it.
  */
-TEST(executor_tests, destroying_a_pool_does_not_wait_a_whole_tick) {
+TEST(shared_executor_tests, destroying_a_pool_does_not_wait_a_whole_tick) {
   auto fastest = std::chrono::steady_clock::duration::max();
 
   for (int round = 0; round < 5; ++round) {
@@ -1429,7 +1432,7 @@ std::string worker_named_in(const std::string& reported) {
 /**
  * @brief Two pools name their workers apart, so a warning says which pool it came from.
  */
-TEST(executor_tests, two_pools_name_their_workers_apart) {
+TEST(shared_executor_tests, two_pools_name_their_workers_apart) {
   std::string named[2];
 
   for (auto& name : named) {
@@ -1450,7 +1453,7 @@ TEST(executor_tests, two_pools_name_their_workers_apart) {
 /**
  * @brief A pool given a name prefixes its workers with it.
  */
-TEST(executor_tests, a_named_pool_prefixes_its_workers) {
+TEST(shared_executor_tests, a_named_pool_prefixes_its_workers) {
   testing::internal::CaptureStderr();
   {
     executor pool(1, "store_a");
@@ -1464,7 +1467,7 @@ TEST(executor_tests, a_named_pool_prefixes_its_workers) {
 }
 
 //! The workers hold the pool's this, so a pool is neither copied nor moved.
-TEST(executor_tests, a_pool_is_neither_copied_nor_moved) {
+TEST(shared_executor_tests, a_pool_is_neither_copied_nor_moved) {
   static_assert(!std::is_copy_constructible_v<executor>);
   static_assert(!std::is_copy_assignable_v<executor>);
   static_assert(!std::is_move_constructible_v<executor>);
@@ -1509,7 +1512,7 @@ std::string worker_running(executor& pool, task_type type) {
  * @brief A heavy task runs on a heavy worker, a light one on a light worker, and the workers are
  * named after their type.
  */
-TEST(executor_tests, a_typed_task_runs_on_a_worker_of_its_type) {
+TEST(shared_executor_tests, a_typed_task_runs_on_a_worker_of_its_type) {
   executor pool(1, 1, "split");
   pool.start();
 
@@ -1520,7 +1523,7 @@ TEST(executor_tests, a_typed_task_runs_on_a_worker_of_its_type) {
 /**
  * @brief The constructor with one count builds light workers only, named after their type.
  */
-TEST(executor_tests, a_pool_built_with_one_count_has_light_workers) {
+TEST(shared_executor_tests, a_pool_built_with_one_count_has_light_workers) {
   executor pool(1, "store_a");
   pool.start();
 
@@ -1530,7 +1533,7 @@ TEST(executor_tests, a_pool_built_with_one_count_has_light_workers) {
 /**
  * @brief Heavy work holding every heavy worker does not hold up a light task.
  */
-TEST(executor_tests, a_light_task_does_not_wait_for_heavy_work) {
+TEST(shared_executor_tests, a_light_task_does_not_wait_for_heavy_work) {
   gate heavy;
   gate unused;
   std::atomic_int ran = {0};
@@ -1549,7 +1552,7 @@ TEST(executor_tests, a_light_task_does_not_wait_for_heavy_work) {
 /**
  * @brief A heavy task waits for a heavy worker, even while a light worker is idle.
  */
-TEST(executor_tests, a_heavy_task_waits_for_a_heavy_worker) {
+TEST(shared_executor_tests, a_heavy_task_waits_for_a_heavy_worker) {
   gate heavy;
   gate unused;
   std::atomic_int ran = {0};
@@ -1571,7 +1574,7 @@ TEST(executor_tests, a_heavy_task_waits_for_a_heavy_worker) {
 /**
  * @brief Heavy tasks added back to back are spread over the idle heavy workers.
  */
-TEST(executor_tests, a_burst_of_heavy_tasks_is_spread_over_idle_heavy_workers) {
+TEST(shared_executor_tests, a_burst_of_heavy_tasks_is_spread_over_idle_heavy_workers) {
   gate busy_a;
   gate busy_b;
   executor pool(1, 2);
@@ -1589,7 +1592,7 @@ TEST(executor_tests, a_burst_of_heavy_tasks_is_spread_over_idle_heavy_workers) {
  * @brief A heavy task on a pool with no heavy workers runs on a light one, and the pool says so
  * once, not once per task.
  */
-TEST(executor_tests, a_heavy_task_without_heavy_workers_runs_light_and_warns_once) {
+TEST(shared_executor_tests, a_heavy_task_without_heavy_workers_runs_light_and_warns_once) {
   std::atomic_int ran = {0};
 
   testing::internal::CaptureStderr();
@@ -1610,7 +1613,7 @@ TEST(executor_tests, a_heavy_task_without_heavy_workers_runs_light_and_warns_onc
 /**
  * @brief An untyped task runs on any worker, heavy ones included, as before task types.
  */
-TEST(executor_tests, an_untyped_task_runs_on_any_worker) {
+TEST(shared_executor_tests, an_untyped_task_runs_on_any_worker) {
   gate light;
   gate unused;
   std::atomic_int ran = {0};
@@ -1629,7 +1632,7 @@ TEST(executor_tests, an_untyped_task_runs_on_any_worker) {
 /**
  * @brief A pool needs a light worker; heavy ones are optional.
  */
-TEST(executor_tests, a_pool_with_no_light_workers_is_refused) {
+TEST(shared_executor_tests, a_pool_with_no_light_workers_is_refused) {
   EXPECT_THROW(executor(0, 1), std::invalid_argument);
   EXPECT_THROW(executor(0, 0), std::invalid_argument);
   EXPECT_NO_THROW(executor(1, 0));
@@ -1638,7 +1641,7 @@ TEST(executor_tests, a_pool_with_no_light_workers_is_refused) {
 /**
  * @brief A typed task's callback is notified, as an untyped one's is.
  */
-TEST(executor_tests, a_typed_task_notifies_its_callback) {
+TEST(shared_executor_tests, a_typed_task_notifies_its_callback) {
   std::atomic_int notified = {0};
   executor pool(1, 1);
   pool.start();

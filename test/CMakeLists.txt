@@ -39,7 +39,7 @@ FetchContent_MakeAvailable(googletest)
 # `ctest --test-dir` needs.
 enable_testing()
 
-# ../          - executor.hpp
+# ../          - owned_executor.hpp, shared_executor.hpp
 # ../async     - async.hpp, and the actuator/ directory async.hpp includes from
 include_directories(
   ../
@@ -82,12 +82,13 @@ else()
 endif()
 
 # executor_smoke_test walks the pool through the scenarios the prototype was written to answer and
-# prints what it observed; it states only what does not depend on timing. executor_tests is the
-# suite that states expectations.
+# prints what it observed; it states only what does not depend on timing. owned_executor_tests and
+# shared_executor_tests are the suites that state expectations, one per executor.
 add_executable(executor_smoke_test executor_smoke_test.cpp)
-add_executable(executor_tests executor_tests.cpp)
+add_executable(owned_executor_tests owned_executor_tests.cpp)
+add_executable(shared_executor_tests shared_executor_tests.cpp)
 
-foreach(target executor_smoke_test executor_tests)
+foreach(target executor_smoke_test owned_executor_tests shared_executor_tests)
   # gmock_main brings gtest_main with it, so both binaries take the same entry point.
   target_link_libraries(${target} PRIVATE GTest::gmock_main)
 
@@ -105,7 +106,7 @@ endforeach()
 # suites reportable: a defect in the pool can wedge or abort the process, and one test per process
 # means that takes down the single case that provoked it instead of every case after it.
 include(GoogleTest)
-foreach(target executor_smoke_test executor_tests)
+foreach(target executor_smoke_test owned_executor_tests shared_executor_tests)
   gtest_discover_tests(${target}
     PROPERTIES TIMEOUT 120
     DISCOVERY_TIMEOUT 60
