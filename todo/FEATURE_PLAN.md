@@ -105,7 +105,19 @@ notifying door builds an `untangle::task<R>` through `untangle::bind_task()` ins
 | 5 ✅ | `on_task_error`, the callback's thread, the destructor, and `README.md` | `:87-96`, `:288-308`, `README.md` | transcription — **DONE** (`e784324`) |
 | 6 ✅ | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **DONE** (`e784324`) |
 | 7 ✅ | a task cannot say it is heavy: every worker takes any task, so a long one can hold all of them | `:56` (constructor), `:220-250` (`add_task`), `:363` (`pick_worker`) | CONFIRMED (9 cases, 63 of 63 on Debug, ASan and TSan) — **DONE** (`f0de732`) |
-| 8 | tasks from one owner on a shared pool overlap and finish out of order | `:220-250`, `:156` (`wait`), `:257` (`pending`) | planned 2026-10-28 — OPEN |
+| **8** | **tasks from one owner on a shared pool overlap and finish out of order; reworked as a drain loop** | `:363` (`next_queue_id`), `:384-429` (ordered `add_task`), `:611-748` (the hand-over, replaced), `:930-950` (members) | 10 cases, 73 of 73 on Debug, ASan and TSan, with the first implementation; planned 2026-10-28, reworked 2026-10-30 — OPEN |
+| 8.1 | async bumped to `7464139`: `add_queued_task()` public | `async` (pin) | OPEN |
+| 8.2 | tests first: a throwing callback moves the queue on; an ordered queue takes any action type | `test/executor_tests.cpp` | OPEN |
+| 8.3 | the drain: `add_drain()`, `drain()`, `stopped_`, `ordered_queues_`; the hand-over removed | `:384-429`, `:611-748`, `:930-950` | OPEN |
+| 8.4 | docs: `README.md`, the doc blocks, `tools/make_doc.sh`, LF | `README.md`, `doc/` | OPEN |
+| 8.5 | checks: Debug, ASan, TSan; the ordered cases 50 times; the bench; fluxcpp | — | OPEN |
+| **9** | **one class holds both modes: the owned pool carries the shared one's types and queues; split into `base_executor`, `owned_executor` and `shared_executor`** | `executor.hpp` (whole), `test/executor_tests.cpp`, `test/executor_smoke_test.cpp`, `bench/qt_pool_vs_this`, `README.md` | planned 2026-10-30 — OPEN; after step 8 |
+| 9.1 | tests first: `owned_executor_tests.cpp`, `shared_executor_tests.cpp`, the smoke test | `test/` | OPEN |
+| 9.2 | `base_executor.hpp`: the shared part moved out | `executor.hpp` | OPEN |
+| 9.3 | `owned_executor.hpp`: today's pool, without types or queues | `executor.hpp` | OPEN |
+| 9.4 | `shared_executor.hpp`: types and ordered queues; `~shared_executor()` waits first | `executor.hpp` | OPEN |
+| 9.5 | users and docs: `executor.hpp` removed or kept, the bench, `README.md`, `tools/make_doc.sh`, LF | `bench/`, `README.md`, `doc/` | OPEN |
+| 9.6 | checks: as 8.5 | — | OPEN |
 
 ### Step 1 ✅ · `add_task()` renamed `add_action()` — DONE
 
@@ -359,37 +371,104 @@ through the public `add_task()`, which `wait()` refuses while it drains, so a po
 drop what the wrapper still holds. Each owner would then need a drain of its own. Inside the pool
 the hand-over is internal: what was accepted runs, and `wait()` and `pending()` see it.
 
+**The API, agreed 2026-10-28 and named 2026-10-30:**
+- **`std::size_t next_queue_id()`** returns a new queue id, a counter starting at 1, never 0:
+  nothing is allocated.
+- **`add_task(std::size_t queue_id, task_type type, task, args..., callback)`.** Tasks of one
+  ordered queue never overlap, and run and notify in the order added, each on a worker of its own
+  type. Different queues run in parallel. Added means the order `add_task()` calls take the lock:
+  one thread's order is kept, two threads' are not ordered between them.
+- A queue needs no release: it exists only while it has tasks.
+- **`pending()`** counts the tasks waiting in ordered queues; **`wait()`** runs them, since they
+  were accepted before it began; an explicit **`stop()`** drops them, with a warning naming how
+  many. The destructor drains before it stops, so it drops nothing.
+- **Not here, later:** an owner answering light tasks while its own heavy one runs. That gives up
+  the ordering for those tasks, so it belongs to the owner: fluxcpp's feature plan, "later".
+
+**First implementation, replaced (2026-10-30, user: "convoluted").** The finished task's callback
+handed the queue's next task over to a worker. It needed both the task and the callback wrapped
+(`guarded_task`, `guarded_callback`) so a throw still moved the queue on, a handing-over `task_t`
+per waiting task, and an `actionT` able to hold the wrapper. An allocation failure while handing
+over left the queue stuck.
+
+> Proposed - agreed with the user, nothing written: **a drain loop.** One task on a worker runs the
+> queue's tasks in turn.
+> - **8.1 · async bumped to `7464139`**, its step 9: `execution::add_queued_task()` is public, so
+>   the pool can queue its own drain, which is not of the `actionT` type. Its own commit, first.
+> - **8.2 · Tests first.** The 10 cases stay: they describe behaviour, not the mechanism. Two more:
+>   - `a_queued_callback_that_throws_still_moves_the_queue_on`, covered by `guarded_callback`
+>     until now and by no case;
+>   - `an_ordered_queue_takes_any_action_type`: an ordered task on a pool whose `actionT` is not a
+>     `std::function`, today a static_assert.
+> - **8.3 · The drain.**
+>   - **`add_task(queue_id, ...)`** seals the task, its arguments and callback into one `task_t`
+>     with `bind_task()`, and pushes `{type, task}` onto the queue. A new queue gets a drain of that
+>     type through `add_drain()`; a refused drain erases the queue and answers false.
+>   - **`add_drain(queue_id, type)`**, with the queues' lock held, picks a worker of that type,
+>     counts the drain in `worker_task_count_`, and queues it with `add_queued_task()`. It does not
+>     check `running_`, so `wait()` runs a queue to its end.
+>   - **`drain(queue_id, type, index)`**, on the worker, runs the queue's tasks one by one while
+>     they are of its type. What a task or its callback throws goes to `on_task_error`, under the
+>     worker's name, and the loop goes on. An empty queue is erased; a task of the other type gets a
+>     drain of that type.
+>   - **Stop:** a `stopped_` flag, set by `stop()` and cleared by `start()`. The drain checks it
+>     between tasks and drops the rest with the "dropped N" warning. Not `running_`, which `wait()`
+>     clears too and which must still drain.
+>   - **Removed:** `guarded_task`, `guarded_callback`, `handover_task()`, `hand_over()`,
+>     `handover_task_queue`, and the static_assert that `actionT` holds a wrapper.
+>   - **Renamed:** `ordered_handover_task_queues_` → `ordered_queues_`, a queue id to its
+>     `std::deque<ordered_task>`; `ordered_task` is `{task_type type; task_t task;}`. No `running`
+>     flag: a queue is in the map exactly while its drain runs.
+>   - **Kept:** `queued_in_order_` for `pending()`, `next_queue_id_`, `ordered_queues_mutex_`.
+>   - **Recorded, not handled:** an allocation failure inside `add_drain()` can still leave a queue
+>     stuck. A drain holds its worker until its queue empties or changes type; handing itself over
+>     again after N tasks is the fix, if ever needed.
+> - **8.4 · Docs:** `README.md`'s ordered queues section; every function's parameters and return;
+>   `tools/make_doc.sh` clean; every file LF.
+> - **8.5 · Checks:** Debug, ASan and TSan green; the ordered cases 50 times under TSan and ASan;
+>   the bench builds; fluxcpp green against it.
+> - **Order:** this repo, then fluxcpp's pin.
+
+### Step 9 · one class holds both modes — OPEN
+`executor.hpp`, `test/`, `bench/`, `README.md` · planned 2026-10-30, after step 8
+
+**The problem.** A pool a store owns needs neither task types nor ordered queues, yet carries both.
+Each mode reads more simply as a class of its own, with what they share in a base.
+
 > Proposed - agreed with the user, nothing written:
-> - **`std::size_t sequence()`** returns a fresh ordering key, a counter: nothing is allocated.
-> - **`add_task(std::size_t sequence, task_type type, task, args..., callback)`.** Tasks with the
->   same key never overlap and run in the order they were added, each on a worker of its own type.
->   Tasks with different keys run in parallel, as now. Added means the order `add_task()` calls get
->   the lock: one thread's order is kept, two threads' are not ordered between them.
-> - **How:** under a lock, a map from key to a queue and a flag for whether one is running.
->   - If the key has a task running, the new one queues and the call answers true.
->   - Otherwise it goes to a worker at once. A worker's refusal clears the flag and answers false,
->     as today.
->   - The key's entry is erased once its queue empties, so keys need no release.
-> - **The hand-over** runs on the worker, inside the finished task's callback, after the user's own
->   callback: so the next task starts only once the previous one's callback has run. A task that
->   throws hands over too, then rethrows, so `on_task_error` still sees it. The hand-over is
->   internal, so it is not refused while `wait()` drains: what was accepted runs.
-> - **`wait()`** stays correct with no change to its check. The hand-over happens while the
->   finishing worker is still busy, so `nothing_running()` sees no gap. The keys' queues are finite,
->   so the drain ends. **`pending()`** adds the keys' queues.
-> - **An explicit `stop()` with tasks still queued under a key** drops them, with a warning naming
->   how many. The destructor drains before it stops, so it drops nothing.
-> - **Cost:** a lock and a map lookup per keyed task; untyped and typed tasks pay nothing new.
-> - **Tests, under TSan and ASan:**
->   - one key's tasks never overlap and finish in order, across types;
->   - a task that throws still hands over;
->   - `wait()` drains every key's queue, and `pending()` counts it;
->   - two keys run in parallel;
->   - a key's light task waits for its own heavy one, but another key's does not;
->   - `stop()` drops what is queued, and warns.
-> - **Not here, later:** an owner answering light tasks while its own heavy one runs. That gives up
->   the ordering for those tasks, so it belongs to the owner: fluxcpp's feature plan, "later".
-> - **Order:** this repo first, then async's pin if it moves (it should not), then fluxcpp's pin.
+> - **Three headers:**
+>   - **`base_executor.hpp`**, `base_executor<actionT>`: the workers and their light and heavy
+>     ranges, `start`/`stop`/`wait`/`pending`, `on_task_error`, the destructor's shutdown, and the
+>     protected helpers - `pick_worker`, `add_task_to_worker`, `task_is_empty`, the invocable
+>     checks, `report_task_error`, `decrease_worker_task_count`, `worker_drained`.
+>   - **`owned_executor.hpp`**, `owned_executor<actionT>`, today's `executor`: `(worker_count,
+>     name)` and the two untyped `add_task`. The pool as before step 7: no types, no queues.
+>   - **`shared_executor.hpp`**, `shared_executor<actionT>`: `task_type`, `(light_count,
+>     heavy_count, name)`, the untyped and typed `add_task`, `next_queue_id()`, the ordered
+>     `add_task`, `add_drain`, `drain`.
+> - **The base** is not used on its own: protected, non-virtual constructor and destructor.
+> - **`~shared_executor()` calls `wait()` first:** the base's destructor runs after the derived
+>   members are gone, and a running drain uses `ordered_queues_`.
+> - **`pending()`** stays in the base and adds a protected count the shared executor keeps
+>   (`queued_in_order_` moves there): no virtual call, no hiding.
+> - **`light_count_`, `name_`'s fallback warning and `heavy_fallback_warned_`** move with
+>   `task_type` to the shared executor.
+> - **Cost:** a template's base members are named `this->workers_` and so on.
+> - **`executor.hpp` is removed** (proposed; the user has not decided): code includes the header of
+>   the executor it uses. The alternative is to keep it as a header including both.
+>
+> The sub-steps, in order:
+> - **9.1 · Tests first.** `test/owned_executor_tests.cpp` (today's pool cases, which also cover
+>   the base) and `test/shared_executor_tests.cpp` (types and ordered queues), written against the
+>   new names, so they fail to build; the smoke test uses `owned_executor`.
+> - **9.2 · `base_executor.hpp`**, the shared part moved out of `executor.hpp`.
+> - **9.3 · `owned_executor.hpp`**, today's pool on the base, without types or queues.
+> - **9.4 · `shared_executor.hpp`**, types and ordered queues on the base, and `~shared_executor()`
+>   calling `wait()`.
+> - **9.5 · Users and docs.** `executor.hpp` removed (or kept, as decided); `bench/qt_pool_vs_this`
+>   uses `owned_executor`; `README.md` gets a section per executor; every function's parameters and
+>   return; `tools/make_doc.sh` clean; every file LF.
+> - **9.6 · Checks:** as step 8's. fluxcpp's `flux_common.hpp` and its feature step 1 follow there.
 
 ## Order
 
