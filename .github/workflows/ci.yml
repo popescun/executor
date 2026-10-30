@@ -52,7 +52,7 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      # executor.hpp includes <async.hpp> from the async submodule, which carries
+      # The executors include <async.hpp> from the async submodule, which carries
       # its own actuator submodule - hence recursive. Both are public repositories,
       # so the default GITHUB_TOKEN reaches them and no PAT is needed. The format
       # job does not need them: submodule content is a gitlink here, so

@@ -3,8 +3,8 @@
 /**
  * @file qt_pool_vs_this.cpp
  *
- * @brief A batch of tasks on untangle::executor against Qt's thread pool, results delivered to the
- * main thread.
+ * @brief A batch of tasks on untangle::owned_executor against Qt's thread pool, results delivered
+ * to the main thread.
  *
  * The main thread submits a batch, the pool runs it, and every result is moved to the main thread
  * the way a UI update is - which is what a flux store and presenter do with each answer. Three
@@ -41,9 +41,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <executor.hpp>
 #include <functional>
 #include <mutex>
+#include <owned_executor.hpp>
 #include <random>
 #include <string>
 #include <vector>
@@ -200,7 +200,7 @@ struct executor_pool {
   }
 
   shared& common;
-  untangle::executor<task_t> pool;
+  untangle::owned_executor<task_t> pool;
 };
 
 struct qthreadpool_pool {

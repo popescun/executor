@@ -113,8 +113,8 @@ notifying door builds an `untangle::task<R>` through `untangle::bind_task()` ins
 | **8** | **one class holds both modes: the owned pool carries the shared one's types; split into `owned_executor` (the original, renamed only) and `shared_executor`** | `executor.hpp` (whole), `test/`, `bench/qt_pool_vs_this`, `README.md`, `Doxyfile`, CI | planned 2026-10-30 — OPEN |
 | 8.1 ✅ | tests first: `owned_executor_tests.cpp`, `shared_executor_tests.cpp`, the smoke test | `test/` | renamed only, plus `moves_to_seal_a_task()` answering `true` — **DONE** (`4c467ff`) |
 | 8.2 ✅ | `owned_executor.hpp`: `1c3a203:executor.hpp`, renamed only | `owned_executor.hpp` | diff shows renames only; owned and smoke 54 of 54 on Debug, ASan and TSan — **DONE** (`4c467ff`) |
-| 8.3 ✅ | `shared_executor.hpp`: `f0de732:executor.hpp`, renamed; `unnamed_shared_pools` | `shared_executor.hpp` | diff shows renames only; both headers compile in one file; 112 of 112 on Debug, ASan and TSan — **DONE**, commit pending |
-| 8.4 | users and docs: `executor.hpp` removed, CMake, Doxyfile, CI, the bench, `README.md`, `tools/make_doc.sh`, LF | `test/`, `bench/`, `README.md`, `doc/` | OPEN |
+| 8.3 ✅ | `shared_executor.hpp`: `f0de732:executor.hpp`, renamed; `unnamed_shared_pools` | `shared_executor.hpp` | diff shows renames only; both headers compile in one file; 112 of 112 on Debug, ASan and TSan — **DONE** (`06e4b96`) |
+| 8.4 ✅ | users and docs: `executor.hpp` removed, CMake, Doxyfile, CI, the bench, `README.md`, `tools/make_doc.sh`, LF | `Doxyfile`, CI, `bench/`, `README.md`, `doc/` | `README.md` names both, with a section for the shared one; refman 41 pages, no warnings; the bench builds — **DONE** |
 | 8.5 | checks: Debug, ASan, TSan for both; the bench matches the original | — | OPEN |
 | **9** | **tasks from one owner on a shared pool overlap and finish out of order: ordered queues, as a drain loop, on `shared_executor`** | `shared_executor.hpp` | first implementation kept as a POC (stash), not landed; planned 2026-10-28, reworked 2026-10-30 — OPEN; after step 8 |
 | 9.1 ✅ | async bumped to `7464139`: `add_queued_task()` public | `async` (pin) | **DONE** (`ab267f3`) |
@@ -488,7 +488,8 @@ a new `has_tasks()` — and it gates async's step 3. Neither touches this repo.
 Inherited from `FIX_PLAN.md`, unchanged. **Each step is a test first**: a case that shows what is
 missing, put up for review on its own, and the code written only once the case is agreed. The test
 is the unit of review, not the implementation. **One step per commit**, and a step's case travels
-with its own fix. The plan's own updates are their own commit, and always a later one.
+with its own fix. The plan's updates travel in the same commit as the change they record
+(user, 2026-10-30); a commit cannot name its own hash, so the next change adds it.
 
 **Every header change is followed by `tools/make_doc.sh`**, and all three repos are touched across
 the chain.
@@ -504,6 +505,7 @@ the chain.
 | `f0de732` | 7 — task types, light and heavy workers, 9 cases, `README.md` and the reference |
 | `ab267f3` | 9.1 — `async` bumped to `7464139`: `add_queued_task()` public |
 | `4c467ff` | 8.1 and 8.2 — `owned_executor`, the original pool renamed, and the tests split |
+| `06e4b96` | 8.3 — `shared_executor`, step 7's pool renamed |
 
 **CLOSED.** Every step is done or merged, and all of it is in `e784324`. 32 of 32 and 5 of 5 green,
 clang-format clean, doxygen clean, `README.md` and `doc/refman.pdf` current.

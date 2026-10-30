@@ -4,9 +4,16 @@
 
 *c++ thread pool executor based on async execution*
 
-A header-only library: `executor.hpp` exposes a pool of workers, each one an
-[async](https://github.com/popescun/async) `execution` in continuous mode, fed by a shared queue of
-tasks.
+A header-only library of two thread pools, each worker an
+[async](https://github.com/popescun/async) `execution` in continuous mode:
+
+- **`owned_executor.hpp`**, `untangle::owned_executor`: a pool its owner holds alone, such as a
+  store that runs its work on a thread of its own.
+- **`shared_executor.hpp`**, `untangle::shared_executor`: a pool many owners share, with light and
+  heavy workers, so a few long tasks cannot hold every worker. See *the shared executor* below.
+
+Both take work the same way, and start, stop, wait and report failures the same way. The sections
+below hold for both, and show `owned_executor`.
 
 ## requirements
 
@@ -25,18 +32,18 @@ The headers report warnings with `std::println`, so they need a standard library
 ## example
 
 ```c++
-#include <executor.hpp>
+#include <owned_executor.hpp>
 #include <functional>
 
 int main() {
-  untangle::executor<std::function<void(void)>> pool(4);
+  untangle::owned_executor<std::function<void(void)>> pool(4);
   pool.start();
 
   for (int i = 0; i < 100; ++i) {
     pool.add_task([i] { work(i); }, [] { /* finished */ });
   }
 
-  return 0;  // ~executor finishes what was added, then stops the workers
+  return 0;  // ~owned_executor finishes what was added, then stops the workers
 }
 ```
 
@@ -47,7 +54,7 @@ parameter name, because every task queued is that one callable. One pool runs on
 signature, and the caller names it:
 
 ```c++
-untangle::executor<std::function<int(void)>> pool(4);   // each result goes to the task's callback
+untangle::owned_executor<std::function<int(void)>> pool(4);   // each result goes to the task's callback
 ```
 
 The action type does not have to be a `std::function`. What an `execution` requires of it is a nested
@@ -61,7 +68,7 @@ struct my_task {
   void operator()() const;
 };
 
-untangle::executor<my_task> pool(4);
+untangle::owned_executor<my_task> pool(4);
 ```
 
 ## tasks: work that reports back
@@ -72,7 +79,7 @@ notify. An action type may take arguments, and `add_task()` binds them the way i
 after them:
 
 ```c++
-untangle::executor<std::function<int(int)>> pool(4);
+untangle::owned_executor<std::function<int(int)>> pool(4);
 pool.start();
 
 // the callback comes last, after the arguments the task is bound to
@@ -91,14 +98,14 @@ A task that cannot be called with the arguments given is refused by a `static_as
 Work that returns `void` still reports that it finished, with a callback taking nothing — *finished* is the message and the result is optional:
 
 ```c++
-untangle::executor<std::function<void(void)>> pool(4);
+untangle::owned_executor<std::function<void(void)>> pool(4);
 pool.add_task([] { /* ... */ }, [] { /* finished */ });
 ```
 
 A task with nothing to bind passes the callback alone, whatever it returns:
 
 ```c++
-untangle::executor<std::function<int(void)>> pool(4);
+untangle::owned_executor<std::function<int(void)>> pool(4);
 pool.add_task([] { return 42; }, [](int result) { /* result == 42 */ });
 ```
 
@@ -134,13 +141,20 @@ what spreads the work, with no scheduling logic of its own: 400 tasks over 4 wor
 worker and what the destructor reads to decide the pool is idle. A tally kept here would be the
 pool's belief about its workers; this is the workers' own answer, and it cannot drift.
 
+## the shared executor
+
+`shared_executor` is the pool to share: the application builds and starts it, and hands it to every
+owner by reference. It has everything above, and workers of two kinds.
+
 ### light and heavy workers
 
-A pool has light workers, and may have heavy ones too. `untangle::task_type` says which kind may run
-a task:
+A shared pool has light workers, and may have heavy ones too. `untangle::task_type` says which kind
+may run a task:
 
 ```c++
-untangle::executor<std::function<void(void)>> pool(2, 2, "app");  // 2 light, 2 heavy
+#include <shared_executor.hpp>
+
+untangle::shared_executor<std::function<void(void)>> pool(2, 2, "app");  // 2 light, 2 heavy
 pool.start();
 
 pool.add_task(untangle::task_type::heavy, [] { count_primes(); }, [] {});
@@ -152,7 +166,7 @@ A typed task goes to a worker of its type, picked as above within that type. Lon
 only the heavy workers, and light ones keep running beside them. An untyped task goes to any
 worker, as before.
 
-`executor(worker_count, name)` builds light workers only. A heavy task on such a pool, or on one
+`shared_executor(worker_count, name)` builds light workers only. A heavy task on such a pool, or on one
 built with no heavy workers, runs on a light worker, and the pool warns once on stderr that it
 should be built with `(light_count, heavy_count)`. A pool with no light worker is refused, as one
 with no worker is.
@@ -212,7 +226,7 @@ captured.
 
 For a pool that is a local variable outliving what its work touches, the destructor is enough and
 nothing else is needed. For a pool held as a **member of another class**, it is already too late:
-`~executor()` runs during its owner's member destruction, so by then the owner's derived subobject
+the pool's destructor runs during its owner's member destruction, so by then the owner's derived subobject
 is gone, and so is every member declared after the pool. A callback reaching into either of those
 runs against destroyed storage however faithfully the pool drains — and on the stack that is not
 even a fault a sanitizer can name, because the memory is still addressable.
@@ -233,9 +247,9 @@ drain's, so a plain `wait()` prints it exactly as a destructor does; the second 
 alone:
 
 ```
-executor: still waiting to drain after 1s - 1 queued, 2 in a task: pool_1_light_0, pool_1_light_1
-executor: still waiting to drain after 3s - 0 queued, 1 in a task: pool_1_light_1
-executor: still waiting to stop after 1s - 1 not left its thread: pool_1_light_1
+executor: still waiting to drain after 1s - 1 queued, 2 in a task: pool_1_worker_0, pool_1_worker_1
+executor: still waiting to drain after 3s - 0 queued, 1 in a task: pool_1_worker_1
+executor: still waiting to stop after 1s - 1 not left its thread: pool_1_worker_1
 ```
 
 The interval starts at a second and doubles to a ceiling of thirty, so a stuck teardown says
@@ -262,7 +276,7 @@ asking. `add_task()` answers false inside the task, so it can tell.
 catches it and carries on with the next task; `on_task_error` is where the throw goes:
 
 ```c++
-untangle::executor<std::function<void(void)>> pool(4);
+untangle::owned_executor<std::function<void(void)>> pool(4);
 
 pool.on_task_error = [](std::exception_ptr thrown) {
   try {
@@ -278,11 +292,12 @@ and that is the case most worth hearing about. Assign it before the first `add_t
 reads it — and expect it on a worker's thread, with more than one worker possibly inside it at once.
 Leave it unset and the pool warns on stderr instead, naming the worker.
 
-**The name says which pool too.** Workers are named `<pool>_light_<i>` and `<pool>_heavy_<i>`, after
-the name the pool was given - `executor pool(2, "store_a")` has `store_a_light_0` and
-`store_a_light_1` - or, without one,
-`pool_<n>`, numbered across the process: two pools never share a worker name, so every warning - the
-failure reports above and the destructor's waits alike - says where it came from.
+**The name says which pool too.** An owned pool's workers are named `<pool>_worker_<i>`, after
+the name the pool was given - `owned_executor pool(2, "store_a")` has `store_a_worker_0` and
+`store_a_worker_1` - or, without one, `pool_<n>`, numbered across the process. A shared pool's are
+`<pool>_light_<i>` and `<pool>_heavy_<i>`, and without a name it is `shared_pool_<n>`. Two pools
+never share a worker name, so every warning - the failure reports above and the destructor's waits
+alike - says where it came from.
 
 A *return value* is not collected by the pool: a continuous worker keeps none. It goes to the
 task's own callback — see *tasks: work that reports back* above.
@@ -317,6 +332,6 @@ accesses in incompatible ways and cannot be combined, so one build directory is 
 
 ## the reference
 
-`tools/make_doc.sh` builds `doc/refman.pdf` from the header and this README. It needs doxygen,
+`tools/make_doc.sh` builds `doc/refman.pdf` from the two headers and this README. It needs doxygen,
 tectonic and python3, and it fails on any doxygen warning that is not an obsolete-tag notice, so an
 undocumented member or a broken `\ref` does not reach the reference.

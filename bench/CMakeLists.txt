@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(qt_pool_vs_this LANGUAGES CXX)
 
-# As the tests: executor.hpp and async.hpp use <print>.
+# As the tests: owned_executor.hpp and async.hpp use <print>.
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -36,11 +36,11 @@ find_package(Threads REQUIRED)
 
 qt_add_executable(qt_pool_vs_this qt_pool_vs_this.cpp)
 
-# ../ - executor.hpp; ../async - async.hpp, and the actuator/ directory it includes from.
+# ../ - owned_executor.hpp; ../async - async.hpp, and the actuator/ directory it includes from.
 target_include_directories(qt_pool_vs_this PRIVATE .. ../async)
 target_link_libraries(qt_pool_vs_this PRIVATE Qt6::Core Qt6::Concurrent Threads::Threads)
 
-# Every function starts on a 64-byte cache line. Without it, an edit anywhere in executor.hpp moves
+# Every function starts on a 64-byte cache line. Without it, an edit anywhere in the header moves
 # the functions after it, and a hot one landing elsewhere in its line shows up as a gain or a loss of
 # its own: two versions with the same code measured 4-5% apart (feature plan, step 7). Aligned, a
 # comparison measures the code, not where the linker happened to place it.
