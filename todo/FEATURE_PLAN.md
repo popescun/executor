@@ -110,12 +110,12 @@ notifying door builds an `untangle::task<R>` through `untangle::bind_task()` ins
 | 5 ✅ | `on_task_error`, the callback's thread, the destructor, and `README.md` | `:87-96`, `:288-308`, `README.md` | transcription — **DONE** (`e784324`) |
 | 6 ✅ | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **DONE** (`e784324`) |
 | 7 ✅ | a task cannot say it is heavy: every worker takes any task, so a long one can hold all of them | `:56` (constructor), `:220-250` (`add_task`), `:363` (`pick_worker`) | CONFIRMED (9 cases, 63 of 63 on Debug, ASan and TSan) — **DONE** (`f0de732`) |
-| **8** | **one class holds both modes: the owned pool carries the shared one's types; split into `owned_executor` (the original, renamed only) and `shared_executor`** | `executor.hpp` (whole), `test/`, `bench/qt_pool_vs_this`, `README.md`, `Doxyfile`, CI | planned 2026-10-30 — OPEN |
+| **8 ✅** | **one class holds both modes: the owned pool carries the shared one's types; split into `owned_executor` (the original, renamed only) and `shared_executor`** | `executor.hpp` (whole), `test/`, `bench/qt_pool_vs_this`, `README.md`, `Doxyfile`, CI | planned 2026-10-30 — **DONE** |
 | 8.1 ✅ | tests first: `owned_executor_tests.cpp`, `shared_executor_tests.cpp`, the smoke test | `test/` | renamed only, plus `moves_to_seal_a_task()` answering `true` — **DONE** (`4c467ff`) |
 | 8.2 ✅ | `owned_executor.hpp`: `1c3a203:executor.hpp`, renamed only | `owned_executor.hpp` | diff shows renames only; owned and smoke 54 of 54 on Debug, ASan and TSan — **DONE** (`4c467ff`) |
 | 8.3 ✅ | `shared_executor.hpp`: `f0de732:executor.hpp`, renamed; `unnamed_shared_pools` | `shared_executor.hpp` | diff shows renames only; both headers compile in one file; 112 of 112 on Debug, ASan and TSan — **DONE** (`06e4b96`) |
-| 8.4 ✅ | users and docs: `executor.hpp` removed, CMake, Doxyfile, CI, the bench, `README.md`, `tools/make_doc.sh`, LF | `Doxyfile`, CI, `bench/`, `README.md`, `doc/` | `README.md` names both, with a section for the shared one; refman 41 pages, no warnings; the bench builds — **DONE** |
-| 8.5 | checks: Debug, ASan, TSan for both; the bench matches the original | — | OPEN |
+| 8.4 ✅ | users and docs: `executor.hpp` removed, CMake, Doxyfile, CI, the bench, `README.md`, `tools/make_doc.sh`, LF | `Doxyfile`, CI, `bench/`, `README.md`, `doc/` | `README.md` names both, with a section for the shared one; refman 41 pages, no warnings; the bench builds — **DONE** (`505424d`) |
+| 8.5 ✅ | checks: Debug, ASan, TSan for both; the bench matches the original | — | 112 of 112; bench level but for one placement-sensitive case; fluxcpp 39 of 39 on all three, prototypes build — **DONE** |
 | **9** | **tasks from one owner on a shared pool overlap and finish out of order: ordered queues, as a drain loop, on `shared_executor`** | `shared_executor.hpp` | first implementation kept as a POC (stash), not landed; planned 2026-10-28, reworked 2026-10-30 — OPEN; after step 8 |
 | 9.1 ✅ | async bumped to `7464139`: `add_queued_task()` public | `async` (pin) | **DONE** (`ab267f3`) |
 | 9.2 | tests first: the POC's 10 cases; a throwing callback moves the queue on; an ordered queue takes any action type | `test/shared_executor_tests.cpp` | OPEN |
@@ -362,7 +362,7 @@ versions alike (step 7 fast unaligned, slow aligned). **Decided (user, 2026-10-2
 regression; the bench builds with `-falign-functions=64` from now on, so a comparison measures code
 and not placement (`bench/CMakeLists.txt`, `bench/README.md`).
 
-### Step 8 · one class holds both modes — OPEN
+### Step 8 ✅ · one class holds both modes — DONE
 `executor.hpp` (whole), `test/`, `bench/`, `README.md`, `Doxyfile`, `.github/workflows/ci.yml` ·
 planned 2026-10-30
 
@@ -396,6 +396,27 @@ no base class: the worker management is written twice rather than the owned pool
 >   executor; `tools/make_doc.sh` clean; every file LF.
 > - **8.5 · Checks:** Debug, ASan and TSan green for both; the bench builds and `owned_executor`'s
 >   numbers match the original's; fluxcpp's `flux_common.hpp` and its feature step 1 follow there.
+
+**The bench, against the original (8.5).** `bench/qt_pool_vs_this` from `1c3a203` with its own
+`executor.hpp`, against today's: the sources differ only in names and comments. Both use today's
+async and `-falign-functions=64`. Six runs each, alternating; the executor's median of medians:
+
+| workers | tasks | task µs | submitted | delivered |
+|---:|---:|---:|---:|---:|
+| 1 | 1 | 0 | 0.7 / 0.7 µs | 7.8 / 6.4 |
+| 4 | 1 | 0 | 0.6 / 0.6 | 8.1 / 8.0 |
+| 1 | 1000 | 0 | 117.5 / 43.8 | 120.2 / 54.7 |
+| 4 | 1000 | 0 | 34.5 / 36.0 | 77.1 / 78.2 |
+| 1 | 1 | 10 | 0.7 / 0.7 | 17.8 / 17.9 |
+| 4 | 1 | 10 | 0.7 / 0.7 | 17.7 / 17.8 |
+| 1 | 1000 | 10 | 19.6 / 21.1 | 11272 / 11391 |
+| 4 | 1000 | 10 | 31.6 / 31.0 | 3060 / 3032 |
+| 1 | 1000 | mixed | 22.4 / 22.1 | 114418 / 114032 |
+| 4 | 1000 | mixed | 46.2 / 44.2 | 34615 / 34712 |
+
+Original / owned. Level, but for one worker's empty batch, faster here in the owned build. With the
+same code that points to placement, the fast and slow modes step 7 recorded for this case; the two
+binaries' layouts were not compared.
 
 ### Step 9 · one owner's tasks overlap and reorder on a shared pool — OPEN
 `shared_executor.hpp`, after step 8 · planned 2026-10-28, reworked 2026-10-30
@@ -506,6 +527,7 @@ the chain.
 | `ab267f3` | 9.1 — `async` bumped to `7464139`: `add_queued_task()` public |
 | `4c467ff` | 8.1 and 8.2 — `owned_executor`, the original pool renamed, and the tests split |
 | `06e4b96` | 8.3 — `shared_executor`, step 7's pool renamed |
+| `505424d` | 8.4 — users and docs follow the split |
 
 **CLOSED.** Every step is done or merged, and all of it is in `e784324`. 32 of 32 and 5 of 5 green,
 clang-format clean, doxygen clean, `README.md` and `doc/refman.pdf` current.
