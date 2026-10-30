@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Nicolae Popescu. MIT License.
 
 /**
- * @brief A thread pool executor built out of untangle::async::execution objects.
+ * @brief A thread pool many owners share, built out of untangle::async::execution objects.
  *
  * N workers in continuous mode behind a shared queue. Nothing overtakes what is already queued.
  */
-#ifndef UNTANGLE_EXECUTOR_EXECUTOR_HPP
-#define UNTANGLE_EXECUTOR_EXECUTOR_HPP
+#ifndef UNTANGLE_EXECUTOR_SHARED_EXECUTOR_HPP
+#define UNTANGLE_EXECUTOR_SHARED_EXECUTOR_HPP
 
 #include <algorithm>
 #include <async.hpp>
@@ -30,8 +30,9 @@
 
 namespace untangle {
 
-//! Numbers the pools that are not given a name, across every task type, so no two are alike.
-inline std::atomic<std::size_t> unnamed_pools = {0};
+//! Numbers the shared pools that are not given a name, so no two are alike. Not unnamed_pools,
+//! which owned_executor.hpp defines.
+inline std::atomic<std::size_t> unnamed_shared_pools = {0};
 
 /**
  * @brief Which workers may run a task: a pool has light workers, and may have heavy ones too.
@@ -55,7 +56,7 @@ enum class task_type : std::uint8_t { light, heavy };
  * @tparam actionT - The callable the pool runs. One pool runs one signature, arguments and result.
  */
 template <typename actionT>
-class executor {
+class shared_executor {
  public:
   /**
    * @brief Builds \p worker_count light workers, and no heavy one. They do not run until
@@ -63,11 +64,12 @@ class executor {
    *
    * @param worker_count - How many workers to run. Must not be zero.
    * @param name - What its workers are named after, `<name>_light_<i>`, in every warning they
-   * print. Left empty, it is `pool_<n>`, numbered across the process, so two pools are never alike.
+   * print. Left empty, it is `shared_pool_<n>`, numbered across the process, so two pools are never
+   * alike.
    * @throws std::invalid_argument - \p worker_count is zero: such a pool could never run its work.
    */
-  explicit executor(std::size_t worker_count, std::string name = {})
-      : executor(worker_count, 0, std::move(name)) {}
+  explicit shared_executor(std::size_t worker_count, std::string name = {})
+      : shared_executor(worker_count, 0, std::move(name)) {}
 
   /**
    * @brief Builds \p light_count light workers and \p heavy_count heavy ones. They do not run
@@ -78,17 +80,17 @@ class executor {
    * @param heavy_count - How many heavy workers to run. May be zero: heavy tasks then run on the
    * light workers, and the pool warns once.
    * @param name - What its workers are named after, `<name>_light_<i>` and `<name>_heavy_<i>`, in
-   * every warning they print. Left empty, it is `pool_<n>`, numbered across the process.
+   * every warning they print. Left empty, it is `shared_pool_<n>`, numbered across the process.
    * @throws std::invalid_argument - \p light_count is zero.
    */
-  executor(std::size_t light_count, std::size_t heavy_count, std::string name = {})
+  shared_executor(std::size_t light_count, std::size_t heavy_count, std::string name = {})
       : light_count_(light_count) {
     if (light_count == 0) {
       throw std::invalid_argument("executor: light_count must not be zero");
     }
 
     if (name.empty()) {
-      name = "pool_" + std::to_string(unnamed_pools.fetch_add(1) + 1);
+      name = "shared_pool_" + std::to_string(unnamed_shared_pools.fetch_add(1) + 1);
     }
 
     name_ = name;
@@ -118,10 +120,10 @@ class executor {
   }
 
   //! Not copied or moved: every worker's callbacks hold this pool's `this`.
-  executor(const executor&) = delete;
-  executor& operator=(const executor&) = delete;
-  executor(executor&&) = delete;
-  executor& operator=(executor&&) = delete;
+  shared_executor(const shared_executor&) = delete;
+  shared_executor& operator=(const shared_executor&) = delete;
+  shared_executor(shared_executor&&) = delete;
+  shared_executor& operator=(shared_executor&&) = delete;
 
   /**
    * @brief Drains what was added, then stops the workers and destroys them.
@@ -134,7 +136,7 @@ class executor {
    *
    * @attention This waits for the pool, not for what its work touched: see \ref wait().
    */
-  ~executor() {
+  ~shared_executor() {
     // Nothing is stopped before this, or the queue could never empty. wait() leaves the pool
     // accepting, so stop() follows at once: that window is the only one a shutdown would take.
     wait();
@@ -184,8 +186,9 @@ class executor {
    * @remark A stopped pool is waited for too: its workers run what they were given before they
    * leave, so the wait ends.
    *
-   * @attention It waits for the work, not for what the work touched. Held as a member, ~executor()
-   * runs once the owner's derived parts and later members are gone: call this before that.
+   * @attention It waits for the work, not for what the work touched. Held as a member,
+   * ~shared_executor() runs once the owner's derived parts and later members are gone: call this
+   * before that.
    */
   void wait() {
     // One drain at a time: two threads between the exchange below and the restore at the end would
@@ -685,4 +688,4 @@ class executor {
 
 }  // namespace untangle
 
-#endif  // UNTANGLE_EXECUTOR_EXECUTOR_HPP
+#endif  // UNTANGLE_EXECUTOR_SHARED_EXECUTOR_HPP

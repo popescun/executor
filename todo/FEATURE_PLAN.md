@@ -111,9 +111,9 @@ notifying door builds an `untangle::task<R>` through `untangle::bind_task()` ins
 | 6 ✅ | `README.md`, `tools/make_doc.sh`, and the commits | `README.md`, `doc/` | **DONE** (`e784324`) |
 | 7 ✅ | a task cannot say it is heavy: every worker takes any task, so a long one can hold all of them | `:56` (constructor), `:220-250` (`add_task`), `:363` (`pick_worker`) | CONFIRMED (9 cases, 63 of 63 on Debug, ASan and TSan) — **DONE** (`f0de732`) |
 | **8** | **one class holds both modes: the owned pool carries the shared one's types; split into `owned_executor` (the original, renamed only) and `shared_executor`** | `executor.hpp` (whole), `test/`, `bench/qt_pool_vs_this`, `README.md`, `Doxyfile`, CI | planned 2026-10-30 — OPEN |
-| 8.1 | tests first: `owned_executor_tests.cpp`, `shared_executor_tests.cpp`, the smoke test | `test/` | OPEN |
-| 8.2 | `owned_executor.hpp`: `1c3a203:executor.hpp`, renamed only | `executor.hpp` | OPEN |
-| 8.3 | `shared_executor.hpp`: `f0de732:executor.hpp`, renamed; `unnamed_shared_pools` | `executor.hpp` | OPEN |
+| 8.1 ✅ | tests first: `owned_executor_tests.cpp`, `shared_executor_tests.cpp`, the smoke test | `test/` | renamed only, plus `moves_to_seal_a_task()` answering `true` — **DONE** (`4c467ff`) |
+| 8.2 ✅ | `owned_executor.hpp`: `1c3a203:executor.hpp`, renamed only | `owned_executor.hpp` | diff shows renames only; owned and smoke 54 of 54 on Debug, ASan and TSan — **DONE** (`4c467ff`) |
+| 8.3 ✅ | `shared_executor.hpp`: `f0de732:executor.hpp`, renamed; `unnamed_shared_pools` | `shared_executor.hpp` | diff shows renames only; both headers compile in one file; 112 of 112 on Debug, ASan and TSan — **DONE**, commit pending |
 | 8.4 | users and docs: `executor.hpp` removed, CMake, Doxyfile, CI, the bench, `README.md`, `tools/make_doc.sh`, LF | `test/`, `bench/`, `README.md`, `doc/` | OPEN |
 | 8.5 | checks: Debug, ASan, TSan for both; the bench matches the original | — | OPEN |
 | **9** | **tasks from one owner on a shared pool overlap and finish out of order: ordered queues, as a drain loop, on `shared_executor`** | `shared_executor.hpp` | first implementation kept as a POC (stash), not landed; planned 2026-10-28, reworked 2026-10-30 — OPEN; after step 8 |
@@ -503,6 +503,7 @@ the chain.
 | `1c3a203` | — this plan: steps 7 and 8 |
 | `f0de732` | 7 — task types, light and heavy workers, 9 cases, `README.md` and the reference |
 | `ab267f3` | 9.1 — `async` bumped to `7464139`: `add_queued_task()` public |
+| `4c467ff` | 8.1 and 8.2 — `owned_executor`, the original pool renamed, and the tests split |
 
 **CLOSED.** Every step is done or merged, and all of it is in `e784324`. 32 of 32 and 5 of 5 green,
 clang-format clean, doxygen clean, `README.md` and `doc/refman.pdf` current.
